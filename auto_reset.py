@@ -31,6 +31,7 @@ class ResetConfirmation:
     question: str
     answer: Future
     foreground: bool = False
+    prompt: str | None = None
 
 
 class AutoReset:

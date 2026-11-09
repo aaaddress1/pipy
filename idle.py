@@ -242,7 +242,9 @@ class IdleMaintenance:
 
                 async def read_choice():
                     try:
-                        return consent_value(await prompt.prompt_async(CONSENT_PROMPT, handle_sigint=False))
+                        return consent_value(await prompt.prompt_async(
+                            getattr(offer, "prompt", None) or CONSENT_PROMPT, handle_sigint=False,
+                        ))
                     except (EOFError, KeyboardInterrupt):
                         return None
 

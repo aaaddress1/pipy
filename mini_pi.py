@@ -86,6 +86,7 @@ from context_windows import HISTORY as CONTEXT_HISTORY, TOOLS as CONTEXT_TOOLS, 
 from goals import Goals, GoalSteer, SCHEMA as GOAL_SCHEMA, describe as describe_goal, discard_stale_goal_steers
 from todos import Todos
 from cost_gate import CostCapError, CostGate, entry_usage, total_cost
+from broker_usage import UsagePreflightBlocked
 from maintenance_retry import MaintenanceRetry
 from memory import MemoryOptions, bounded, clear_memory, consolidate, guidance, injection, memory_status, redact_memory
 from memory_files import MemoryFiles
@@ -102,6 +103,7 @@ from local_credentials import LocalCredentials, agent_db_path
 from mcp_tools import ExternalToolResult, McpSession, McpTool, ToolCache, discover_servers, timeout_seconds, tool_alias
 from recovery import (
     EmptyTurn, IncompleteTurn, RECOVERABLE_ERRORS, StepLimitReached, StreamInterrupted, TRANSPORT_ERRORS, TurnRecovery,
+    usage_preflight,
 )
 from routing import Router, load_routes
 from runtime import Compaction, Session, database, initialize, pack, paused_turn, responses_replay_scope
@@ -141,7 +143,7 @@ AUTO_CONTINUE = ("Resume the user's latest intent. Review the retained messages 
 def run_agent(task, query, tools, max_steps, session, compaction, system_prompt, make_recovery, turn=None,
               take_updates=None, background=False, stop_guard=None, on_input=None, jobs=None, admit=None, child=None,
               rules=None, on_admitted=None, *, tool_workers, speculation=None, on_tools=None, initial_metadata=None,
-              initial_note=None, goal=None, todo=None, todo_stop=True, post_compaction=None, task_eager=False):
+              initial_note=None, goal=None, todo=None, todo_stop=True, post_compaction=None, task_eager=False, check_usage=None):
     """Ask the model, run its tools in order, and feed their results back."""
     cancellation = turn or active_turn()
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
@@ -197,6 +199,11 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         for work in works:
             delivered = append_input(work, queued=True) or delivered
         return delivered
+
+    def take_steering():
+        if check_usage and turn.has_steering():
+            check_usage()
+        return turn.steering()
 
     def rule_notice(hits, kind):
         if turn and kind != "prose":
@@ -295,6 +302,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     for _ in steps:
         if cancellation:
             cancellation.check()
+        if check_usage:
+            check_usage()
         if jobs and (delivery := jobs.take_background()):
             append_input(delivery, notification=True)
         if rules and (warning := rules.take_judgments()):
@@ -309,10 +318,14 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 cancellation.check()
             if admit:
                 admit()
+            if check_usage:
+                check_usage()
             if child and (notice := child.reminder()):
                 session.append([{"role": "developer", "content": notice}])
             system = system_prompt()
             recovery.maintain(system, phase)
+            if check_usage and check_usage():
+                system = system_prompt()
             compaction.remind_context_notes(system)
             messages = compaction.messages(system)
             attempted_route = recovery.router.route
@@ -396,7 +409,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             notified = False
             if turn:
                 turn.server.event("turn_end", message=wire, toolResults=[])
-                steering = turn.steering()
+                steering = take_steering()
                 if steering:
                     if matched and matched.prose_hits:
                         rule_notice(tuple(matched.prose_hits.values()), "prose")
@@ -471,7 +484,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         if rules:
             rules.age += 1
         if turn:
-            if append_steering(turn.steering()) and stop_guard:
+            if append_steering(take_steering()) and stop_guard:
                 stop_guard.retries = 0
         if child and child.submitted is not None:
             return assistant["content"]
@@ -1567,7 +1580,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         context_policy=context_policy, profile=getattr(args, "model_profile", None),
                         primary_candidates=getattr(args, "primary_candidates", ()),
                         role_hint=getattr(args, "model_role_hint", None), secrets=getattr(args, "config_secrets", None),
-                        fixed_primary=bool(getattr(args, "per_call_guard", None)))
+                        fixed_primary=bool(getattr(args, "per_call_guard", None)), usage_aware=args.usage_aware_fallback)
         assume_exit = (child.restore_plan is not None if child else bool(
             getattr(args, "restore", None) and not getattr(args, "internal_session_switch", False)
         ))
@@ -2352,11 +2365,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             return bool(last_inline and inline.disable())
 
         def query(messages, active_tools, turn=None, *, credit=None, show=True, force_yield=False, force_todo=False,
-                  speculation=None):
+                  speculation=None, usage_credential=None):
             nonlocal last_inline
             cancellation = turn or active_turn()
             warmer.invalidate()
-            router.prepare()
+            router.prepare(usage_credential)
             bind_context()
             route = router.route
             if per_call_guard := getattr(args, "per_call_guard", None):
@@ -2413,7 +2426,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 live_source = None
                 if (turn and not turn.background and route.api == codex_responses.API
                     and compat.get("supportsSteering") is True
-                    and dotted(args.rule_config, "providers.openaiLiveSteering") is True):
+                    and dotted(args.rule_config, "providers.openaiLiveSteering") is True
+                    and (not router.usage_aware or type(router.credential) is not int)):
                     live_source = getattr(turn, "live", None)
                 observe_title = None
                 if titles and not titles.named:
@@ -3473,7 +3487,50 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     task = None
             tool_count = 0
             goal_started = goal_succeeded = goal_interrupted = False
-            agent_admitted = False
+            agent_admitted = agent_started = False
+            usage_ready = usage_credential = None
+
+            def confirm_usage(source, target, remaining):
+                quota = f" ({100 * remaining:.1f}% remaining)" if remaining is not None else ""
+                return terminal_lane.confirm_usage(f"Usage reserve reached for {source}{quota}. Switch to {target}?", turn)
+
+            def usage_switch(source, reason):
+                bind_context()
+                if rpc and rpc.ready:
+                    role = router.pinned_chain or router.role_hint or "default"
+                    router.usage_fallback_pending = router.route.identity(), role
+                    rpc.event("retry_fallback_applied", **{"from": route_base(source), "to": route_base(router.route),
+                                                           "role": role, "reason": reason})
+                else:
+                    print(f"[{reason}]", file=sys.stderr)
+
+            def check_usage():
+                nonlocal usage_ready, usage_credential
+                current = router.route, router.credential
+                if usage_ready == current:
+                    return False
+                usage_credential = usage_preflight(
+                    router, args.usage_reserve_pct, args.usage_reserve_policy,
+                    lambda: compaction.estimate(compaction.messages(system_prompt()), floor_stored=True),
+                    confirm=confirm_usage if terminal_lane and turn and getattr(turn, "steering_at_boundary", False) else None,
+                    check=cancellation.check if cancellation else None, switched=usage_switch,
+                )
+                bind_context()
+                usage_ready = router.route, router.credential
+                return current != usage_ready
+
+            def checked_query(messages, active_tools, **options):
+                nonlocal usage_ready, usage_credential
+                prepared = usage_credential if usage_ready == (router.route, router.credential) else None
+                usage_ready = usage_credential = None
+                answer, usage = query(messages, active_tools, turn=turn, show=show, speculation=speculation,
+                                      usage_credential=prepared, **options)
+                if (pending := router.usage_fallback_pending) and pending[0] == router.route.identity() and (
+                    answer.get("content") or answer.get("tool_calls") or answer.get("_thinking")
+                ):
+                    router.usage_fallback_pending = None
+                    rpc.event("retry_fallback_succeeded", model=route_base(router.route), role=pending[1])
+                return answer, usage
 
             def count_tools(count):
                 nonlocal tool_count
@@ -3546,6 +3603,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                     task = expanded
                                 if not task:
                                     return None
+                    if router.usage_aware:
+                        check_usage()
                     initial_memory = initial_note = None
                     backend = mnemopi or hindsight
                     synthetic_goal = isinstance(task, GoalSteer) or isinstance(task, dict) and (
@@ -3572,8 +3631,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     todo.begin()
                     if task is None:
                         agent_admitted = session.can_continue()
+                    agent_started = True
                     answer = run_agent(
-                        task, partial(query, turn=turn, show=show, speculation=speculation), partial(configured_tools, active_tools),
+                        task, checked_query, partial(configured_tools, active_tools),
                         args.max_steps, session, compaction,
                         turn_system, partial(make_recovery, cancellation, background or bool(turn and turn.background)), turn=turn,
                         take_updates=manager.take_updates if manager and not child else None,
@@ -3588,6 +3648,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         todo=todo, todo_stop=args.task is None and not args.continue_session,
                         post_compaction=post_compaction,
                         task_eager=not child and layered_setting(maintenance_layers, "task.eager") == "always",
+                        check_usage=check_usage if router.usage_aware else None,
                     )
                     goal_succeeded = True
                     if foreground and not (cancellation and cancellation.is_cancelled()):
@@ -3614,6 +3675,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         failure["_live_interruption"] = True
                     if turn:
                         turn.interrupt_snapshot = None
+                raise
+            except UsagePreflightBlocked:
+                if not agent_started and (background or turn and turn.background) and isinstance(task, dict):
+                    notification = {**task, "_mcp_notification": True} if task.get("role") == "user" else task
+                    session.append([notification])
                 raise
             except CostCapError as error:
                 if not child:
@@ -4039,6 +4105,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             if editor:
                 from idle import IdleMaintenance
 
+                def take_confirmation(*, foreground_only=False):
+                    offer = lane.next_usage_confirmation() if lane and foreground_only else None
+                    return offer or (automatic.next_confirmation(foreground_only=foreground_only) if automatic else None)
+
                 maintenance = IdleMaintenance(
                     editor, recap_seconds=args.idle_recap_seconds,
                     compact_seconds=args.idle_compact_seconds if args.idle_compaction else None,
@@ -4048,7 +4118,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     background=run_background,
                     background_ready=background_ready,
                     background_enabled=lambda: bool(jobs or local_mcp and local_mcp.notifications_enabled),
-                    take_confirmation=automatic.next_confirmation if automatic else None,
+                    take_confirmation=take_confirmation if automatic or router.usage_aware else None,
                     side_panel=panel,
                     btw_panel=side,
                     lane=lane,
@@ -4718,6 +4788,11 @@ def main():
         base_delay = dotted(settings, "retry.baseDelayMs")
         args.maintenance_retry_base = base_delay / 1000 if number(base_delay) and base_delay >= 0 else .5
         args.maintenance_retry_enabled = dotted(settings, "retry.enabled") is not False
+        args.usage_aware_fallback = dotted(settings, "retry.usageAwareFallback") is True
+        reserve = dotted(settings, "retry.usageReservePct")
+        args.usage_reserve_pct = min(100, max(0, reserve)) if number(reserve) else 10
+        reserve_policy = dotted(settings, "retry.usageReservePolicy")
+        args.usage_reserve_policy = reserve_policy if reserve_policy in ("confirm", "auto", "fail-closed") else "confirm"
         if args.fallback_on is None:
             policy = dotted(settings, "retry.fallbackOn")
             args.fallback_on = policy if policy in ("any", "usage-limit", "except-usage-limit") else "any"

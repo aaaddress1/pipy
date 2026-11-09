@@ -11,8 +11,9 @@ from urllib.parse import urlsplit
 import httpx2
 
 from auth_broker_cache import REMOTE_REFRESH, config_root, number
-from broker_usage import (IDENTITY, PROVIDERS, exhausted, healable_scopes, match_report, merge_report,
-                          overlay_key, parse_policies, plan_requirement, rank_oauth, usage_reports, usage_reset_times)
+from broker_usage import (IDENTITY, PROVIDERS, UsageHealth, account_health, account_policy, exhausted, healable_scopes,
+                          match_report, merge_report, overlay_key, parse_policies, plan_rank, plan_requirement, rank_oauth,
+                          usage_reports, usage_reset_times)
 from observed_usage import ObservedUsage
 from rate_limits import UsageBlock
 
@@ -432,6 +433,32 @@ class CredentialPool:
         offset = time() * 1000 - self.server_time()
         return {identifier: tuple(value + offset if value is not None else None for value in pair)
                 for identifier, pair in self.quota_candidates(provider, scope, accounts, model, kind).items()}
+
+    async def usage_health(self, provider, scope, accounts, model, active, reserve):
+        if provider not in PROVIDERS:
+            return UsageHealth()
+        await self.model_rows(provider, scope, accounts, model, heal=True)
+        selected = self.rows.get(active)
+        kind = selected["kind"] if selected else "oauth"
+        if selected and kind != "oauth" and selected.get("source") != "login":
+            return UsageHealth()
+        reports = await self.usage(provider)
+        now, tick = self.server_time(), monotonic()
+        blocks = self.quota_candidates(provider, scope, accounts, model, kind)
+        result = []
+        measured = False
+        for identifier, (blocked, _) in blocks.items():
+            row = self.rows[identifier]
+            if kind != "oauth" and row.get("source") != "login":
+                continue
+            measured = True
+            report = match_report(reports, row, self.allow_unattributed(provider, accounts is not None))
+            report = merge_report(report, self.overlay(row, tick))
+            if report and plan_rank(plan_requirement(provider, model), report["metadata"]) == 2:
+                continue
+            _, threshold, _ = account_policy(row, self.policies.get(provider, ()), reserve)
+            result.append(account_health(identifier, provider, model, report, blocked, reserve if threshold is None else threshold, now))
+        return UsageHealth.summarize(result) if measured else UsageHealth()
 
     async def usage(self, provider):
         if (cached := self.usage_cache.get(provider)) and cached[0] > monotonic():

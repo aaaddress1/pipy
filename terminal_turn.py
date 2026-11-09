@@ -2,9 +2,10 @@
 
 import sys
 from collections import deque
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager
 from dataclasses import dataclass
+from queue import Empty, SimpleQueue
 from threading import Lock, RLock, Timer, current_thread
 
 from prompt_toolkit.application.current import get_app
@@ -16,6 +17,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.utils import get_cwidth
 
 from btw import ANSI
+from broker_usage import UsagePreflightBlocked
 from cost_gate import usd
 from handoff import Cancellation
 from live_steering import LiveQueue
@@ -190,6 +192,7 @@ class TerminalLane:
         self.returned = []
         self.turn, self.settled = None, None
         self.background_paused = False
+        self.usage_confirmations = SimpleQueue()
         self.goal_timer = None
         self.loop = self.loop_timer = self.loop_gate = self.loop_reset = None
         self.loop_workers = set()
@@ -241,6 +244,28 @@ class TerminalLane:
         if wake := self.wake:
             wake()
 
+    def confirm_usage(self, question, turn):
+        from auto_reset import ResetConfirmation
+
+        answer = Future()
+        self.usage_confirmations.put(ResetConfirmation(question, answer, foreground=True, prompt="Switch model? [y/N] "))
+        self.changed()
+        try:
+            while not answer.done():
+                turn.wait(.1)
+            return answer.result() == "yes"
+        finally:
+            answer.cancel()
+
+    def next_usage_confirmation(self):
+        while True:
+            try:
+                offer = self.usage_confirmations.get_nowait()
+            except Empty:
+                return None
+            if not offer.answer.done():
+                return offer
+
     def submit(self, work, mode="steer", *, urgent=False, loop_prompt=False):
         with self.lock:
             self.cancel_goal()
@@ -270,10 +295,12 @@ class TerminalLane:
         self.changed()
 
     def run(self, turn):
+        queued_source = None
         while turn:
             work = turn.works[0]
             answer = None
             failed = False
+            usage_blocked = False
             try:
                 if work.operation:
                     turn.check()
@@ -288,21 +315,30 @@ class TerminalLane:
                 print("[Turn interrupted.]", file=sys.stderr)
             except Exception as error:
                 failed = True
+                usage_blocked = isinstance(error, UsagePreflightBlocked)
                 turn.interrupted(error)
                 print(f"mini-pi: {error}", file=sys.stderr)
             finally:
                 with self.lock:
-                    for item in [*turn.claimed, *turn.live.take_all(), *turn.works[1:]]:
+                    requeued = usage_blocked and queued_source is not None and not work.admitted
+                    if requeued:
+                        queued_source.extendleft(reversed(turn.works))
+                    remaining = [] if requeued else turn.works[1:]
+                    for item in [*turn.claimed, *turn.live.take_all(), *remaining]:
                         if text := item.restore():
                             self.returned.append(text)
-                    if (work.on_drop or failed) and (text := work.restore()):
+                    if not requeued and (work.on_drop or failed) and (text := work.restore()):
                         self.returned.append(text)
                     queued = []
-                    if not (self.budget and self.budget.is_cancelled()):
+                    queued_source = None
+                    if usage_blocked:
+                        self.background_paused = True
+                    if not usage_blocked and not (self.budget and self.budget.is_cancelled()):
                         if self.priority:
                             queued, self.priority = [self.priority], None
                         else:
-                            queued = self.take(self.steers, self.steering_mode) or self.take(self.followups, self.followup_mode)
+                            queued_source = self.steers if self.steers else self.followups
+                            queued = self.take(queued_source, self.steering_mode if queued_source is self.steers else self.followup_mode)
                     completed = not queued and not failed and not turn.is_cancelled()
                     next_goal = turn.goal_next if completed else None
                     next_compaction = turn.compaction_next if completed else None

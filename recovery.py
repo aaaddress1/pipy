@@ -10,7 +10,8 @@ from dataclasses import replace
 from httpx import NetworkError, RemoteProtocolError, TimeoutException
 from openai import APIConnectionError, APIStatusError
 
-from auth_broker import ModelCredentialError, ModelQuotaError
+from auth_broker import AuthBrokerError, ModelCredentialError, ModelQuotaError
+from broker_usage import UsagePreflightBlocked
 from model_catalog import model_identity
 from rate_limits import (
     BILLING, QUOTA_GUESS, TRANSIENT_DELAYS, UsageBlock, classify_rate_limit, error_text, quota_wait, retry_after,
@@ -102,6 +103,71 @@ def media_rejection(error):
         "too many images", "image exceeds", "image is too large", "images are not supported", "does not support images",
         "image byte limit", "request body too large", "payload too large", "request entity too large", "unsupported image",
     ))
+
+
+def usage_preflight(router, reserve, policy, context_tokens, *, confirm=None, check=None, switched=None):
+    source, credential = router.route, router.credential
+    health = router.usage_health(source, credential, reserve)
+    if check:
+        check()
+    if health.state == "healthy":
+        if any(item.identifier == credential and item.state == "healthy" for item in health.accounts):
+            router.usage_reserve_approval = None
+        try:
+            selected = router.healthy_credential(source, health, credential)
+        except AuthBrokerError:
+            return None
+        if selected is not None:
+            router.use_credential(selected)
+        return selected
+    if health.state == "unknown":
+        return None
+    selector = model_identity(source.catalog_model) if source.catalog_model else source.name
+    if health.state != "reserve":
+        router.usage_reserve_approval = None
+    if policy == "fail-closed":
+        condition = "reserve reached" if health.state == "reserve" else "usage depleted"
+        raise UsagePreflightBlocked(f"Usage preflight blocked: {condition} for {selector}; reserve policy is fail-closed.")
+    if router.fixed_primary or router.usage_reserve_approval == source.identity():
+        return None
+
+    declined = False
+    reason = health.reason(reserve, router.broker.server_time())
+
+    def choose(candidate):
+        nonlocal declined
+        if declined:
+            return False
+        try:
+            selected = router.available(candidate)
+            if selected is None:
+                return False
+            candidate_health = router.usage_health(candidate, selected, reserve)
+            if candidate_health.state in ("reserve", "depleted"):
+                return False
+            selected = router.healthy_credential(candidate, candidate_health, selected)
+        except AuthBrokerError:
+            return False
+        if check:
+            check()
+        if policy == "confirm" and health.state == "reserve" and confirm:
+            remaining = next((item.remaining for item in health.accounts if item.identifier == credential), None)
+            if remaining is None:
+                remaining = min((item.remaining for item in health.accounts if item.remaining is not None), default=None)
+            declined = not confirm(selector, candidate.name, remaining)
+            if check:
+                check()
+            if declined:
+                router.usage_reserve_approval = source.identity()
+                return False
+        return router.switch(candidate, "usage preflight fallback", credential=selected)
+
+    if router.fallback(set(), True, context_tokens=context_tokens(), pinned=True, preflight=choose):
+        router.usage_reserve_approval = None
+        if switched:
+            switched(source, reason)
+        return router.credential
+    return None
 
 
 class TurnRecovery:

@@ -13,6 +13,7 @@ from time import time
 
 from openai import APIStatusError
 
+from broker_usage import UsagePreflightBlocked
 from cost_gate import CostCapError
 from handoff import Cancellation
 from live_steering import LiveQueue
@@ -338,6 +339,7 @@ class RpcServer:
         self.awaiting_jobs = False
         self.idle_command = False
         self.background_suppressed = False
+        self.usage_paused = False
 
     def next_message(self):
         self.message_counter += 1
@@ -475,7 +477,7 @@ class RpcServer:
                        if self.turn else 0)
             if kind == "abort_and_prompt":
                 self.abort(user=True)
-            elif claimed + len(self.steering) + len(self.follow_up) >= MAX_QUEUE:
+            elif self.turn and claimed + len(self.steering) + len(self.follow_up) >= MAX_QUEUE:
                 raise RpcFailure("The prompt queue is full.", "session_busy")
             if self.turn:
                 if kind != "abort_and_prompt" and self.mcp and self.mcp.is_prompt_command(work.content):
@@ -496,7 +498,7 @@ class RpcServer:
                     self.response(command)
                 self.event("queue_update", **self.queues())
                 return
-            self.background_suppressed = False
+            self.background_suppressed = self.usage_paused = False
             self.response(command)
             self.start_turn(work)
 
@@ -512,7 +514,7 @@ class RpcServer:
                     self.start_turn(Work({"type": "goal-continuation"}, content))
 
     def next_background(self):
-        if self.budget and self.budget.is_cancelled():
+        if self.usage_paused or self.budget and self.budget.is_cancelled():
             return None
         if self.jobs and (delivery := self.jobs.take_background()):
             if not self.background_suppressed or delivery.get("_irc_messages"):
@@ -546,6 +548,7 @@ class RpcServer:
                 self.output.write({"type": "available_commands_update", **handler({})})
 
     def run(self, turn):
+        queued_source = None
         while turn:
             error = None
             status = "completed"
@@ -569,9 +572,16 @@ class RpcServer:
                         error, status = exc, "error"
                         break
                 self.steering.extendleft(reversed(turn.take_uncommitted_steering()))
-                queued = self.steering or self.follow_up
+                usage_blocked = isinstance(error, UsagePreflightBlocked)
+                requeued = usage_blocked and queued_source is not None and not turn.messages
+                if usage_blocked:
+                    self.usage_paused = True
+                    if requeued:
+                        queued_source.extendleft(reversed(turn.works))
+                        self.event("queue_update", **self.queues())
+                queued = None if self.usage_paused else self.steering or self.follow_up
                 background = self.next_background() if not queued else None
-                self.awaiting_jobs = bool(self.has_pending_jobs())
+                self.awaiting_jobs = bool(not self.usage_paused and self.has_pending_jobs())
                 continuation = None
                 if status == "completed" and not queued and not background and not self.awaiting_jobs:
                     next_turn = turn.compaction_next or turn.goal_next
@@ -579,19 +589,22 @@ class RpcServer:
                         source = "compaction-continuation" if turn.compaction_next else "goal-continuation"
                         continuation = Work({"type": source}, content)
                 settled = not queued and not background and not continuation and not self.awaiting_jobs
-                guard = {"automaticContinuationBlocked": True} if turn.compaction_blocked else {}
+                guard = {"automaticContinuationBlocked": True} if turn.compaction_blocked or usage_blocked else {}
                 self.event("agent_end", messages=turn.messages, yielded=True, isTerminal=settled, **guard)
-                for work in turn.works:
-                    self.result(work, status, settled, error)
+                if not requeued:
+                    for work in turn.works:
+                        self.result(work, status, settled, error, invoked=not usage_blocked or bool(turn.messages))
                 for command, data in turn.interrupt_responses:
                     self.response(command, data)
                 next_work = [work for work in (background, continuation) if work]
+                queued_source = queued if queued else None
                 if queued:
                     limit = len(queued) if queued is self.follow_up and self.follow_up_mode == "all" else 1
                     next_work = [queued.popleft() for _ in range(limit)]
                     for work in next_work:
                         if work.ack_pending:
                             self.response(work.command)
+                            work.ack_pending = False
                     self.event("queue_update", **self.queues())
                 turn = self.turn = RpcTurn(self, next_work, self.budget) if next_work else None
                 if settled:
@@ -721,6 +734,7 @@ class RpcServer:
         return None
 
     def serve(self, run_task, record_input, commands, mcp=None, jobs=None, *, retry_ready=None):
+        self.usage_paused = False
         self.run_task, self.record_input, self.commands = run_task, record_input, commands
         self.retry_ready = retry_ready
         if not self.ready:

@@ -20,7 +20,7 @@ from xxhash import xxh32_intdigest
 from anthropic_fallback import validate_chain
 from anthropic_messages import credit_header, headers as anthropic_headers, official_endpoint
 from auth_broker import AuthBrokerError, ModelCredentialError, ModelQuotaError
-from broker_usage import quota_scope, response_limits
+from broker_usage import PROVIDERS, UsageHealth, quota_scope, response_limits
 from observed_usage import normalize_usage
 from cache_warmer import Prices
 from cancellable_http import CancellableTransport, active_turn
@@ -557,13 +557,15 @@ class BrokerModelAuth(httpx.Auth):
 
 class Router:
     def __init__(self, routes, primary, session, fallback_on, clients_stack, transport_loop=None, broker=None,
-                 *, context_policy, profile=None, primary_candidates=(), role_hint=None, secrets=None, fixed_primary=False):
+                 *, context_policy, profile=None, primary_candidates=(), role_hint=None, secrets=None, fixed_primary=False,
+                 usage_aware=False):
         self.routes = routes
         self.context_policy = context_policy
         self.primary = self.fit_context(routes[primary])
         self.session = session
         self.fallback_on = fallback_on
         self.fixed_primary = fixed_primary
+        self.usage_aware = usage_aware
         self.clients = {}
         self.responses_sockets = {}
         self.responses_efforts = OrderedDict()
@@ -597,6 +599,8 @@ class Router:
         self.pinned_chain = self.fallback_origin = None
         self.clear_inherited_effort()
         self.refusal_pinned = False
+        self.usage_reserve_approval = None
+        self.usage_fallback_pending = None
         primaries = [self.fit_context(self.routes[name]) for name in self.primary_candidates]
         if not self.fixed_primary:
             for primary in primaries:
@@ -616,6 +620,8 @@ class Router:
                 return
         self.primary = self.route = primaries[0]
         self.credential = None
+        if self.usage_aware and self.route.broker_provider in PROVIDERS and self.route.name in self.quota_blocked:
+            return
         if not self.fallback(set(), usage_limit=self.route.name in self.quota_blocked, cooldown=0):
             raise ValueError(f"No credential available for route {self.route.name!r} or its eligible fallbacks.")
 
@@ -694,7 +700,10 @@ class Router:
         slot = route.name, credential
         return self.blocked.get(slot, 0) > monotonic or self.local_quota.get(slot, (0, False))[0] > wall
 
-    def prepare(self):
+    def prepare(self, preferred=None):
+        if preferred is not None:
+            self.use_credential(preferred)
+            return
         slot = self.route.name, self.credential
         now = time.time() * 1000
         if not self.route.broker_provider and not self.locally_blocked(self.route, self.credential, time.monotonic(), now):
@@ -707,12 +716,41 @@ class Router:
             if self.route.name in self.quota_blocked or self.local_quota.get(slot, (0, False))[0] > now:
                 raise ModelQuotaError(f"Broker accounts have reached their quota for route {self.route.name!r}.")
             raise ModelCredentialError(f"No credential is available for route {self.route.name!r}.")
+        self.use_credential(selected)
+
+    def use_credential(self, selected):
         self.credential = selected
         if type(selected) is int:
             self.pins[self.route.broker_provider] = selected
             self.pin_used[self.route.broker_provider] = time.monotonic()
         else:
             self.pins.pop(self.route.broker_provider, None)
+
+    def usage_health(self, route, credential, reserve):
+        if not self.broker or route.key_override or route.broker_provider not in PROVIDERS or (
+            type(credential) is not int and not (credential is None and route.name in self.quota_blocked)
+        ):
+            return UsageHealth()
+        try:
+            health = self.transport_loop.call(self.broker.usage_health(
+                route.broker_provider, route.quota_scope(), route.broker_accounts, route.model, credential, reserve,
+            ), active_turn())
+        except (AuthBrokerError, ValueError):
+            return UsageHealth()
+        if not health.accounts:
+            return health
+        tick, wall = time.monotonic(), time.time() * 1000
+        return UsageHealth.summarize([
+            replace(item, state="depleted", remaining=None) if self.locally_blocked(route, item.identifier, tick, wall)
+            else item for item in health.accounts
+        ])
+
+    def healthy_credential(self, route, health, credential):
+        healthy = {item.identifier for item in health.accounts if item.state == "healthy"}
+        if not healthy or credential in healthy:
+            return credential
+        preferred = self.available(route, excluded={item.identifier for item in health.accounts} - healthy, track=False)
+        return preferred if preferred in healthy else credential
 
     def request_settings(self, route=None, credential=None):
         route, credential = (self.route, self.credential) if route is None else (route, credential)
@@ -891,9 +929,9 @@ class Router:
             settings["default_headers"] = dict(headers)
         return settings
 
-    def switch(self, target, reason):
+    def switch(self, target, reason, *, credential=None):
         target = self.fit_context(target)
-        credential = self.available(target)
+        credential = self.available(target) if credential is None else credential
         if credential is None or target == self.route:
             return False
         previous = self.route
@@ -1044,17 +1082,18 @@ class Router:
         return found
 
     def fallback(self, visited, usage_limit, defer_anthropic=None, *, credit_targets=(), cooldown=None, pinned=False,
-                 context_tokens=None):
+                 context_tokens=None, preflight=None):
         if self.fallback_on == "off" or (
-            self.fallback_on == "usage-limit" and not usage_limit
-        ) or (self.fallback_on == "except-usage-limit" and usage_limit):
+            preflight is None and (self.fallback_on == "usage-limit" and not usage_limit
+                                   or self.fallback_on == "except-usage-limit" and usage_limit)
+        ):
             return False
         direct = self.chain(self.route)
         inherited = self.chain(self.primary)
         if self.route.name in inherited:
             direct.extend(inherited[inherited.index(self.route.name) + 1:])
         key = None
-        effort = None
+        effort = self.route.effort(self.requested_effort()) if preflight else None
         profile_candidates = []
         if self.profile and self.profile.chains:
             effort = self.route.effort(self.requested_effort())
@@ -1075,7 +1114,7 @@ class Router:
             if name in visited or time.monotonic() < self.cooldowns.get(name, 0):
                 continue
             budget = self.context_policy.budget.prompt_budget(candidate.window)
-            if name in profile_candidates and context_tokens is not None and budget is not None and context_tokens > budget:
+            if (preflight or name in profile_candidates) and context_tokens is not None and budget is not None and context_tokens > budget:
                 continue
             if self.profile and key and (
                 candidate.provider(), candidate.model, candidate.api, candidate.endpoint(), candidate.upstream, candidate.effort(effort)
@@ -1083,9 +1122,9 @@ class Router:
                 source.provider(), source.model, source.api, source.endpoint(), source.upstream, effort
             ):
                 continue
-            if self.switch(candidate, "model fallback"):
+            if (preflight(candidate) if preflight else self.switch(candidate, "model fallback")):
                 visited.add(name)
-                if name in profile_candidates or self.pinned_chain:
+                if preflight or name in profile_candidates or self.pinned_chain:
                     self.pinned_chain = self.pinned_chain or key
                     self.fallback_origin = self.fallback_origin or source
                     self.refusal_pinned = self.refusal_pinned or pinned

@@ -14,6 +14,38 @@ PROVIDERS = frozenset(("anthropic", "openai-codex"))
 IDENTITY = ("email", "accountId", "projectId", "orgId")
 
 
+class UsagePreflightBlocked(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class AccountHealth:
+    identifier: int
+    state: str
+    remaining: float | None = None
+    resets_at: float | None = None
+
+
+@dataclass(frozen=True)
+class UsageHealth:
+    state: str = "unknown"
+    accounts: tuple[AccountHealth, ...] = ()
+
+    @classmethod
+    def summarize(cls, accounts):
+        states = {account.state for account in accounts}
+        state = next((value for value in ("healthy", "unknown", "reserve") if value in states), "depleted")
+        return cls(state, tuple(accounts))
+
+    def reason(self, reserve, now):
+        condition = ("available quota is at or below the " + f"{reserve:g}% reserve" if self.state == "reserve"
+                     else "all eligible accounts are quota-exhausted or temporarily blocked" if self.accounts
+                     else "no account is eligible for this model's plan requirements")
+        reset = min((item.resets_at for item in self.accounts if item.resets_at and item.resets_at > now), default=None)
+        timing = f" Earliest reported reset in {math.ceil((reset - now) / 1000)} seconds." if reset else ""
+        return f"Usage preflight: {condition}.{timing} No request was sent to the source model for this attempt."
+
+
 def parse_policies(entries, reserve):
     if entries is None:
         entries = []
@@ -290,6 +322,26 @@ def limits_for(provider, model, limits, now):
         return scoped, scoped, primary, secondary, boost
     scoped = [limit for limit in limits if limit["scope"].get("modelId") in (None, model)]
     return scoped, (), None, None, False
+
+
+def account_health(identifier, provider, model, report, blocked_until, reserve, now):
+    if blocked_until:
+        return AccountHealth(identifier, "depleted", resets_at=blocked_until)
+    if not report:
+        return AccountHealth(identifier, "unknown")
+    limits = limits_for(provider, model, report["limits"], now)[0]
+    current = [limit for limit in limits if not number(reset := window(limit).get("resetsAt"))
+               or reset > now or limit.get("_fetchedAt", report["fetchedAt"]) >= reset]
+    depleted = [limit for limit in current if exhausted(limit)]
+    if depleted:
+        reset = min((value for limit in depleted if number(value := window(limit).get("resetsAt")) and value > now),
+                    default=None)
+        return AccountHealth(identifier, "depleted", resets_at=reset)
+    used = [value for limit in current if (value := fraction(limit)) is not None]
+    if not used:
+        return AccountHealth(identifier, "unknown")
+    remaining = max(0, min(1, 1 - max(used)))
+    return AccountHealth(identifier, "reserve" if remaining <= reserve / 100 + 1e-9 else "healthy", remaining)
 
 
 def healable_scopes(provider, report):
