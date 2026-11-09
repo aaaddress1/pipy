@@ -21,6 +21,7 @@ from service_runtime import SCHEMA as SERVICE_SCHEMA
 import snapcompact
 from cancellable_http import active_turn, turn_scope
 from compaction_policy import Budget
+from context_windows import BOUNDARY, NOTE_LIMIT, NOTE_TYPE, REMINDER, ROLLOVER, note_message, render_message, render_metadata
 from model_catalog import RESPONSES_APIS
 from recovery import StreamInterrupted, TRANSPORT_ERRORS
 from shake import AUTO, RESCUE, artifact_id, plan
@@ -57,7 +58,7 @@ def portable_message(message, thinking_route=None):
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
-               "_todo_message", "_todo_snapshot", "_todo_entry_id")
+               "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -137,6 +138,9 @@ def session_write(method):
     return serialized
 
 
+UNREAD = object()
+
+
 class Session:
     def __init__(self, path, session_id, workspace):
         self.path = path
@@ -148,6 +152,7 @@ class Session:
         self.navigation_epoch = 0
         self.fresh_provider_id = None
         self.timestamp_batches = False
+        self._context_notes = self._rollover_request = UNREAD
         with database(path) as db:
             db.execute(
                 "INSERT OR IGNORE INTO sessions(id, workspace, updated) VALUES (?, ?, ?)",
@@ -257,6 +262,7 @@ class Session:
         self.fresh_provider_id = None
         self._archive_view = None
         self.navigation_epoch += 1
+        self._context_notes = self._rollover_request = UNREAD
 
     @session_write
     def reset_context(self):
@@ -280,6 +286,7 @@ class Session:
         self._archive_view = None
         self.archive_images_disabled = False
         self.navigation_epoch += 1
+        self._context_notes = self._rollover_request = None
         return dropped
 
     def archived_responses_prefix(self):
@@ -445,6 +452,133 @@ class Session:
             self.touch(db)
         self.leaf = leaf
 
+        if any(payload.get("customType") == NOTE_TYPE for payload in payloads):
+            self._context_notes = UNREAD
+
+    @session_write
+    def context_notes(self):
+        if self._context_notes is not UNREAD:
+            return self._context_notes
+        self._context_notes = self.read_context_notes()
+        return self._context_notes
+
+    def read_context_notes(self):
+        with database(self.path) as db:
+            rows = db.execute(graph.ANCESTORS + """
+                SELECT n.id,n.kind,n.payload,s.source_id FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                LEFT JOIN session_entry_sources s ON s.session=n.session AND s.node=n.id
+                WHERE n.kind='reset' OR (n.kind='foreign' AND json_extract(n.payload,'$.customType')=?)
+                ORDER BY n.id DESC
+            """, (self.leaf, self.id, self.id, NOTE_TYPE))
+            for node, kind, payload, source in rows:
+                if kind == "reset":
+                    break
+                entry = json.loads(payload)
+                data = entry.get("data")
+                if (entry.get("type") == "custom" and isinstance(data, dict) and data.keys() == {"version", "text"}
+                        and type(data["version"]) is int
+                        and data["version"] == 1 and isinstance(text := data["text"], str)):
+                    try:
+                        if len(text.encode("utf-8")) <= NOTE_LIMIT:
+                            return {"entryId": source or entry.get("id") or str(node), "text": text}
+                    except UnicodeEncodeError:
+                        continue
+        return None
+
+    @session_write
+    def save_context_notes(self, text, epoch, check=None):
+        if check:
+            check()
+        if epoch != self.navigation_epoch:
+            raise ValueError("The session branch changed before the notebook could be saved.")
+        size = len(text.encode("utf-8"))
+        if size > NOTE_LIMIT:
+            raise ValueError(f"Context notes exceed the {NOTE_LIMIT:,} UTF-8 byte limit.")
+        identifier = uuid4().hex
+        self.record_metadata({"type": "custom", "customType": NOTE_TYPE, "id": identifier,
+                              "timestamp": datetime.now(timezone.utc).isoformat(), "data": {"version": 1, "text": text}})
+        return {"entryId": identifier, "text": text, "bytes": size}
+
+    def full_history(self):
+        with self.writer, database(self.path) as db:
+            leaf = self.leaf
+            rows = graph.nodes(db, self.id, leaf)
+            batches = dict(db.execute(graph.ANCESTORS + """
+                SELECT b.seq,b.messages FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                JOIN batches b ON b.session=n.session AND b.seq=n.batch
+            """, (leaf, self.id, self.id)))
+            sources = dict(db.execute("SELECT node,source_id FROM session_entry_sources WHERE session=?", (self.id,)))
+        yield "# Current branch — full history"
+        yield ""
+        records = [(node, parent, kind, seq, json.loads(raw) if raw else None) for node, parent, kind, seq, raw in rows]
+        updated = {(payload[0], payload[1]) for _, _, kind, _, payload in records if kind == "tool_update"}
+        identifiers, anchors = {None: "root"}, {}
+        for node, parent, kind, seq, payload in records:
+            if kind == "elision":
+                identifiers[node] = identifiers[parent]
+                continue
+            identifier = sources.get(node) or (payload.get("id") if isinstance(payload, dict) else None) or str(node)
+            identifiers[node] = identifier
+            yield f"## Entry {identifier} · {'message' if kind in ('batch', 'tool_update') else kind}"
+            yield f"Parent: {identifiers[parent]}"
+            if kind == "batch":
+                anchors[seq] = identifier
+                for position, message in enumerate(json.loads(batches[seq])):
+                    if (seq, position) not in updated:
+                        yield from render_message(message)
+            elif kind == "tool_update":
+                yield from render_message(payload[2])
+            else:
+                yield from render_metadata(kind, payload, anchors)
+            yield ""
+
+    def context_boundary(self):
+        with database(self.path) as db:
+            row = db.execute(graph.ANCESTORS + """
+                SELECT MAX(n.id) FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                WHERE n.kind IN ('compact','reset')
+            """, (self.leaf, self.id, self.id)).fetchone()
+            return row[0] or 0
+
+    def rollover_request(self, cut, committed):
+        if not committed:
+            return self.read_rollover_request(cut, False)
+        if self._rollover_request is UNREAD:
+            self._rollover_request = self.read_rollover_request(cut, True)
+        return self._rollover_request
+
+    def read_rollover_request(self, cut, committed):
+        with database(self.path) as db:
+            leaf = self.leaf
+            if committed:
+                entry = db.execute(graph.ANCESTORS + """
+                    SELECT n.parent FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                    WHERE n.kind='compact' ORDER BY n.id DESC LIMIT 1
+                """, (leaf, self.id, self.id)).fetchone()
+                if entry:
+                    leaf = entry[0]
+            _, start = graph.transcript_boundary(db, self.id, leaf)
+            parents = {owner for owner, in db.execute("SELECT owner FROM subagent_links WHERE child=?", (self.id,))}
+            rows = db.execute(graph.ANCESTORS + """
+                SELECT b.seq,j.value FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                JOIN batches b ON b.session=n.session AND b.seq=n.batch JOIN json_each(b.messages) j
+                WHERE b.seq>=? AND (json_extract(j.value,'$.role')='user'
+                    OR json_type(j.value,'$._parent_assignment')='true'
+                    OR json_type(j.value,'$._irc_messages')='array')
+                ORDER BY b.seq DESC,j.key DESC
+            """, (leaf, self.id, self.id, start))
+            for seq, raw in rows:
+                message = json.loads(raw)
+                user = message["role"] == "user" and not any(message.get(key) for key in (
+                    "_mcp_notification", "_async_jobs", "_service_runs", "_irc_messages", "_goal_message",
+                ))
+                parent = message.get("_parent_assignment") or any(
+                    row.get("sender") in parents for row in message.get("_irc_messages", ())
+                )
+                if user or parent:
+                    return {"role": "user", "content": message["content"]} if seq < cut else None
+        return None
+
     def goal_record(self):
         with database(self.path) as db:
             row = db.execute(graph.ANCESTORS + """
@@ -581,7 +715,8 @@ class Session:
         self, system, summary=None, cut=0, *, include_native=False, include_archive=False, before=None, method=None,
         thinking_route=None, for_compaction=False,
     ):
-        archive = self.archive_view() if include_archive and summary is None else None
+        committed = summary is None
+        archive = self.archive_view() if include_archive and committed else None
         metadata = self.native_summary if summary is None else None
         native = metadata if include_native else None
         if metadata:
@@ -595,7 +730,7 @@ class Session:
                 content = "\n".join(part["text"] for part in content)
             head.append({"role": "user", "content": content})
         elif summary:
-            context = handoff.CONTEXT.replace("{{summary}}", summary) if method == "handoff" else (
+            context = summary if method == ROLLOVER else handoff.CONTEXT.replace("{{summary}}", summary) if method == "handoff" else (
                 "Summary of earlier conversation. Build on prior work without repeating it. "
                 "Follow the latest user request and carry forward constraints on unfinished work. "
                 "Requests from completed turns are historical.\n"
@@ -608,10 +743,12 @@ class Session:
             if native and ("items" in native or "block" in native):
                 key = "_responses_compaction" if "items" in native else "_anthropic_compaction"
                 head[-1][key] = native
+        if method == ROLLOVER and (request := self.rollover_request(max(cut, self.first_kept) if committed else cut, committed)):
+            head.append(request)
         provenance = {"_compaction_context": True} if for_compaction else {}
         if provenance and len(head) > 1:
             head[-1].update(provenance)
-        return head + [
+        messages = head + [
             {**provenance, "role": "user", "content": (
                 graph.SUMMARY_CONTEXT.replace("{{summary}}", message["content"])
                 if message.get("_branch_summary") else (
@@ -626,6 +763,16 @@ class Session:
             for message in batch
             if include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak"))
         ]
+        if (notes := self.context_notes()) and notes["text"]:
+            insert = 1
+            if len(messages) > 1 and any(key in messages[1] for key in ("_anthropic_compaction", "_responses_compaction")):
+                insert = 2
+                if insert < len(messages) and messages[insert]["role"] == "assistant":
+                    insert += 1
+                while insert < len(messages) and messages[insert]["role"] == "tool":
+                    insert += 1
+            messages.insert(insert, {**provenance, **note_message(notes["text"])})
+        return messages
 
     @session_write
     def compact(self, cut, summary, native=None):
@@ -640,7 +787,7 @@ class Session:
             if portable_archive:
                 native["portable_archive"] = portable_archive
             portable_handoff = previous.get("portable_handoff") or (
-                previous if previous.get("method") == "handoff" else None
+                previous if previous.get("method") in ("handoff", ROLLOVER) else None
             )
             if portable_handoff:
                 native["portable_handoff"] = portable_handoff
@@ -651,6 +798,7 @@ class Session:
         self.leaf = leaf
         self.first_kept, self.summary = cut, summary
         self.native_summary = native
+        self._rollover_request = UNREAD
         self._archive_view = None
         self.batches = [(seq, batch) for seq, batch in self.batches if seq >= cut]
 
@@ -703,7 +851,7 @@ class Compaction:
         self, session, window, percent, keep_recent, summarize, executor, methods=("native", "shake", "soft"),
         native_compact=None, on_context_change=None, prepare_handoff=None, context_discount=None, disable_inline=None,
         on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True, mid_turn_enabled=True,
-        budget=None,
+        budget=None, context_windows=None,
     ):
         self.session = session
         self.window = window
@@ -711,6 +859,8 @@ class Compaction:
         self.auto_enabled = auto_enabled
         self.async_enabled = async_enabled
         self.mid_turn_enabled = mid_turn_enabled
+        self.context_windows = context_windows or (lambda: False)
+        self.context_reminder = None
         self.threshold = self.budget.trigger(window)
         self.summarize = summarize
         self.executor = executor
@@ -863,6 +1013,12 @@ class Compaction:
     def maintain(self, system, reason="threshold", focus=None, *, methods=None, phase="pre", promote=None):
         if not self.auto_enabled and reason != "manual":
             return False
+        if methods is None and not focus and self.context_windows() and reason in (
+            "manual", "threshold", "overflow", "incomplete", "idle",
+        ):
+            if reason == "threshold" and (self.threshold is None or phase == "mid" and not self.mid_turn_enabled):
+                return False
+            return self.rollover(system, reason, phase=phase, promote=promote)
         methods = self.methods if methods is None else methods
         if not methods:
             return False
@@ -933,6 +1089,51 @@ class Compaction:
         if reason == "threshold" and phase == "mid" and not changed:
             self.threshold_dead_end = self.threshold_cut()
         return changed and (not retrying or self.fits_prompt(system))
+
+    def remind_context_notes(self, system):
+        if not self.auto_enabled or self.threshold is None or not self.context_windows():
+            return
+        estimate = max(self.provider_context, self.estimate(self.messages(system), floor_stored=True))
+        lead = min(32_000, max(8_192, self.threshold // 8))
+        if 0 < self.threshold - estimate <= lead:
+            boundary = self.session.context_boundary()
+            if boundary != self.context_reminder:
+                self.context_reminder = boundary
+                self.session.append([{"role": "developer", "content": REMINDER, "_context_note_reminder": True}])
+
+    def rollover(self, system, reason, *, phase="mid", promote=None):
+        if not self.window or not self.context_windows():
+            return False
+        with self.session.writer:
+            before = self.messages(system)
+            estimate = self.estimate(before, floor_stored=True)
+            if phase in ("mid", "post"):
+                estimate = max(estimate, self.provider_context)
+            if reason == "threshold" and (estimate <= self.threshold or promote and promote()):
+                return False
+            cut = self.cut_index()
+            target = self.session.batches[cut][0] if cut is not None else None
+            boundary = self.session.navigation_epoch, self.session.first_kept, target
+            if reason == "threshold" and self.threshold_dead_end == boundary:
+                return False
+            if cut is None:
+                if reason == "threshold":
+                    self.threshold_dead_end = boundary
+                return False
+            snapshot = Snapshot(self.session.first_kept, target, estimate, "",
+                                self.session.navigation_epoch, self.session.leaf)
+            result = CompactionSummary(BOUNDARY, {"method": ROLLOVER, "tokensBefore": estimate})
+            limit = self.prompt_budget if reason in ("overflow", "incomplete") else None
+
+            def commit_rollover():
+                if cancellation := active_turn():
+                    cancellation.check()
+                return self.commit(system, before, snapshot, result, limit)
+
+            changed = self.maintenance_attempt("threshold" if reason == "explicit" else reason, "soft", commit_rollover)
+            if not changed and reason == "threshold":
+                self.threshold_dead_end = boundary
+            return changed
 
     def threshold_cut(self):
         index = self.cut_index()

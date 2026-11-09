@@ -24,7 +24,7 @@ class BatchSignal(Cancellation):
 def exclusive(call, tools):
     function = call["function"]
     name = function["name"]
-    if name in ("write", "edit", "yield", "goal"):
+    if name in ("write", "edit", "yield", "goal", "context_notes", "new_context"):
         return True
     policy = getattr(tools.get(name), "concurrency", None)
     if name != "shell" and not callable(policy):

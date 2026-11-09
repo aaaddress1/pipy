@@ -180,9 +180,12 @@ def import_message(entry):
             if isinstance(rows, list):
                 message["_service_runs"] = [row for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)]
         if entry.get("customType") == "irc:incoming":
-            rows = mapping(entry.get("details")).get("messages")
+            details = mapping(entry.get("details"))
+            rows = details.get("messages")
             if isinstance(rows, list):
                 message["_irc_messages"] = [row for row in rows if isinstance(row, dict) and type(row.get("id")) is int]
+            if details.get("fromParent") is True:
+                message["_parent_assignment"] = True
         if entry.get("customType") == "ttsr-injection":
             rules = mapping(entry.get("details")).get("rules")
             if isinstance(rules, list):
@@ -320,6 +323,8 @@ def import_compaction(db, session, parent, entry, batches):
             native = {"snapcompact": archive} if archive else native.get("portable_handoff")
     if not native and entry.get("method") == "handoff":
         native = {"method": "handoff"}
+    if not native and mapping(entry.get("details")).get("kind") == "experimental-context-rollover":
+        native = {"method": "experimental-context-rollover", "tokensBefore": entry.get("tokensBefore", 0)}
     if not native and "snapcompact" in source:
         archive = mapping(source["snapcompact"])
         text = archive.get("text") or "\n".join(archive.get(key) or "" for key in ("textHead", "textTail"))
@@ -498,9 +503,12 @@ def export_message(message, call_names):
         if details := message.get("_async_jobs"):
             return {"type": "custom_message", "customType": "async-result", "content": message["content"],
                     "display": True, "attribution": "agent", "details": details}
-        if peers := message.get("_irc_messages"):
+        if (peers := message.get("_irc_messages")) or message.get("_parent_assignment"):
+            details = {"messages": peers or []}
+            if message.get("_parent_assignment"):
+                details["fromParent"] = True
             return {"type": "custom_message", "customType": "irc:incoming", "content": message["content"],
-                    "display": True, "attribution": "agent", "details": {"messages": peers}}
+                    "display": True, "attribution": "agent", "details": details}
         if services := message.get("_service_runs"):
             return {"type": "custom_message", "customType": "launch-completion", "content": message["content"],
                     "display": True, "attribution": "agent", "details": {"daemons": services}}
@@ -694,6 +702,9 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                           "miniPi": {"native": native, "cut": anchor(cut, parent), "summary": summary}}
                 if native and native.get("method") == "handoff":
                     record["method"] = "handoff"
+                if native and native.get("method") == "experimental-context-rollover":
+                    record["details"] = {"kind": "experimental-context-rollover", "version": 1}
+                    record["tokensBefore"] = native.get("tokensBefore", 0)
             elif kind == "elision":
                 record = {"type": "custom", "customType": "mini-pi.elision",
                           "data": [(anchors[batch], position, value) for batch, position, value in payload]}
@@ -708,7 +719,7 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
             todo_entry = None
             if kind == "tool_update":
                 todo_entry = payload[2].get("_todo_entry_id")
-            elif kind == "foreign" and record.get("customType") == "user_todo_edit":
+            elif kind == "foreign" and record.get("customType") in ("user_todo_edit", "experimental_context_notes"):
                 todo_entry = record.get("id")
             entry = make(record, base, sources.get(identifier), todo_entry=todo_entry)
             base = entry["id"]

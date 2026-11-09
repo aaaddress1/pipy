@@ -77,6 +77,7 @@ import task_isolation
 from cache_warmer import CacheWarmer
 from cancellable_http import CancellableTransport, TransportLoop, active_turn, turn_scope
 from compaction_policy import CompactionPolicy, setting as layered_setting
+from context_windows import HISTORY as CONTEXT_HISTORY, TOOLS as CONTEXT_TOOLS, history_route, read_history, search_history
 from goals import Goals, GoalSteer, SCHEMA as GOAL_SCHEMA, describe as describe_goal, discard_stale_goal_steers
 from todos import Todos
 from cost_gate import CostCapError, CostGate, entry_usage, total_cost
@@ -248,6 +249,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 session.append([{"role": "developer", "content": notice}])
             system = system_prompt()
             recovery.maintain(system, phase)
+            compaction.remind_context_notes(system)
             messages = compaction.messages(system)
             try:
                 active_tools = tools()
@@ -406,6 +408,11 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 stop_guard.retries = 0
         if child and child.submitted is not None:
             return assistant["content"]
+        if any(index in completed and call["function"]["name"] == "new_context"
+               and not batch[index + 1].get("_tool_error")
+               and (batch[index + 1].get("_tool_details") or {}).get("requested") is True
+               for index, call in enumerate(calls)):
+            compaction.rollover(system_prompt(), "explicit")
     raise StepLimitReached(f"Reached the limit of {max_steps} model steps. Use --continue or /continue to resume.")
 
 
@@ -909,7 +916,7 @@ def shell_output(session, output, header, limit=OUTPUT_LIMIT, preview=None):
 
 def workspace_tools(workspace, session, turn=None, mcp=None, *, jobs=None, auto_background=None, max_timeout=0,
                     shell_runner=run_shell, peer=None, async_shell=True, rules=None, memory_files=None, skills=None,
-                    mnemopi=None):
+                    mnemopi=None, context_history=False):
     bridge = getattr(turn, "bridge", None)
     services = jobs.services if jobs else None
 
@@ -924,6 +931,8 @@ def workspace_tools(workspace, session, turn=None, mcp=None, *, jobs=None, auto_
         return target
 
     def read(path):
+        if history_route(path):
+            return read_history(path, session, context_history, OUTPUT_LIMIT)
         if path.startswith("rule://"):
             return clipped(read_rule(path, rules.rules if rules else {}))
         if path.startswith("memory://"):
@@ -1111,6 +1120,13 @@ def workspace_tools(workspace, session, turn=None, mcp=None, *, jobs=None, auto_
     if jobs:
         tools["wait"] = ("Wait for a peer reply, background job or owned service when there is no other useful work.", {},
                          lambda: jobs.wait(active_turn() or turn))
+    if context_history:
+        def grep(pattern, path, case=True, skip=None):
+            return clipped(search_history(path, pattern, case, skip, session, context_history))
+
+        tools["grep"] = (f"Search the current branch's raw history with a regular expression. Use {CONTEXT_HISTORY}.",
+                         {"pattern": "Regular expression", "path": "Raw history URL, optionally with a line range",
+                          "case": ("Match case (default true)", "boolean"), "skip": ("Matches to skip", "number")}, grep)
     return tools
 
 
@@ -1307,6 +1323,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         maintenance_layers = getattr(args, "compaction_layers", None)
         if maintenance_layers is None:
             maintenance_layers = (args.rule_config, *project_context.settings_layers(workspace))
+        context_windows_enabled = layered_setting(maintenance_layers, "compaction.experimentalContextManagement") is True
         context_policy = CompactionPolicy(maintenance_layers, percent=args.compact_at, keep_recent=args.keep_recent,
                                           agent=child.task.agent.name if child else None)
         goal_modes = next((value for layer in reversed(maintenance_layers)
@@ -1418,7 +1435,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         builtin_tools = partial(workspace_tools, workspace, session, jobs=jobs,
                                 auto_background=args.async_auto_background, max_timeout=args.tools_max_timeout,
                                 shell_runner=shell_runner, peer=peer, async_shell=args.async_enabled, rules=rules,
-                                memory_files=memory_files, skills=skills, mnemopi=mnemopi)
+                                memory_files=memory_files, skills=skills, mnemopi=mnemopi,
+                                context_history=context_windows_enabled)
         eval_py, eval_js, interpreter, per_call, eval_background, eval_provision = eval_settings(
             (args.rule_config, *project_context.settings_layers(workspace)),
         )
@@ -1500,6 +1518,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
 
         def build_tools(turn=None, manager=None):
             tools = builtin_tools(turn, manager)
+            if context_windows_enabled:
+                tools.update(context_window_tools)
             if todo.enabled and not (child and child.task.structured):
                 tools["todo"] = todo
             if eval_tool:
@@ -1513,11 +1533,48 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             tools.update(learning_tools())
             return tools
 
+        def context_notes(values):
+            cancellation = active_turn()
+            if cancellation:
+                cancellation.check()
+            if values == {}:
+                notes = session.context_notes()
+                return tool_result(notes["text"] if notes else "No context notes are stored for this session branch.",
+                                   notes or {"text": ""})
+            if not isinstance(values, dict) or values.keys() != {"text"} or not isinstance(values["text"], str):
+                return tool_result("Expected a notebook text string.", {}, True)
+            try:
+                saved = session.save_context_notes(values["text"], session.navigation_epoch,
+                                                   cancellation.check if cancellation else None)
+            except ValueError as error:
+                return tool_result(str(error), {}, True)
+            return tool_result("Context notes saved.", saved)
+
+        def new_context(values):
+            if cancellation := active_turn():
+                cancellation.check()
+            if values != {}:
+                return tool_result("new_context takes no arguments.", {}, True)
+            return tool_result("New context window requested.", {"requested": True})
+
+        context_window_tools = {
+            "context_notes": subagents.Tool(
+                "Read the current notebook, replace it with concise working state, or clear it with empty text.",
+                {"type": "object", "properties": {"text": {"type": "string"}}, "additionalProperties": False}, context_notes,
+            ),
+            "new_context": subagents.Tool(
+                "Request rollover after the current tool batch. Update context_notes first.",
+                {"type": "object", "properties": {}, "additionalProperties": False}, new_context,
+            ),
+        }
+
         def configured_tools(builtin=None):
             if builtin is None:
                 manager = current_mcp()
                 builtin = build_tools(active_turn(), manager)
             available = {**builtin, **external_tools()}
+            if context_windows_enabled:
+                available.update({name: builtin[name] for name in CONTEXT_TOOLS if name in builtin})
             if goal and (goal_tool := goal.advertised_tool()):
                 available["goal"] = subagents.Tool(
                     "Read or manage the session goal. Complete it only after verifying every deliverable.",
@@ -2546,7 +2603,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             async_enabled=eval_setting(maintenance_layers, "compaction.asyncEnabled") is not False,
             auto_enabled=eval_setting(maintenance_layers, "compaction.enabled") is not False,
             mid_turn_enabled=child is not None or eval_setting(maintenance_layers, "compaction.midTurnEnabled") is not False,
-            budget=budget,
+            budget=budget, context_windows=lambda: (
+                context_windows_enabled and (router.route.catalog_model or {}).get("supportsTools") is not False
+                and CONTEXT_TOOLS <= configured_tools().keys()
+            ),
         )
         bound = (router.route, router.credential)
 
