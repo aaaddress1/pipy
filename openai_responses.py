@@ -18,6 +18,7 @@ import model_catalog
 import codex_responses
 import responses_cache
 import responses_resume
+from responses_tools import ITEM_EVENTS, TOOL_EVENTS, TOOL_ITEMS, StreamedTools
 from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
 from responses_websocket import generation_evidence
@@ -535,6 +536,15 @@ def http_events(client, body, prepare_resumed):
             yield from (event.to_dict() for event in stream)
 
 
+def event_type(event):
+    kind = event["type"]
+    if kind in ("response.done", "response.completed"):
+        status = (event.get("response") or {}).get("status")
+        if status in ("completed", "incomplete", "failed"):
+            return f"response.{status}"
+    return kind
+
+
 def chained_http_events(client, body, chain_state, prepare_resumed=None, breakpoint=None):
     full, wire = chain_state.request(body, breakpoint)
     for attempt in range(2):
@@ -542,7 +552,7 @@ def chained_http_events(client, body, chain_state, prepare_resumed=None, breakpo
         try:
             with closing(http_events(client, wire, prepare_resumed)) as stream:
                 for event in stream:
-                    kind = event["type"]
+                    kind = event_type(event)
                     response = event.get("response") or {}
                     if first and attempt == 0 and kind in ("error", "response.failed") and not generation_evidence(response):
                         error = response.get("error") or event.get("error") or event
@@ -650,7 +660,7 @@ def stream_attempt(
     else:
         body, breakpoint = responses_cache.prepare(body, route, messages, prompt_cache_key)
     visible, thinking, tool_draft = [], [], False
-    stream_tools = {}
+    stream_tools = StreamedTools(codex=codex_route is not None)
     usage = reported_usage = None
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
@@ -659,13 +669,13 @@ def stream_attempt(
             for event in stream:
                 if cancel:
                     cancel()
-                kind = event["type"]
+                kind = event_type(event)
                 if kind == "response.created":
                     if tracker:
                         tracker.restart()
                     if speculation:
                         speculation.restart()
-                    stream_tools.clear()
+                    stream_tools.reset()
                 elif kind in ("response.output_text.delta", "response.refusal.delta"):
                     piece = event["delta"]
                     guard.push(None, piece, tool_draft)
@@ -689,28 +699,18 @@ def stream_attempt(
                     tracker.end_text("text")
                 elif kind in ("response.reasoning_text.done", "response.reasoning_summary_text.done") and tracker:
                     tracker.end_text("thinking")
-                elif kind in ("response.function_call_arguments.delta", "response.function_call_arguments.done") or (
-                    kind in ("response.output_item.added", "response.output_item.done")
-                    and event["item"]["type"] == "function_call"
-                ):
-                    tool_draft = True
-                    guard.push(None, None, True)
-                    checking = tracker and tracker.rules.stream_tools
-                    if checking or speculation:
-                        index = event.get("output_index")
-                        if item := event.get("item"):
-                            stream_tools[index] = [item.get("name", ""), item.get("call_id"), item.get("arguments", "")]
-                        if index in stream_tools:
-                            current = stream_tools[index]
-                            if kind == "response.function_call_arguments.delta":
-                                current[2] += event["delta"]
-                            elif kind == "response.function_call_arguments.done":
-                                current[2] = event.get("arguments", current[2])
-                            final = kind in ("response.function_call_arguments.done", "response.output_item.done")
-                            if checking:
-                                tracker.tool(index, current[0], current[2], current[1], final=final)
-                            if speculation:
-                                speculation.observe(index, current[0], current[1], current[2], final=final)
+                elif kind in TOOL_EVENTS or kind in ITEM_EVENTS:
+                    draft = stream_tools.observe(event)
+                    if kind in TOOL_EVENTS or (event.get("item") or {}).get("type") in TOOL_ITEMS:
+                        tool_draft = True
+                        guard.push(None, None, True)
+                    if draft and (tracker or speculation):
+                        name, identifier = draft.item["name"], draft.item["call_id"]
+                        final = draft.arguments_done or draft.closed
+                        if tracker and tracker.rules.stream_tools:
+                            tracker.tool(draft.index, name, draft.raw, identifier, final=final)
+                        if speculation:
+                            speculation.observe(draft.index, name, identifier, draft.raw, final=final)
                 elif kind in ("response.completed", "response.incomplete", "response.failed"):
                     response = event["response"]
                     reported_usage = response.get("usage")
@@ -718,20 +718,29 @@ def stream_attempt(
                     details = {"text": "".join(visible), "tool_draft": tool_draft, "usage": usage}
                     error = response.get("error") or {}
                     resumed = event.get("_resumed_message")
+                    truncated = False
+                    executable = True
                     if error.get("code") in ("context_length_exceeded", "context_window_exceeded"):
                         raise ContextWindowExceeded("Responses context window exceeded.", **details)
-                    if kind == "response.incomplete" and (
-                        resumed or (response.get("incomplete_details") or {}).get("reason") == "max_output_tokens"
-                    ):
-                        raise IncompleteTurn("Responses reached the generation limit.", **details)
-                    if kind != "response.completed" or response.get("status") != "completed":
+                    at_limit = (response.get("incomplete_details") or {}).get("reason") == "max_output_tokens"
+                    if kind == "response.incomplete" and (at_limit or resumed):
+                        if tool_choice not in ("none", "auto"):
+                            recovered, executable = stream_tools.truncated(response, details["text"], allow_execute=at_limit)
+                        else:
+                            recovered = None
+                        if recovered is None:
+                            raise IncompleteTurn("Responses reached the generation limit.", **details)
+                        response, truncated = recovered, True
+                    elif kind != "response.completed" or response.get("status") != "completed":
                         raise StreamInterrupted("Responses did not complete the turn.", **details)
                     guard.finish()
                     if tool_choice in ("none", "auto"):
                         text = "\n".join(piece for item in response["output"] if (piece := item_text(item, "\n")))
                         return {"role": "assistant", "content": text or None}, usage
                     tool_draft |= any(item.get("type") == "function_call" for item in response["output"])
-                    message = resumed or completed_message(response, route, model, fingerprint)
+                    message = resumed if resumed and not truncated else completed_message(response, route, model, fingerprint)
+                    if truncated and not executable:
+                        message["_tool_stop"] = "length"
                     if thought := event.get("_resumed_thinking") or "".join(thinking):
                         message["_thinking"] = thought
                     if (not response.get("_steered") and not message.get("tool_calls")
@@ -740,7 +749,7 @@ def stream_attempt(
                         for item in (message.get("_responses") or {}).get("items", ())
                     )):
                         raise EmptyTurn("Responses stopped without actionable output.", usage=usage)
-                    if http_chain and (chain_result := event.get("_http_chain")):
+                    if not truncated and http_chain and (chain_result := event.get("_http_chain")):
                         http_chain.complete(*chain_result, response, message)
                     if show and not visible and message["content"]:
                         visible.append(message["content"])

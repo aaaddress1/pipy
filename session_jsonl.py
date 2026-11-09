@@ -458,7 +458,8 @@ def export_message(message, call_names):
         result = {
             "role": "assistant", "content": content, "timestamp": now, "api": "openai-completions",
             "provider": "openai", "model": "unknown",
-            "stopReason": "aborted" if message.get("_ttsr_aborted") else "toolUse" if message.get("tool_calls") else "stop",
+            "stopReason": ("aborted" if message.get("_ttsr_aborted") else message.get("_tool_stop")
+                           or ("toolUse" if message.get("tool_calls") else "stop")),
             "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
                       "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
         }

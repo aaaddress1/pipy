@@ -230,14 +230,19 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         compaction.observe(messages, usage)
         matched = rules.response if rules else None
         calls = assistant.get("tool_calls", [])
+        skipped = assistant.get("_tool_stop") == "length"
         for call in calls:
             function = call["function"]
             function["name"] = tool_alias(function["name"], active_tools)
         batch = [assistant, *[
             {
                 "role": "tool", "tool_call_id": call["id"],
-                "content": "Interrupted before result was recorded. Check workspace state before repeating this action.",
+                "content": ("Tool call was not executed because the assistant reached its output limit. "
+                            "Split the work into smaller tool calls." if skipped else
+                            "Interrupted before result was recorded. Check workspace state before repeating this action."),
                 "_tool_error": True,
+                **({"_tool_details": {"__synthetic": True, "source": "assistant_stop_length", "executed": False}}
+                   if skipped else {}),
             }
             for call in calls
         ]]
@@ -283,12 +288,20 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 session.append([{"role": "developer", "content": reminder}])
                 continue
             return assistant["content"]
-        if child and child.yields and any(call["function"]["name"] == "yield" for call in calls):
-            child.yield_context(assistant, session, seq)
-        tool_results, completed = execute_tool_batch(
-            session, seq, batch, active_tools, tool_workers, partial(run_tool, active_tools, turn=turn, speculation=speculation),
-            turn=turn, cancellation=cancellation, child=child, jobs=jobs,
-        )
+        if skipped:
+            tool_results, completed = [], set()
+            if turn:
+                for call, result in zip(calls, batch[1:]):
+                    turn.tool_start(call)
+                    turn.tool_finished(call, result)
+                    tool_results.append(turn.publish(result))
+        else:
+            if child and child.yields and any(call["function"]["name"] == "yield" for call in calls):
+                child.yield_context(assistant, session, seq)
+            tool_results, completed = execute_tool_batch(
+                session, seq, batch, active_tools, tool_workers, partial(run_tool, active_tools, turn=turn, speculation=speculation),
+                turn=turn, cancellation=cancellation, child=child, jobs=jobs,
+            )
         if on_tools:
             on_tools(len(completed))
         if speculation:
@@ -382,8 +395,14 @@ def stream_reply(
                                             usage_observer=observer, tracker=tracker, on_text=on_text, speculation=speculation)
             if tracker:
                 rules.response = tracker.finish(result[0])
+            skipped = result[0].get("_tool_stop") == "length"
+            if meter and skipped:
+                meter.finish("length")
             if speculation:
-                speculation.seal(result[0].get("tool_calls", ()))
+                if skipped:
+                    speculation.discard()
+                else:
+                    speculation.seal(result[0].get("tool_calls", ()))
             return result
         except ThinkingLoop as error:
             if speculation:
