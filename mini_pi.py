@@ -2189,10 +2189,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 options["prompt_cache_key"] = session.request_cache_key
             return options
 
-        def live_messages(system, route):
+        def live_messages(system, route, *, before=None):
             messages = session.messages(
                 system, include_native=route.api != "chat-completions", include_archive=True,
-                thinking_route=chat_thinking_scope(route),
+                thinking_route=chat_thinking_scope(route), before=before,
             )
             if eval_tool and (snapshot := eval_tool.context()):
                 messages.append({"role": "user", "content": snapshot})
@@ -2513,11 +2513,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 unique[key(largest)] = largest
             return tuple(unique.values())
 
-        def prepare_handoff(system, focus, automatic, cancellation):
+        def prepare_handoff(system, focus, automatic, cancellation, *, before=None):
             candidates = maintenance_routes() if automatic else (router.route,)
             schemas = tool_schemas(configured_tools())
             request = {"role": "user", "content": handoff.prompt(focus)}
-            plans = {route.identity(): ([*live_messages(system, route)[0], request], request_options(route))
+            plans = {route.identity(): ([*live_messages(system, route, before=before)[0], request], request_options(route))
                      for route in candidates}
 
             def send(route, credential):

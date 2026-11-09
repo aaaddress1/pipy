@@ -926,6 +926,7 @@ class Snapshot:
     transcript: str
     navigation_epoch: int = 0
     leaf: int | None = None
+    pending_from: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1065,7 +1066,7 @@ class Compaction:
     def fits_prompt(self, system):
         return self.prompt_budget is None or self.estimate(self.messages(system), floor_stored=True) <= self.prompt_budget
 
-    def cut_index(self):
+    def cut_index(self, pending_from=None):
         if len(self.session.batches) < 2:
             return None
         budget = self.budget.recent_budget(self.window)
@@ -1083,16 +1084,28 @@ class Compaction:
             if kept > budget:
                 break
             cut = index
+        if pending_from is not None:
+            cut = next((index for index, (seq, _) in enumerate(batches[:cut]) if seq >= pending_from), cut)
         return cut or None
 
-    def snapshot(self, estimated):
-        if (cut := self.cut_index()) is None:
+    def pending_input_start(self):
+        start = None
+        for seq, batch in reversed(self.session.batches):
+            for message in reversed(batch):
+                if message["role"] == "assistant":
+                    return start
+                if message["role"] in ("user", "developer"):
+                    start = seq
+        return start
+
+    def snapshot(self, estimated, pending_from=None):
+        if (cut := self.cut_index(pending_from)) is None:
             return None
         discarded = [message for _, batch in self.session.batches[:cut] for message in batch]
         prefix = [portable_message(message) for message in without_useless(discarded)]
         payload = pack({"previous_summary": self.session.summary, "discarded_messages": prefix})
         return Snapshot(self.session.first_kept, self.session.batches[cut][0], estimated, payload,
-                        self.session.navigation_epoch, self.session.leaf)
+                        self.session.navigation_epoch, self.session.leaf, pending_from)
 
     def shake_for_body_read_timeout(self, check=None, replay_prefixes=None):
         return self.shake(AUTO, tool_results_only=True, check=check, replay_prefixes=replay_prefixes)
@@ -1147,11 +1160,14 @@ class Compaction:
             except SQLiteError:
                 print("[pruning: could not persist tool result updates]", file=sys.stderr)
 
-    def shake(self, preset, *, tool_results_only=False, check=None, replay_prefixes=None):
+    def shake(self, preset, *, tool_results_only=False, check=None, replay_prefixes=None, before=None):
         if check:
             check()
+        batches = self.session.batches
+        if before is not None:
+            batches = [(seq, batch) for seq, batch in batches if seq < before]
         replacements, artifacts, savings = plan(
-            self.session.batches, tokens, preset, tool_results_only=tool_results_only,
+            batches, tokens, preset, tool_results_only=tool_results_only,
             message_tokens=lambda message: tokens(portable_message(message)),
         )
         if not savings:
@@ -1182,12 +1198,13 @@ class Compaction:
             self.last_commit_node = None
         if not self.auto_enabled and reason != "manual":
             return False
+        pending_from = self.pending_input_start() if reason == "threshold" and phase == "pre" else None
         if methods is None and not focus and self.context_windows() and reason in (
             "manual", "threshold", "overflow", "incomplete", "idle",
         ):
             if reason == "threshold" and (self.threshold is None or phase == "mid" and not self.mid_turn_enabled):
                 return False
-            return self.rollover(system, reason, phase=phase, promote=promote)
+            return self.rollover(system, reason, phase=phase, promote=promote, pending_from=pending_from)
         methods = self.methods if methods is None else methods
         if not methods:
             return False
@@ -1204,9 +1221,9 @@ class Compaction:
                 self.threshold_dead_end = None
             if estimated <= self.threshold:
                 if estimated < self.threshold:
-                    self.start_speculation(system, estimated)
+                    self.start_speculation(system, estimated, pending_from=pending_from)
                 return False
-            if self.start_speculation(system, estimated):
+            if self.start_speculation(system, estimated, pending_from=pending_from):
                 return False
             if promote and promote():
                 return False
@@ -1215,7 +1232,7 @@ class Compaction:
             if reason in ("manual", "idle") or not self.pending.future.done():
                 self.discard_pending()
             else:
-                self.check_speculation(estimated)
+                self.check_speculation(system, estimated, pending_from=pending_from)
         changed = False
         for index, method in enumerate(methods):
             if not self.method_usable(method, reason):
@@ -1227,7 +1244,7 @@ class Compaction:
             if self.pending and self.pending.method != method:
                 self.discard_pending()
             if method == "shake":
-                reclaimed = self.maintenance_attempt(reason, method, partial(self.shake, AUTO))
+                reclaimed = self.maintenance_attempt(reason, method, partial(self.shake, AUTO, before=pending_from))
                 if reason == "idle":
                     return reclaimed
                 if reclaimed:
@@ -1245,7 +1262,7 @@ class Compaction:
                 attempt = partial(
                     self.summarize_history, system, reason != "threshold", method, recovery_band,
                     pending_only=method == "handoff" and reason in ("overflow", "media"),
-                    automatic=reason != "manual", focus=focus,
+                    automatic=reason != "manual", focus=focus, pending_from=pending_from,
                 )
                 if self.maintenance_attempt(reason, method, attempt):
                     return True
@@ -1313,7 +1330,7 @@ class Compaction:
                 self.context_reminder = boundary
                 self.session.append([{"role": "developer", "content": REMINDER, "_context_note_reminder": True}])
 
-    def rollover(self, system, reason, *, phase="mid", promote=None):
+    def rollover(self, system, reason, *, phase="mid", promote=None, pending_from=None):
         if not self.window or not self.context_windows():
             return False
         with self.session.writer:
@@ -1323,7 +1340,7 @@ class Compaction:
                 estimate = max(estimate, self.provider_context)
             if reason == "threshold" and (estimate <= self.threshold or promote and promote()):
                 return False
-            cut = self.cut_index()
+            cut = self.cut_index(pending_from)
             target = self.session.batches[cut][0] if cut is not None else None
             boundary = self.session.navigation_epoch, self.session.first_kept, target
             if reason == "threshold" and self.threshold_dead_end == boundary:
@@ -1333,7 +1350,7 @@ class Compaction:
                     self.threshold_dead_end = boundary
                 return False
             snapshot = Snapshot(self.session.first_kept, target, estimate, "",
-                                self.session.navigation_epoch, self.session.leaf)
+                                self.session.navigation_epoch, self.session.leaf, pending_from)
             result = CompactionSummary(BOUNDARY, {"method": ROLLOVER, "tokensBefore": estimate})
             limit = self.prompt_budget if reason in ("overflow", "incomplete") else None
 
@@ -1386,7 +1403,8 @@ class Compaction:
 
     def handoff_request(self, system, snapshot, focus, automatic, cancellation):
         files = self.session.file_operations(snapshot.first_kept)
-        request = self.prepare_handoff(system, focus, automatic, cancellation)
+        options = {"before": snapshot.pending_from} if snapshot.pending_from is not None else {}
+        request = self.prepare_handoff(system, focus, automatic, cancellation, **options)
 
         def run(_):
             document = request()
@@ -1514,16 +1532,18 @@ class Compaction:
     def native_request(self, system, snapshot, speculative):
         route = self.session.archive_route
         batches = self.session.batches
-        cut = snapshot.first_kept
+        cut, pending_from = snapshot.first_kept, snapshot.pending_from
         anthropic = route and route.api in ANTHROPIC_COMPACTION_APIS
         files_due_before = float("inf")
         if anthropic:
             # Anthropic merges adjacent messages on the same side of a turn.
             # Move past that run so the retained signed assistant sees the same wire boundary.
+            end = pending_from if pending_from is not None else batches[-1][0] + 1
             cut = next((right_seq for (_, left), (right_seq, right) in zip(batches, batches[1:])
                         if right_seq >= cut and right[0]["role"] not in ("developer", "system")
                         and (left[-1]["role"] == "assistant") != (right[0]["role"] == "assistant")),
-                       batches[-1][0] + 1)
+                       end)
+            cut = min(cut, end)
             if first := next((batch[0] for seq, batch in batches if seq >= cut), None):
                 last = next((message for seq, batch in reversed(batches) if seq < cut
                              for message in reversed(batch) if message["role"] != "tool"), None)
@@ -1535,8 +1555,9 @@ class Compaction:
         covered = next(seq for seq, _ in reversed(batches) if seq < cut)
         whole = None
         if responses:
-            whole = self.session.messages(system, include_native=True, include_archive=True, for_compaction=True)
-        last = batches[-1][0]
+            whole = self.session.messages(system, include_native=True, include_archive=True, before=pending_from,
+                                          for_compaction=True)
+        last = next(seq for seq, _ in reversed(batches) if pending_from is None or seq < pending_from)
         compact = self.native_compact
         session_id = self.session.transcript_id
         if speculative:
@@ -1551,12 +1572,15 @@ class Compaction:
 
         return run
 
-    def start_speculation(self, system, estimated):
+    def start_speculation(self, system, estimated, *, pending_from=None):
         """Start a side request if useful and return whether threshold maintenance should defer."""
         if self.threshold is None or not self.auto_enabled:
             return False
-        self.check_speculation(estimated, system=system)
         if not self.async_enabled:
+            self.discard_pending()
+            return False
+        invalidated = self.check_speculation(system, estimated, pending_from=pending_from, refresh=estimated < self.threshold)
+        if invalidated and estimated > self.threshold:
             return False
         method = next((item for item in self.methods if self.method_usable(item, "threshold")
                        and not (item == "native" and self.native_speculation_failed)), None)
@@ -1569,7 +1593,7 @@ class Compaction:
             return False
         if self.pending:
             return above and not self.pending.future.done()
-        snapshot = self.snapshot(estimated)
+        snapshot = self.snapshot(estimated, pending_from)
         if not snapshot or snapshot.first_kept == self.last_cuts.get(method):
             return False
         cancellation = handoff.Cancellation(automatic=True)
@@ -1583,17 +1607,18 @@ class Compaction:
         print("[compaction: background summary started]", file=sys.stderr)
         return above
 
-    def check_speculation(self, estimated, *, system=None):
+    def check_speculation(self, system, estimated, *, pending_from=None, refresh=False):
+        """Return true when an armed result was discarded and needs a fresh cut."""
         if not self.pending:
-            return
+            return False
         pending = self.pending
         snapshot, future = pending.snapshot, pending.future
         if (not self.async_enabled or snapshot.navigation_epoch != self.session.navigation_epoch
             or snapshot.boundary != self.session.first_kept or future.cancelled()):
             self.discard_pending()
-            return
+            return False
         if not future.done():
-            return
+            return False
         if error := future.exception():
             if pending.method == "native":
                 transient = isinstance(error, (CancelledError, StreamInterrupted, *TRANSPORT_ERRORS))
@@ -1602,16 +1627,18 @@ class Compaction:
                 self.native_speculation_failed = not transient
             print(f"[compaction: background request failed ({type(error).__name__})]", file=sys.stderr)
             self.discard_pending()
-        elif system is not None:
+        else:
             result = future.result()
             summary = CompactionSummary(result) if isinstance(result, str) else result
             native = summary.native if isinstance(summary, CompactionSummary) else None
-            grew = estimated - snapshot.context_tokens > max(self.budget.keep_recent, 8192)
+            grew = refresh and estimated - snapshot.context_tokens > max(self.budget.keep_recent, 8192)
             band = self.armed_recovery_band(snapshot, summary)
             if (grew and not (native and native.get("block"))) or not self.compaction_costs(
-                system, self.messages(system), snapshot, summary, band, True,
+                system, self.messages(system), snapshot, summary, band, True, pending_from=pending_from, armed=True,
             ):
                 self.discard_pending()
+                return True
+        return False
 
     def armed_recovery_band(self, snapshot, summary, default=None):
         native = summary.native if isinstance(summary, CompactionSummary) else None
@@ -1620,27 +1647,26 @@ class Compaction:
             return min(default, band) if default is not None else band
         return default
 
-    def summarize_history(self, system, force, method, recovery_band=None, *, pending_only=False, automatic=True, focus=None):
+    def summarize_history(self, system, force, method, recovery_band=None, *, pending_only=False, automatic=True,
+                          focus=None, pending_from=None):
         messages = self.messages(system)
         estimated = self.estimate(messages)
-        snapshot = self.snapshot(estimated)
-        if not snapshot:
-            return False
-        if not force and snapshot.first_kept == self.last_cuts.get(method):
-            return False
         armed = self.pending if self.pending and self.pending.method == method else None
         if pending_only and not armed:
             return False
-        self.last_cuts[method] = snapshot.first_kept
         try:
             if armed:
                 self.pending = None
                 result = armed.future.result()
                 band = self.armed_recovery_band(armed.snapshot, result, recovery_band)
-                if self.commit(system, messages, armed.snapshot, result, band):
+                if self.commit(system, messages, armed.snapshot, result, band, pending_from=pending_from, armed=True):
                     return True
             if pending_only:
                 return False
+            snapshot = self.snapshot(estimated, pending_from)
+            if not snapshot or not force and snapshot.first_kept == self.last_cuts.get(method):
+                return False
+            self.last_cuts[method] = snapshot.first_kept
             request, payload = self.summary_request(method, system, snapshot, automatic=automatic, focus=focus)
             return self.commit(system, messages, snapshot, request(payload), recovery_band)
         except CancelledError:
@@ -1650,33 +1676,49 @@ class Compaction:
             print(f"[compaction: summary request failed ({type(error).__name__})]", file=sys.stderr)
             return False
 
-    def compaction_costs(self, system, before, snapshot, summary, recovery_band, require_reduction):
+    def compaction_costs(self, system, before, snapshot, summary, recovery_band, require_reduction, *,
+                         pending_from=None, armed=False):
         if (
             not isinstance(summary, CompactionSummary) or not summary.text.strip() or snapshot.boundary != self.session.first_kept
             or snapshot.navigation_epoch != self.session.navigation_epoch
         ):
             return None
         native = summary.native or {}
+        if armed and (route := self.session.archive_route):
+            if "items" in native and not responses_replay_matches(native, route):
+                return None
+            if "block" in native and (route.api not in ANTHROPIC_COMPACTION_APIS or not route.native_compaction
+                    or not (native.get("route") == route.identity() or native.get("anthropic_provider") == native_provider(route))):
+                return None
         cut = native["replay_through"] + 1 if "replay_through" in native else snapshot.first_kept
+        if any(boundary is not None and cut > boundary for boundary in (snapshot.pending_from, pending_from)):
+            return None
+        if snapshot.leaf is not None and self.session.leaf != snapshot.leaf:
+            with database(self.session.path) as db:
+                if not graph.intact_compaction_prefix(db, self.session.id, self.session.leaf, snapshot.leaf, cut):
+                    return None
         after = self.messages(system, summary.text, cut, method=native.get("method"))
         extra_tokens = native.get("replacement_tokens", 0)
-        before_tokens = self.context_cost(before)
+        estimated, stored = self.context_sizes(before, None)
+        before_tokens = stored if armed else estimated
         after_tokens = tokens(after) + extra_tokens
-        projected = self.estimate(after, extra_tokens)
+        projected = after_tokens if armed else self.estimate(after, extra_tokens)
         if (require_reduction and after_tokens >= before_tokens) or (self.window and projected >= self.window):
             return None
         if recovery_band is not None and projected > recovery_band:
             return None
         return cut, before_tokens, after_tokens
 
-    def commit(self, system, before, snapshot, result, recovery_band=None, *, require_reduction=True):
+    def commit(self, system, before, snapshot, result, recovery_band=None, *, require_reduction=True,
+               pending_from=None, armed=False):
         summary = CompactionSummary(result) if isinstance(result, str) else result
         cancellation = active_turn()
         check = cancellation.check if cancellation else None
         with self.session.writer:
             if check:
                 check()
-            costs = self.compaction_costs(system, before, snapshot, summary, recovery_band, require_reduction)
+            costs = self.compaction_costs(system, before, snapshot, summary, recovery_band, require_reduction,
+                                          pending_from=pending_from, armed=armed)
             if costs is None:
                 return False
             cut, before_tokens, after_tokens = costs

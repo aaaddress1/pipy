@@ -203,6 +203,26 @@ def nodes(db, session, leaf, after=0):
     """, (leaf, session, session, after)).fetchall()
 
 
+def intact_compaction_prefix(db, session, leaf, snapshot_leaf, cut):
+    found, rewritten = db.execute("""
+        WITH RECURSIVE suffix(id,parent,kind,payload) AS (
+            SELECT id,parent,kind,payload FROM session_nodes WHERE id=? AND session=?
+            UNION ALL
+            SELECT n.id,n.parent,n.kind,n.payload FROM session_nodes n JOIN suffix s ON n.id=s.parent
+            WHERE n.session=? AND n.id>=?
+        )
+        SELECT coalesce(max(n.id = ?),0), coalesce(max(n.id > ? AND (
+            n.kind IN ('compact','reset') OR
+            (n.kind='tool_update' AND json_extract(n.payload,'$[0]') < ?) OR
+            (n.kind='elision' AND EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN n.kind='elision' THEN n.payload ELSE '[]' END) e
+                WHERE json_extract(e.value,'$[0]') < ?
+            ))
+        )),0) FROM suffix n
+    """, (leaf, session, session, snapshot_leaf, snapshot_leaf, snapshot_leaf, cut, cut)).fetchone()
+    return bool(found and not rewritten)
+
+
 def without_images(message):
     """Strip projected image blocks while preserving text, tool details and pairing."""
     if message.get("role") not in ("user", "developer", "tool"):
