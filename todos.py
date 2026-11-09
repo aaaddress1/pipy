@@ -534,6 +534,12 @@ class Todos:
             return None
         return notice("eager-todo-prelude", "Create a phased todo list covering every requested deliverable before substantial work.")
 
+    def post_compaction_prelude(self, active):
+        if not active or self.eager not in ("always", "preferred") or self.phases:
+            return None
+        action = "You MUST call" if self.eager == "always" else "Consider calling"
+        return notice("eager-todo-prelude", f"{action} the todo tool to record a phased plan for the remaining work.")
+
     def mid_run(self, active):
         if active and self.mid_reminders and self.mutations >= 12 and self.nudges < 2 and actionable(self.phases):
             self.mutations, self.nudges = 0, self.nudges + 1

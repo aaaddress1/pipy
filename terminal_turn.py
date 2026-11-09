@@ -79,6 +79,8 @@ class TerminalTurn(Cancellation):
         self.live = LiveQueue(self, lane.steers, lambda: lane.steering_mode, lane.repaint)
         self.background = works[0].background
         self.goal_next = None
+        self.compaction_next = None
+        self.compaction_blocked = False
         self.goal_internal_abort = False
         self.soft_steering = lane.interrupt_mode != "wait"
         self.compacting = bool(works[0].operation)
@@ -208,8 +210,8 @@ class TerminalLane:
             if text := self.dequeue():
                 self.restore(event.current_buffer, [text])
 
-        @self.keys.add("escape", filter=Condition(lambda: self.busy() or self.loop is not None))
-        @self.keys.add("c-c", filter=Condition(lambda: self.busy() or self.loop_pending()), eager=True)
+        @self.keys.add("escape", filter=Condition(lambda: self.busy() or self.loop is not None or self.goal_timer is not None))
+        @self.keys.add("c-c", filter=Condition(lambda: self.busy() or self.automatic_pending()), eager=True)
         def interrupt(event):
             self.restore(event.current_buffer, self.abort())
 
@@ -301,17 +303,21 @@ class TerminalLane:
                             queued, self.priority = [self.priority], None
                         else:
                             queued = self.take(self.steers, self.steering_mode) or self.take(self.followups, self.followup_mode)
-                    next_goal = turn.goal_next if not queued and not failed and not turn.is_cancelled() else None
+                    completed = not queued and not failed and not turn.is_cancelled()
+                    next_goal = turn.goal_next if completed else None
+                    next_compaction = turn.compaction_next if completed else None
+                    blocked = turn.compaction_blocked
                     turn = self.turn = TerminalTurn(self, queued) if queued else None
                     if not turn:
                         self.settled = bool(answer and answer.strip())
-                    if not turn and self.loop:
-                        if failed and not work.background:
+                    scheduled = next_compaction and self.schedule_goal(next_compaction, compaction=True)
+                    if not turn and self.loop and not scheduled:
+                        if blocked or failed and not work.background:
                             self.cancel_loop_pending()
                             self.loop.capture(None)
                         else:
                             self.schedule_loop()
-                    elif next_goal:
+                    elif not scheduled and next_goal:
                         self.schedule_goal(next_goal)
                 self.changed()
 
@@ -320,24 +326,26 @@ class TerminalLane:
             self.goal_timer.cancel()
             self.goal_timer = None
 
-    def schedule_goal(self, next_goal):
+    def schedule_goal(self, next_goal, *, compaction=False):
         with self.lock:
             self.cancel_goal()
-            if self.turn or self.loop or not next_goal():
-                return
+            if self.turn or self.loop and not compaction or not next_goal():
+                return False
 
             def admit():
                 with self.lock:
                     if self.goal_timer is not timer:
                         return
                     self.goal_timer = None
-                    if (not self.turn and not self.editor.default_buffer.text.strip()
+                    if (not self.turn and not self.idle_compacting and not self.editor.default_buffer.text.strip()
                             and not (self.budget and self.budget.is_cancelled()) and (content := next_goal())):
                         self.submit(TerminalWork(content, expand_prompt=False))
+                self.changed()
 
-            timer = self.goal_timer = Timer(.8, admit)
+            timer = self.goal_timer = Timer(.1 if compaction else .8, admit)
             timer.daemon = True
             timer.start()
+            return True
 
     def cancel_loop_pending(self):
         if self.loop_timer:
@@ -366,6 +374,9 @@ class TerminalLane:
 
     def loop_pending(self):
         return bool(self.loop_timer or self.loop_gate or self.loop_reset)
+
+    def automatic_pending(self):
+        return self.goal_timer is not None or self.loop_pending()
 
     def schedule_loop(self):
         loop = self.loop

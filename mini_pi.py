@@ -130,15 +130,18 @@ OUTPUT_LIMIT = 16_000
 ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 ARTIFACT_HEAD_BYTES = 3 * 1024 * 1024
 MAX_PAUSED_TURN_CONTINUATIONS = 8
+AUTO_CONTINUE = ("Resume the user's latest intent. Review the retained messages and follow the latest request. "
+                 "If no work remains, say so briefly without inventing work.")
 
 
 def run_agent(task, query, tools, max_steps, session, compaction, system_prompt, make_recovery, turn=None,
               take_updates=None, background=False, stop_guard=None, on_input=None, jobs=None, admit=None, child=None,
               rules=None, on_admitted=None, *, tool_workers, speculation=None, on_tools=None, initial_metadata=None,
-              initial_note=None, goal=None, todo=None, todo_stop=True):
+              initial_note=None, goal=None, todo=None, todo_stop=True, post_compaction=None, task_eager=False):
     """Ask the model, run its tools in order, and feed their results back."""
     cancellation = turn or active_turn()
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
+    compaction.continuation_blocked = False
     compaction.prune_tool_results(cold_check=True)
 
     def append_input(content, notification=False, *, queued=False, admitted=None, metadata=None, note=None):
@@ -202,7 +205,18 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
 
     force_todo = False
     goal_steer = isinstance(task, GoalSteer)
-    if todo and task is not None and not goal_steer and todo.eager != "default" and (
+
+    def compaction_preludes():
+        active = tools()
+        if todo and (prelude := todo.post_compaction_prelude("todo" in active)):
+            append_input(prelude)
+        if task_eager and "task" in active:
+            append_input({"role": "developer", "content": "<eager-task-prelude>Use `task` to delegate independent "
+                                                          "work that advances the latest request.</eager-task-prelude>"})
+
+    if isinstance(task, dict) and task.get("_compaction_continue"):
+        compaction_preludes()
+    elif todo and task is not None and not goal_steer and todo.eager != "default" and (
         prelude := todo.prelude(task, session.batches, "todo" in tools())
     ):
         append_input(prelude)
@@ -224,6 +238,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     pause_continuations = 0
     dsml_nudges = 0
     phase = "pre"
+    inline_compaction_continuation = False
 
     if turn:
         for extra in turn.works[1:]:
@@ -365,7 +380,23 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             if stop_guard and not (jobs and jobs.pending()) and (reminder := stop_guard.reminder(assistant, request)):
                 session.append([{"role": "developer", "content": reminder}])
                 continue
-            recovery.maintain(system, "post")
+            compacted = recovery.maintain(system, "post")
+            if (compacted or compaction.threshold_dead_end is not None) and not compaction.post_threshold_ready(
+                system, tool_schemas(active_tools), compacted,
+            ):
+                if turn:
+                    turn.compaction_blocked = True
+                return assistant["content"]
+            if compacted and post_compaction and not (jobs and jobs.pending()):
+                if continuation := post_compaction(assistant):
+                    if turn:
+                        turn.compaction_next = continuation
+                        return assistant["content"]
+                    if not inline_compaction_continuation and (content := continuation()):
+                        inline_compaction_continuation = True
+                        compaction_preludes()
+                        append_input(content)
+                        continue
             if (todo and todo_stop and not (jobs and jobs.pending())
                     and not (goal and goal.budget_limited())
                     and (reminder := todo.stop(assistant["content"], "todo" in active_tools))):
@@ -1376,9 +1407,32 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             cost_gate.goal_usage = goal.observe
 
         def next_goal():
-            if goal and args.task is None and not args.continue_session and not todo.blocked_only():
+            if (goal and args.task is None and not args.continue_session and not todo.blocked_only()
+                    and not compaction.continuation_blocked):
                 return goal.continuation(args.mode)
             return None
+
+        def post_compaction(assistant):
+            if layered_setting(maintenance_layers, "compaction.autoContinue", True) is False:
+                return None
+            if assistant.get("_pause_exhausted") or goal and (goal.budget_limited() or todo.blocked_only()):
+                return None
+            active_goal = bool(goal and goal.active)
+            if session_jsonl.plain_text(assistant.get("content")).strip() and not paused_turn(assistant) and not active_goal:
+                return None
+            epoch, boundary, cache_key = session.navigation_epoch, session.context_boundary(), session.request_cache_key
+            revision = goal.revision if active_goal else None
+
+            def admit_continuation():
+                if (compaction.continuation_blocked or session.navigation_epoch != epoch
+                        or session.request_cache_key != cache_key or session.context_boundary() != boundary
+                        or run_budget and run_budget.is_cancelled()):
+                    return None
+                if revision is not None and (goal.revision != revision or not next_goal()):
+                    return None
+                return {"role": "developer", "content": AUTO_CONTINUE, "_compaction_continue": True}
+
+            return admit_continuation
 
         def goal_operation(op, objective=None, token_budget=None):
             if not goal:
@@ -1402,6 +1456,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 return goal_control("set", argument, live=live, visible_objective=True), "objective"
             if operation in ("pause", "resume", "drop", "show") or not operation:
                 op = "get" if operation in ("", "show") else operation
+                if op == "resume" and not live:
+                    compaction.continuation_blocked = False
                 return goal_control(op, live=live), "continue" if op == "resume" else None
             return goal_control("create", arguments, live=live, visible_objective=True), "objective"
 
@@ -3235,6 +3291,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             nonlocal first_local_turn
             cancellation = turn or run_budget or active_turn()
             foreground = not (background or turn and turn.background)
+            if turn:
+                turn.compaction_next = None
+                turn.compaction_blocked = False
             if foreground and not child and expand_prompt and isinstance(task, str):
                 command = task.split(maxsplit=1)
                 if command and command[0] in ("/clear", "/fresh"):
@@ -3326,7 +3385,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                     return None
                     initial_memory = initial_note = None
                     backend = mnemopi or hindsight
-                    synthetic_goal = isinstance(task, GoalSteer) or isinstance(task, dict) and bool(task.get("_goal_message"))
+                    synthetic_goal = isinstance(task, GoalSteer) or isinstance(task, dict) and (
+                        task.get("_goal_message") or task.get("_compaction_continue")
+                    )
                     if backend and foreground and not synthetic_goal:
                         content = task.get("content") if isinstance(task, dict) else task
                         latest = session_jsonl.plain_text(content)
@@ -3359,6 +3420,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         on_tools=count_tools if capture_queue and foreground else None,
                         goal=goal,
                         todo=todo, todo_stop=args.task is None and not args.continue_session,
+                        post_compaction=post_compaction,
+                        task_eager=not child and layered_setting(maintenance_layers, "task.eager") == "always",
                     )
                     goal_succeeded = True
                     if foreground and not (cancellation and cancellation.is_cancelled()):
@@ -3382,7 +3445,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         and not getattr(turn, "goal_internal_abort", False)
                         and not (run_budget and run_budget.is_cancelled()))
                     goal.end(interrupted=interrupted)
-                    if goal_succeeded and turn and not interrupted:
+                    if goal_succeeded and turn and not (interrupted or turn.compaction_blocked or turn.compaction_next):
                         turn.goal_next = next_goal
                 warmer.settle()
 

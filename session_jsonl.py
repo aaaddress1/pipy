@@ -171,6 +171,8 @@ def import_message(entry):
             return {**message, "role": role, "_goal_message": entry["customType"]}
         if entry.get("customType") == "thinking-loop-redirect":
             message["_thinking_loop_redirect"] = True
+        if entry.get("customType") == "compaction-auto-continue":
+            message["_compaction_continue"] = True
         if entry.get("customType") == "session-transfer" and (marker := graph.transfer_details(entry.get("details"))):
             message["_session_transfer"] = marker
         if entry.get("customType") == "memory-recall-changes":
@@ -491,6 +493,9 @@ def export_message(message, call_names):
         return {"type": "custom_message", "customType": kind, "content": message["content"],
                 "display": False, "attribution": "agent"}
     if role == "developer":
+        if message.get("_compaction_continue"):
+            return {"type": "custom_message", "customType": "compaction-auto-continue", "content": message["content"],
+                    "display": False, "attribution": "agent", "synthetic": True}
         if message.get("_thinking_loop_redirect"):
             return {"type": "custom_message", "customType": "thinking-loop-redirect", "content": message["content"],
                     "display": False, "attribution": "agent"}

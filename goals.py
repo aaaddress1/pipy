@@ -173,7 +173,8 @@ class Goals:
             self.running = True
             self.pending = 0
             self.context_revision = None
-            continued = isinstance(task, dict) and task.get("_goal_message") == "goal-continuation"
+            continued = isinstance(task, dict) and (task.get("_goal_message") == "goal-continuation"
+                                                     or self.active and task.get("_compaction_continue"))
             self.activity = sha256() if continued else None
             self.activity_seen = False
 

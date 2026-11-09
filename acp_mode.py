@@ -385,6 +385,8 @@ class AcpSession:
             self.chunk("user_message_chunk", text_block(fields["message"]["content"]), fields["messageId"])
         elif kind == "ttsr_triggered":
             self.notice("TTSR applied: " + ", ".join(rule["name"] for rule in fields["rules"]))
+        elif kind == "notice" and fields.get("source") == "compaction":
+            self.notice(fields["message"])
         elif kind == "tool_execution_start":
             identifier = fields["toolCallId"]
             update = tool_update(self.cwd, identifier, fields["toolName"], fields["args"])
@@ -515,6 +517,9 @@ class AcpSession:
                             content = turn.steers.popleft()
                         elif turn.follow_ups:
                             content = turn.follow_ups.popleft()
+                        elif (not self.prompts and turn.compaction_next
+                              and (continuation := turn.compaction_next())):
+                            content = continuation
                         else:
                             # Finalize under the same lock that admits steering.
                             turn = self.finish(turn, stop)

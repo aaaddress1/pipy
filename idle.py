@@ -163,7 +163,7 @@ class IdleMaintenance:
                     armed_at = None
                     continue
 
-                if lane and lane.loop_pending():
+                if lane and lane.automatic_pending():
                     await self.wait(wake, None)
                     continue
 
@@ -181,7 +181,7 @@ class IdleMaintenance:
                     if not reader.done() and not self.editor.default_buffer.text and self.needs_compaction():
                         if lane:
                             with lane.lock:
-                                if lane.busy() or lane.loop_pending():
+                                if lane.busy() or lane.automatic_pending():
                                     continue
                                 lane.idle_compacting = True
                         try:

@@ -211,6 +211,8 @@ class RpcTurn(Cancellation):
         self.claimed = []
         self.interrupt_responses = []
         self.goal_next = None
+        self.compaction_next = None
+        self.compaction_blocked = False
         if live_steering:
             self.live = LiveQueue(self, server.steering, lambda: server.steering_mode,
                                   lambda: server.event("queue_update", **server.queues()))
@@ -561,11 +563,14 @@ class RpcServer:
                 background = self.next_background() if not queued else None
                 self.awaiting_jobs = bool(self.has_pending_jobs())
                 continuation = None
-                if status == "completed" and not queued and not background and not self.awaiting_jobs and turn.goal_next:
-                    if content := turn.goal_next():
-                        continuation = Work({"type": "goal-continuation"}, content)
+                if status == "completed" and not queued and not background and not self.awaiting_jobs:
+                    next_turn = turn.compaction_next or turn.goal_next
+                    if next_turn and (content := next_turn()):
+                        source = "compaction-continuation" if turn.compaction_next else "goal-continuation"
+                        continuation = Work({"type": source}, content)
                 settled = not queued and not background and not continuation and not self.awaiting_jobs
-                self.event("agent_end", messages=turn.messages, yielded=True, isTerminal=settled)
+                guard = {"automaticContinuationBlocked": True} if turn.compaction_blocked else {}
+                self.event("agent_end", messages=turn.messages, yielded=True, isTerminal=settled, **guard)
                 for work in turn.works:
                     self.result(work, status, settled, error)
                 for command, data in turn.interrupt_responses:

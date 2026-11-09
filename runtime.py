@@ -59,7 +59,7 @@ def portable_message(message, thinking_route=None):
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
-               "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment")
+               "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment", "_compaction_continue")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -760,7 +760,7 @@ class Session:
                 if message.get("_branch_summary") else (
                     message["content"] if any(message.get(key) for key in (
                         "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
-                        "_thinking_loop_redirect", "_session_transfer", "_goal_message", "_todo_message"))
+                        "_thinking_loop_redirect", "_session_transfer", "_goal_message", "_todo_message", "_compaction_continue"))
                     else "[Agent recovery]\n" + message["content"]
                 )
             )}
@@ -781,7 +781,7 @@ class Session:
         return messages
 
     @session_write
-    def compact(self, cut, summary, native=None):
+    def compact(self, cut, summary, native=None, *, check=None):
         if native and "items" in native:
             previous = self.native_summary or {}
             native = {
@@ -798,9 +798,13 @@ class Session:
             if portable_handoff:
                 native["portable_handoff"] = portable_handoff
         with database(self.path) as db:
+            if check:
+                check()
             leaf = graph.append(db, self.id, self.leaf, "compact", payload=[cut, summary, native])
             graph.set_head(db, self.id, leaf)
             graph.projection(db, self.id, cut, summary, native)
+            if check:
+                check()
         self.leaf = leaf
         self.first_kept, self.summary = cut, summary
         self.native_summary = native
@@ -886,6 +890,7 @@ class Compaction:
         self.measured = None
         self.provider_context = 0
         self.threshold_dead_end = None
+        self.continuation_blocked = False
 
     def discard_pending(self):
         if self.pending:
@@ -910,6 +915,7 @@ class Compaction:
         self.measured = None
         self.provider_context = 0
         self.threshold_dead_end = None
+        self.continuation_blocked = False
         self.native_speculation_failed = False
 
     def observe(self, messages, usage):
@@ -1145,9 +1151,42 @@ class Compaction:
             changed = True
         if retrying and "shake" in methods:
             changed = self.shake(RESCUE) or changed
-        if reason == "threshold" and phase == "mid" and not changed:
+        if reason == "threshold" and phase in ("mid", "post") and not changed:
             self.threshold_dead_end = self.threshold_cut()
         return changed and (not retrying or self.fits_prompt(system))
+
+    def post_threshold_ready(self, system, schemas, changed):
+        if self.threshold is None or not self.auto_enabled:
+            return True
+        messages = self.messages(system)
+        estimate = self.estimate(messages, floor_stored=True)
+        if not changed and (self.threshold_dead_end is None or self.pending
+                            or max(estimate, self.provider_context) <= self.threshold):
+            return True
+
+        def has_headroom():
+            messages = self.messages(system)
+            stored = self.context_sizes(messages, None)[1] + max(0, tokens(schemas) - tokens([]))
+            return max(stored, self.estimate(messages, floor_stored=True)) <= self.threshold * 80 // 100
+
+        if has_headroom():
+            return True
+        if changed and not self.context_windows():
+            cancellation = active_turn()
+            check = cancellation.check if cancellation else None
+            if check:
+                check()
+            if self.shrink_archive(system) and has_headroom():
+                return True
+            if self.shake(RESCUE, check=check) and has_headroom():
+                return True
+        self.continuation_blocked = True
+        self.threshold_dead_end = self.threshold_cut()
+        warning = "Compaction could not create enough headroom. Automatic continuation was paused."
+        if self.on_event:
+            self.on_event("notice", level="warning", source="compaction", message=warning)
+        print(f"[{warning}]", file=sys.stderr)
+        return False
 
     def remind_context_notes(self, system):
         if not self.auto_enabled or self.threshold is None or not self.context_windows():
@@ -1497,12 +1536,17 @@ class Compaction:
 
     def commit(self, system, before, snapshot, result, recovery_band=None, *, require_reduction=True):
         summary = CompactionSummary(result) if isinstance(result, str) else result
-        costs = self.compaction_costs(system, before, snapshot, summary, recovery_band, require_reduction)
-        if costs is None:
-            return False
-        cut, before_tokens, after_tokens = costs
-        self.on_context_change()
-        self.session.compact(cut, summary.text, summary.native)
+        cancellation = active_turn()
+        check = cancellation.check if cancellation else None
+        with self.session.writer:
+            if check:
+                check()
+            costs = self.compaction_costs(system, before, snapshot, summary, recovery_band, require_reduction)
+            if costs is None:
+                return False
+            cut, before_tokens, after_tokens = costs
+            self.on_context_change()
+            self.session.compact(cut, summary.text, summary.native, check=check)
         self.discard_pending()
         self.last_cuts.clear()
         self.measured = None
