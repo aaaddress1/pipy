@@ -162,6 +162,9 @@ def import_message(entry):
         return {"role": "developer", "content": str(entry.get("summary") or ""), "_branch_summary": True}
     if kind == "custom_message":
         message = {"role": "developer", "content": plain_text(text_and_images(entry.get("content")))}
+        if entry.get("customType") in ("goal-mode-context", "goal-continuation", "goal-budget-limit", "guided-goal-interview"):
+            role = "developer" if entry["customType"] == "guided-goal-interview" else "user"
+            return {**message, "role": role, "_goal_message": entry["customType"]}
         if entry.get("customType") == "thinking-loop-redirect":
             message["_thinking_loop_redirect"] = True
         if entry.get("customType") == "session-transfer" and (marker := graph.transfer_details(entry.get("details"))):
@@ -468,6 +471,9 @@ def export_parts(content):
 
 def export_message(message, call_names):
     role = message["role"]
+    if kind := message.get("_goal_message"):
+        return {"type": "custom_message", "customType": kind, "content": message["content"],
+                "display": False, "attribution": "agent"}
     if role == "developer":
         if message.get("_thinking_loop_redirect"):
             return {"type": "custom_message", "customType": "thinking-loop-redirect", "content": message["content"],

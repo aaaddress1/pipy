@@ -46,6 +46,7 @@ class CostGate:
         self.account = parent.account if parent else account or Spend(spent, warning is not None and spent >= warning)
         self.ancestors = ancestors if ancestors is not None else ((parent.session, *parent.ancestors) if parent else ())
         self.on_request = on_request
+        self.goal_usage = parent.goal_usage if parent else None
 
     def admit(self):
         with self.account.lock:
@@ -66,6 +67,8 @@ class CostGate:
                            f"{usd(self.warning)} warning threshold (--warn-cost / session.warnCost).")
         if warning:
             self.notice("warning", warning)
+        if self.goal_usage:
+            self.goal_usage(entry["usage"])
         return identifier
 
     def meter(self, route, purpose, model=None, *, on_usage=None):

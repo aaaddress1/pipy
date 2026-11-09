@@ -423,7 +423,7 @@ def signed_thinking(assistant):
 def latest_request(batches):
     for _, messages in reversed(batches):
         for message in reversed(messages):
-            if message["role"] != "user" or message.get("_mcp_notification"):
+            if message["role"] != "user" or message.get("_mcp_notification") or message.get("_goal_message"):
                 continue
             content = message["content"]
             if isinstance(content, list):

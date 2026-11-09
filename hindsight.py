@@ -93,7 +93,7 @@ def conversation_messages(messages, timestamp=None):
     entries = []
     for message in messages:
         if message["role"] not in ("user", "assistant") or any(
-                key in message for key in ("_mcp_notification", "_async_jobs", "_service_runs")):
+                key in message for key in ("_mcp_notification", "_async_jobs", "_service_runs", "_goal_message")):
             continue
         content = plain_text(message.get("content"))
         if any(char.isalnum() for char in MEMORY_TAGS.sub("", content)):

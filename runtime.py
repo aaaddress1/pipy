@@ -55,7 +55,7 @@ def portable_message(message, thinking_route=None):
     private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
-               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer")
+               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -420,12 +420,23 @@ class Session:
             db.executemany("UPDATE service_runs SET consumed=1 WHERE owner=? AND id=? AND finished IS NOT NULL",
                            ((self.id, identifier) for identifier in services))
 
-    def record_metadata(self, payload):
+    def record_metadata(self, *payloads):
         with database(self.path) as db:
-            leaf = graph.append(db, self.id, self.leaf, "foreign", payload=payload)
+            leaf = self.leaf
+            for payload in payloads:
+                leaf = graph.append(db, self.id, leaf, "foreign", payload=payload)
             graph.set_head(db, self.id, leaf)
             self.touch(db)
         self.leaf = leaf
+
+    def goal_record(self):
+        with database(self.path) as db:
+            row = db.execute(graph.ANCESTORS + """
+                SELECT n.payload FROM ancestry a JOIN session_nodes n ON n.id = a.id
+                WHERE n.kind = 'foreign' AND json_extract(n.payload, '$.type') = 'mode_change'
+                ORDER BY n.id DESC LIMIT 1
+            """, (self.leaf, self.id, self.id)).fetchone()
+        return json.loads(row[0]) if row else {}
 
     def last_thinking_change(self):
         with database(self.path) as db:
@@ -520,7 +531,7 @@ class Session:
                 if message.get("_branch_summary") else (
                     message["content"] if any(message.get(key) for key in (
                         "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
-                        "_thinking_loop_redirect", "_session_transfer"))
+                        "_thinking_loop_redirect", "_session_transfer", "_goal_message"))
                     else "[Agent recovery]\n" + message["content"]
                 )
             )}

@@ -77,6 +77,7 @@ import task_isolation
 from cache_warmer import CacheWarmer
 from cancellable_http import CancellableTransport, TransportLoop, active_turn, turn_scope
 from compaction_policy import CompactionPolicy
+from goals import Goals, SCHEMA as GOAL_SCHEMA, describe as describe_goal
 from cost_gate import CostCapError, CostGate, entry_usage, total_cost
 from maintenance_retry import MaintenanceRetry
 from memory import MemoryOptions, bounded, clear_memory, consolidate, guidance, injection, memory_status, redact_memory
@@ -131,7 +132,7 @@ MAX_PAUSED_TURN_CONTINUATIONS = 8
 def run_agent(task, query, tools, max_steps, session, compaction, system_prompt, make_recovery, turn=None,
               take_updates=None, background=False, stop_guard=None, on_input=None, jobs=None, admit=None, child=None,
               rules=None, on_admitted=None, *, tool_workers, speculation=None, on_tools=None, initial_metadata=None,
-              initial_note=None):
+              initial_note=None, goal=None):
     """Ask the model, run its tools in order, and feed their results back."""
     cancellation = turn or active_turn()
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
@@ -160,7 +161,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             admitted()
         if turn:
             turn.publish(message)
-        if on_input and not notification and message["role"] == "user":
+        if on_input and not notification and message["role"] == "user" and not message.get("_goal_message"):
             if cancellation:
                 cancellation.check()
             on_input(message["content"] if message.get("liveSteered") else content)
@@ -174,6 +175,9 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             print("[TTSR: " + ", ".join(hit.rule.name for hit in hits) + "]", file=sys.stderr)
         append_input(rules.message(hits, kind), notification=True)
 
+    if goal and not (isinstance(task, dict) and task.get("_goal_message")) and (context := goal.context()):
+        if task is not None or session.can_continue():
+            append_input(context)
     if task is not None:
         append_input(task, background, admitted=on_admitted, metadata=initial_metadata, note=initial_note)
     elif not session.can_continue():
@@ -332,6 +336,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             )
         if on_tools:
             on_tools(len(completed))
+        if goal and (limit := goal.tools(batch)):
+            append_input(limit)
         if speculation:
             speculation.discard()
         if turn:
@@ -1255,6 +1261,57 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             maintenance_layers = (args.rule_config, *project_context.settings_layers(workspace))
         context_policy = CompactionPolicy(maintenance_layers, percent=args.compact_at, keep_recent=args.keep_recent,
                                           agent=child.task.agent.name if child else None)
+        goal_modes = next((value for layer in reversed(maintenance_layers)
+                           if isinstance(value := dotted(layer, "goal.continuationModes"), list)), ["interactive"])
+        goal_enabled = next((value for layer in reversed(maintenance_layers)
+                             if isinstance(value := dotted(layer, "goal.enabled"), bool)), True)
+        goal_footer = next((value for layer in reversed(maintenance_layers)
+                            if isinstance(value := dotted(layer, "goal.statusInFooter"), bool)), True)
+
+        def goal_event(**data):
+            if rpc and rpc.ready:
+                rpc.event("goal_updated", **data)
+            if not rpc and (changed := data.get("goal")) and changed["status"] in ("complete", "budget-limited"):
+                print(describe_goal(changed), file=sys.stderr)
+
+        goal = Goals(session, goal_modes, goal_event) if goal_enabled and not child else None
+        if goal:
+            goal.restore(preserve=bool(rpc and rpc.ready or getattr(args, "internal_session_switch", False)))
+            cost_gate.goal_usage = goal.observe
+
+        def next_goal():
+            return goal.continuation(args.mode) if goal and args.task is None and not args.continue_session else None
+
+        def goal_operation(op, objective=None, token_budget=None):
+            if not goal:
+                if op == "get":
+                    return {"goal": None, "state": None}
+                raise ValueError("Goal mode is disabled (goal.enabled).")
+            return goal.command(op, objective, token_budget)
+
+        def goal_slash(arguments):
+            operation, _, argument = arguments.strip().partition(" ")
+            operation = operation.lower()
+            if operation == "budget":
+                budget = None if argument.lower() == "off" else int(argument)
+                return goal_operation(operation, token_budget=budget), "continue"
+            if operation == "set":
+                return goal_operation("set", argument), "objective"
+            if operation in ("pause", "resume", "drop", "show") or not operation:
+                op = "get" if operation in ("", "show") else operation
+                return goal_operation(op), "continue" if op == "resume" else None
+            return goal_operation("create", arguments), "objective"
+
+        def goal_status():
+            if goal and (current := goal.snapshot()["goal"]):
+                label = f"Goal {current['status']}"
+                if goal_footer:
+                    used = current["tokensUsed"]
+                    budget = f" / {current['tokenBudget']:,}" if "tokenBudget" in current else ""
+                    label += f" · {used:,}{budget} tokens"
+                return label
+            return None
+
         router = Router(args.routes, args.model, session, args.fallback_on, client_stack,
                         getattr(args, "transport_loop", None), getattr(args, "model_credentials", None),
                         context_policy=context_policy, profile=getattr(args, "model_profile", None),
@@ -1389,6 +1446,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 manager = current_mcp()
                 builtin = build_tools(active_turn(), manager)
             available = {**builtin, **external_tools()}
+            if goal and goal.tool_visible:
+                available["goal"] = subagents.Tool(
+                    "Read or manage the session goal. Complete it only after verifying every deliverable.",
+                    GOAL_SCHEMA, goal.tool,
+                )
             if isinstance(evaluate := available.get("eval"), EvalTool) and not evaluate.available():
                 available.pop("eval")
             if child and child.task.agent.tools is not None:
@@ -3035,6 +3097,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         print(result)
                     return None
             tool_count = 0
+            goal_started = goal_succeeded = goal_interrupted = False
 
             def count_tools(count):
                 nonlocal tool_count
@@ -3106,7 +3169,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                     return None
                     initial_memory = initial_note = None
                     backend = mnemopi or hindsight
-                    if backend and foreground:
+                    synthetic_goal = isinstance(task, dict) and bool(task.get("_goal_message"))
+                    if backend and foreground and not synthetic_goal:
                         content = task.get("content") if isinstance(task, dict) else task
                         latest = session_jsonl.plain_text(content)
                         if mnemopi:
@@ -3120,6 +3184,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                             backend.commit(initial_memory)
                             if on_admitted:
                                 on_admitted()
+                    if goal:
+                        goal.begin(task)
+                        goal_started = True
                     answer = run_agent(
                         task, partial(query, turn=turn, show=show, speculation=speculation), partial(configured_tools, active_tools),
                         args.max_steps, session, compaction,
@@ -3132,7 +3199,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         on_admitted=admitted, tool_workers=tool_workers, speculation=speculation, initial_metadata=initial_memory,
                         initial_note=initial_note,
                         on_tools=count_tools if capture_queue and foreground else None,
+                        goal=goal,
                     )
+                    goal_succeeded = True
                     if foreground and not (cancellation and cancellation.is_cancelled()):
                         if backend:
                             backend.end_turn()
@@ -3141,11 +3210,21 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         except (ValueError, OSError, RuntimeError) as error:
                             print(f"[auto-learn: capture setup failed ({type(error).__name__})]", file=sys.stderr)
                     return answer
+            except KeyboardInterrupt:
+                goal_interrupted = True
+                raise
             except CostCapError as error:
                 if not child:
                     cost_notice("error", str(error))
                 raise
             finally:
+                if goal_started:
+                    interrupted = goal_interrupted or bool(turn and turn.is_cancelled()
+                        and not getattr(turn, "goal_internal_abort", False)
+                        and not (run_budget and run_budget.is_cancelled()))
+                    goal.end(interrupted=interrupted)
+                    if goal_succeeded and turn and not interrupted:
+                        turn.goal_next = next_goal
                 warmer.settle()
 
         def move_branch(command, arguments, announce=True, *, before_move=None):
@@ -3174,6 +3253,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     request, window = side_request_for_active_route()
                     summary = request(instructions, bounded(transcript, (window or 32_768) * 2))
             session.navigate(leaf, summary)
+            if goal:
+                goal.restore(preserve=True)
             rules.close_judgments()
             if jobs:
                 jobs.rule_notice = None
@@ -3292,8 +3373,19 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 compaction.discard_pending()
                 publish_thinking(level, effective_effort())
 
+            def goal_rpc(command):
+                op = command.get("op")
+                if op not in ("get", "create", "resume", "pause", "drop"):
+                    raise ValueError(f"Unknown goal operation {op!r}.")
+                data = goal_operation(op, command.get("objective"), command.get("token_budget"))
+                if op in ("create", "resume") and goal and goal.active and args.mode in goal.modes:
+                    return rpc_mode.AfterResponse(data, partial(rpc.start_goal, next_goal))
+                return data
+
             return {
                 **binding.handlers(), "navigate_tree": (navigate, True), "fork": (fork, True),
+                "goal": (goal_rpc, lambda command: command.get("op") != "get"),
+                "get_state": (lambda command: binding.state(command) | {"goal": goal_operation("get")["goal"]}, False),
                 "new_session": (new_session, True), "switch_session": (switch_session, True),
                 "compact": (compact, True), "handoff": (handoff_command, True),
                 "reset_context": (lambda _: {"droppedCount": clear_context()}, True),
@@ -3304,6 +3396,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 "get_btw_history": (btw_history, False),
                 "get_available_commands": (
                     lambda _: {"commands": [{"name": "mcp", "description": "Manage MCP servers", "source": "builtin"},
+                                            {"name": "goal", "description": "Manage a durable session goal", "source": "builtin"},
                                             {"name": "clear", "description": "Clear conversation context in place", "source": "builtin"},
                                             {"name": "fresh", "description": "Reset provider stream state", "source": "builtin"},
                                             *(local_mcp.prompt_commands() if local_mcp else [])]}, False,
@@ -3341,13 +3434,18 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 ThreadPoolExecutor(max_workers=2, thread_name_prefix="mini-pi-omfg") as side_workers,
             ):
                 terminal_lane = TerminalLane(editor, main_worker, run_task, run_budget, flow_settings,
-                                             jobs.notify if jobs else None)
+                                             jobs.notify if jobs else None, goal_status=goal_status)
                 panel = OmfgPanel(
                     editor, side_workers, workspace, args.task_user_dir.parent, run_budget, prepare_rule_request,
                     lambda: (partial(rule_outputs, session.leaf), partial(judge_rule_output, mode=rules.judge_mode)),
                     apply_saved_rule,
                 )
                 try:
+                    if getattr(args, "goal", None) and not getattr(args, "internal_session_switch", False):
+                        from terminal_turn import TerminalWork
+
+                        goal_operation("create", args.goal)
+                        terminal_lane.submit(TerminalWork(args.goal.strip(), expand_prompt=False))
                     return interactive_loop(editor, panel, side)
                 finally:
                     terminal_lane.abort()
@@ -3502,6 +3600,13 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 )
             settled = can_recap = False
             draft = ""
+
+            def console_run(content, *, expand_prompt=True):
+                answer = run_task(content, expand_prompt=expand_prompt)
+                while answer is not None and (continuation := next_goal()):
+                    answer = run_task(continuation, expand_prompt=False)
+                return answer
+
             while True:
                 try:
                     mode = "steer"
@@ -3523,6 +3628,39 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if task == "/exit":
                     break
                 command = task.split(maxsplit=1)
+                if command[:1] == ["/guided-goal"]:
+                    try:
+                        if not goal:
+                            raise ValueError("Goal mode is disabled (goal.enabled).")
+                        prompt = goal.guide(command[1] if len(command) > 1 else "")
+                        if lane:
+                            lane.submit(TerminalWork(prompt, expand_prompt=False), "followUp")
+                        else:
+                            console_run(prompt, expand_prompt=False)
+                    except (RuntimeError, OSError, ValueError) as error:
+                        print(f"mini-pi: {error}", file=sys.stderr)
+                    continue
+                if command[:1] == ["/goal"]:
+                    try:
+                        arguments = command[1] if len(command) > 1 else ""
+                        if lane and lane.busy() and arguments.strip().lower() not in ("", "show"):
+                            raise RuntimeError("Wait for the current response or abort it before changing the goal.")
+                        data, launch = goal_slash(arguments)
+                        print(describe_goal(data["goal"]))
+                        if launch == "objective":
+                            objective = data["goal"]["objective"]
+                            if lane:
+                                lane.submit(TerminalWork(objective, expand_prompt=False))
+                            else:
+                                console_run(objective, expand_prompt=False)
+                        elif launch == "continue":
+                            if lane:
+                                lane.schedule_goal(next_goal)
+                            elif continuation := next_goal():
+                                console_run(continuation)
+                    except (RuntimeError, OSError, ValueError) as error:
+                        print(f"mini-pi: {error}", file=sys.stderr)
+                    continue
                 if command[:1] == ["/fresh"]:
                     try:
                         if lane and lane.busy():
@@ -3674,7 +3812,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                             lane.submit(TerminalWork(None if task == "/continue" else task), mode)
                             settled = False
                         else:
-                            answer = run_task(None if task == "/continue" else task)
+                            answer = console_run(None if task == "/continue" else task)
                             can_recap = bool(answer and answer.strip())
                     except CancelledError:
                         if not (run_budget and run_budget.is_cancelled()):
@@ -3820,6 +3958,7 @@ def serve_sessions(args, state, session_id, workspace):
     try:
         previous = account = None
         while session_id:
+            args.internal_session_switch = previous is not None
             try:
                 next_session, next_account, opened = run_session(args, state, session_id, workspace, rpc, account)
             except (Timeout, OpenAIError, RuntimeError, ValueError, OSError, SQLiteError) as error:
@@ -3865,6 +4004,7 @@ def main():
         return run_transfer(transfer, agent_config_dir(active_profile()))
     parser = argparse.ArgumentParser(description=__doc__, epilog="Use 'ps --help', 'ttsr --help' or 'session --help' for subcommands.")
     parser.add_argument("task", nargs="?", help="task for the coding agent; omit for interactive mode")
+    parser.add_argument("--goal", help="start a durable goal in a fresh interactive session")
     parser.add_argument("--mode", choices=["interactive", "rpc", "acp"], default="interactive")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL"), help="provider/model, route alias, or raw model ID")
     parser.add_argument("--list-models", nargs="?", const="", metavar="PATTERN", help="list configured and bundled model rows")
@@ -3943,6 +4083,13 @@ def main():
         parser.error("MCP notification debounce must be nonnegative")
     if args.mode != "interactive" and (args.task is not None or args.continue_session or args.export_jsonl):
         parser.error(f"--mode {args.mode} accepts prompts on stdin")
+    if args.goal is not None:
+        if not args.goal.strip():
+            parser.error("--goal requires a non-empty objective")
+        if args.mode != "interactive" or args.task is not None or not (sys.stdin.isatty() and sys.stdout.isatty()):
+            parser.error("--goal requires an interactive terminal")
+        if args.session or args.continue_session or args.fork or args.import_jsonl:
+            parser.error("--goal requires a fresh session")
     default_methods = ("native", "snapcompact", "handoff", "shake", "soft")
     if args.compaction_methods is not None:
         args.compaction_methods = tuple(part.strip() for part in args.compaction_methods.split(","))

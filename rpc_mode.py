@@ -163,7 +163,9 @@ def wire_message(message, call_names):
     entry = export_message(message, call_names)
     if entry["type"] == "message":
         return entry["message"]
-    if entry.get("customType") in ("async-result", "irc:incoming", "launch-completion", "ttsr-injection", "thinking-loop-redirect"):
+    if message.get("_goal_message") or entry.get("customType") in (
+        "async-result", "irc:incoming", "launch-completion", "ttsr-injection", "thinking-loop-redirect",
+    ):
         return {"role": "custom", **{key: value for key, value in entry.items() if key != "type"},
                 "timestamp": int(time() * 1000)}
     return {"role": "custom", "customType": entry["type"], "content": message["content"], "display": True}
@@ -204,6 +206,7 @@ class RpcTurn(Cancellation):
         self.withdrawn = []
         self.claimed = []
         self.interrupt_responses = []
+        self.goal_next = None
         if live_steering:
             self.live = LiveQueue(self, server.steering, lambda: server.steering_mode,
                                   lambda: server.event("queue_update", **server.queues()))
@@ -486,6 +489,12 @@ class RpcServer:
         self.worker = Thread(target=self.run, args=(self.turn,), name="mini-pi-rpc-turn")
         self.worker.start()
 
+    def start_goal(self, next_goal):
+        with self.lock:
+            if not self.turn and not self.transition and not (self.budget and self.budget.is_cancelled()):
+                if content := next_goal():
+                    self.start_turn(Work({"type": "goal-continuation"}, content))
+
     def next_background(self):
         if self.budget and self.budget.is_cancelled():
             return None
@@ -547,13 +556,17 @@ class RpcServer:
                 queued = self.steering or self.follow_up
                 background = self.next_background() if not queued else None
                 self.awaiting_jobs = bool(self.has_pending_jobs())
-                settled = not queued and not background and not self.awaiting_jobs
+                continuation = None
+                if status == "completed" and not queued and not background and not self.awaiting_jobs and turn.goal_next:
+                    if content := turn.goal_next():
+                        continuation = Work({"type": "goal-continuation"}, content)
+                settled = not queued and not background and not continuation and not self.awaiting_jobs
                 self.event("agent_end", messages=turn.messages, yielded=True, isTerminal=settled)
                 for work in turn.works:
                     self.result(work, status, settled, error)
                 for command, data in turn.interrupt_responses:
                     self.response(command, data)
-                next_work = [background] if background else []
+                next_work = [work for work in (background, continuation) if work]
                 if queued:
                     limit = len(queued) if queued is self.follow_up and self.follow_up_mode == "all" else 1
                     next_work = [queued.popleft() for _ in range(limit)]
@@ -658,6 +671,8 @@ class RpcServer:
                         self.result(work, "aborted", not self.turn, invoked=False)
         elif kind in self.commands:
             handler, idle = self.commands[kind]
+            if callable(idle):
+                idle = idle(command)
             with self.lock:
                 if idle:
                     self.require_idle()

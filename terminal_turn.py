@@ -75,6 +75,8 @@ class TerminalTurn(Cancellation):
         self.claimed = []
         self.live = LiveQueue(self, lane.steers, lambda: lane.steering_mode, lane.repaint)
         self.background = works[0].background
+        self.goal_next = None
+        self.goal_internal_abort = False
         self.soft_steering = lane.interrupt_mode != "wait"
         self.compacting = bool(works[0].operation)
         self.request_leaf = None
@@ -167,9 +169,10 @@ class TerminalTurn(Cancellation):
 
 
 class TerminalLane:
-    def __init__(self, editor, executor, run_task, budget, settings, notify_jobs):
+    def __init__(self, editor, executor, run_task, budget, settings, notify_jobs, *, goal_status=None):
         self.editor, self.executor, self.run_task, self.budget = editor, executor, run_task, budget
         self.notify_jobs = notify_jobs
+        self.goal_status = goal_status
         self.steering_mode = settings.get("steeringMode", "one-at-a-time")
         self.followup_mode = settings.get("followUpMode", "one-at-a-time")
         self.interrupt_mode = settings.get("interruptMode", "immediate")
@@ -180,6 +183,7 @@ class TerminalLane:
         self.returned = []
         self.turn, self.settled = None, None
         self.background_paused = False
+        self.goal_timer = None
         self.wake = None
         self.keys = KeyBindings()
 
@@ -227,6 +231,7 @@ class TerminalLane:
 
     def submit(self, work, mode="steer", *, urgent=False):
         with self.lock:
+            self.cancel_goal()
             if self.budget:
                 self.budget.check()
             if not work.background:
@@ -236,6 +241,7 @@ class TerminalLane:
                 if self.priority or self.turn.works[0].operation:
                     raise ValueError("Compaction already in progress.")
                 self.priority = work
+                self.turn.goal_internal_abort = True
                 self.turn.cancel()
             elif self.turn:
                 ordered = (mode == "followUp" or self.priority or self.turn.works[0].operation
@@ -282,10 +288,37 @@ class TerminalLane:
                             queued, self.priority = [self.priority], None
                         else:
                             queued = self.take(self.steers, self.steering_mode) or self.take(self.followups, self.followup_mode)
+                    next_goal = turn.goal_next if not queued and not failed and not turn.is_cancelled() else None
                     turn = self.turn = TerminalTurn(self, queued) if queued else None
                     if not turn:
                         self.settled = bool(answer and answer.strip())
+                    if next_goal:
+                        self.schedule_goal(next_goal)
                 self.changed()
+
+    def cancel_goal(self):
+        if self.goal_timer:
+            self.goal_timer.cancel()
+            self.goal_timer = None
+
+    def schedule_goal(self, next_goal):
+        with self.lock:
+            self.cancel_goal()
+            if self.turn or not next_goal():
+                return
+
+            def admit():
+                with self.lock:
+                    if self.goal_timer is not timer:
+                        return
+                    self.goal_timer = None
+                    if (not self.turn and not self.editor.default_buffer.text.strip()
+                            and not (self.budget and self.budget.is_cancelled()) and (content := next_goal())):
+                        self.submit(TerminalWork(content, expand_prompt=False))
+
+            timer = self.goal_timer = Timer(.8, admit)
+            timer.daemon = True
+            timer.start()
 
     def take_settled(self):
         with self.lock:
@@ -303,6 +336,7 @@ class TerminalLane:
 
     def abort(self):
         with self.lock:
+            self.cancel_goal()
             turn = self.turn
             waiting = [*self.steers, *([self.priority] if self.priority else []), *self.followups]
             self.priority = None
@@ -311,6 +345,7 @@ class TerminalLane:
             if turn:
                 waiting = [*turn.claimed, *turn.live.take_all(), *turn.works[1:], *waiting]
                 turn.claimed.clear()
+                turn.goal_internal_abort = False
                 turn.cancel()
             self.background_paused = True
             restored = [text for work in waiting if (text := work.restore())]
@@ -361,6 +396,8 @@ class TerminalLane:
         size = self.editor.app.output.get_size()
         width = max(12, size.columns - 3)
         progress = []
+        if self.goal_status and (status := self.goal_status()):
+            progress.append(("dim", status + "\n"))
         for batch in batches:
             intent = " ".join(ANSI.sub("", batch["intent"]).split())
             row = f"{intent} · {batch['done']}/{batch['total']}"

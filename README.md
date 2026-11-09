@@ -110,6 +110,12 @@ uv run mini_pi.py ttsr scan src --json
 
 在互動終端輸入 `/omfg <抱怨>`，目前的模型會在輸入區上方串流顯示候選規則，並以所選分支的歷史輸出驗證。生成時仍可編輯或提交主對話，按 `Esc` 會取消側請求並保留草稿。長規則可用 `PgUp`、`PgDn` 檢視。你可以要求修改、存到專案或存到目前 profile。未確認命中的規則會另外詢問是否儲存。生成與裁判請求不會增加對話訊息。 [上游 `/omfg` 流程](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/controllers/omfg-controller.ts)
 
+## 長程目標 `/goal`
+
+在互動模式輸入 `/goal <目標>` 開始，或用 `--goal "<目標>"` 開一個新的互動會話。`/guided-goal [初步想法]` 先讓模型釐清需求與驗收證據。可用 `/goal show`、`pause`、`resume`、`drop`，或用 `/goal budget N` 設定 token 預算。`/goal budget off` 清除預算，`/goal set <目標>` 可替換活動中的目標。目標狀態寫入會話分支，重新開啟程序後可用 `/goal resume` 接續。 [上游目標狀態與預算](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/goals/runtime.ts)
+
+預設只有互動模式會自動續跑。RPC 可設定 `goal.continuationModes: [interactive, rpc]`，用 `{"type":"goal","op":"create","objective":"…","token_budget":50000}` 建立目標，並用 `get`、`pause`、`resume`、`drop` 管理。預算計入新輸入、輸出及快取寫入，快取命中不計入。續跑若沒有工具活動或重複同一組工具與結果，就會停在目前進度。預算耗盡會請模型收尾，模型驗證完全部交付項目後可透過 `goal` 工具回報完成。 [上游 RPC 續跑控制](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/rpc/rpc-goal.ts)
+
 ## 側對話 `/btw`
 
 輸入 `/btw <問題>` 可在目前上下文中開啟側對話。終端會串流顯示答案，也可同時編輯或提交主對話。單獨輸入 `/btw` 開啟歷史，用方向鍵和 `Enter` 瀏覽，`f` 追問，`c` 複製答案。`Esc` 可取消進行中的請求，並保留已收到的答案。歷史按工作階段保存在 `artifacts/<session>/btw-history/`。 [上游側回合生命週期](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/btw-turn.ts)
