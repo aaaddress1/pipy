@@ -59,11 +59,24 @@ def sdk_body(body):
 class Usage:
     prompt_tokens: int
     completion_tokens: int
+    context_tokens: int | None = None
+    context_prompt_tokens: int | None = None
 
     @classmethod
     def from_response(cls, response):
         usage = response.get("usage") or {}
-        return cls(usage.get("input_tokens") or 0, usage.get("output_tokens") or 0)
+        inputs, outputs = usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
+        input_details = usage.get("input_tokens_details") or {}
+        output_details = usage.get("output_tokens_details") or {}
+        orchestration_input = input_details.get("orchestration_input_tokens") or 0
+        orchestration = orchestration_input + (output_details.get("orchestration_output_tokens") or 0)
+        total = usage.get("total_tokens")
+        if type(total) is not int or total <= 0:
+            return cls(inputs, outputs, inputs + outputs, inputs)
+        primary = inputs + outputs
+        includes_orchestration = orchestration and abs(total - primary) <= abs(total - primary - orchestration)
+        prompt = max(0, inputs - orchestration_input) if includes_orchestration else inputs
+        return cls(inputs, outputs, max(0, total - orchestration), prompt)
 
 
 def replay_bytes(item):

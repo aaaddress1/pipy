@@ -181,6 +181,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     yield_retries = 0
     pause_continuations = 0
     dsml_nudges = 0
+    phase = "pre"
 
     if turn:
         for extra in turn.works[1:]:
@@ -203,7 +204,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             if child and (notice := child.reminder()):
                 session.append([{"role": "developer", "content": notice}])
             system = system_prompt()
-            recovery.maintain(system)
+            recovery.maintain(system, phase)
             messages = compaction.messages(system)
             try:
                 active_tools = tools()
@@ -266,9 +267,9 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         ]]
         seq = session.append(batch)
         wire = turn.response(assistant) if turn else None
+        phase = "mid"
         if not calls:
             request = latest_request(session.batches) if stop_guard and stop_guard.mode == "smart" else None
-            recovery.maintain(system)
             if turn:
                 turn.server.event("turn_end", message=wire, toolResults=[])
                 steering = turn.steering()
@@ -277,6 +278,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                         rule_notice(tuple(matched.prose_hits.values()), "prose")
                     for content in steering:
                         append_input(content, queued=True)
+                    phase = "pre"
                     if stop_guard:
                         stop_guard.retries = 0
                     if rules:
@@ -311,6 +313,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             if stop_guard and not (jobs and jobs.pending()) and (reminder := stop_guard.reminder(assistant, request)):
                 session.append([{"role": "developer", "content": reminder}])
                 continue
+            recovery.maintain(system, "post")
             return assistant["content"]
         if skipped:
             tool_results, completed = [], set()
@@ -2381,6 +2384,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             warmer.invalidate()
             router.reset_responses_context()
 
+        maintenance_layers = (args.rule_config, *project_context.settings_layers(workspace))
         compaction = Compaction(
             session, router.route.window, args.compact_at, args.keep_recent,
             compaction_summarizer(), workers, args.compaction_methods, native_compactor(),
@@ -2388,8 +2392,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             context_discount=context_discount, disable_inline=disable_inline,
             on_event=rpc.event if rpc else None,
             thinking_route=lambda: chat_thinking_scope(router.route),
-            async_enabled=dotted(args.rule_config, "compaction.asyncEnabled") is not False,
-            auto_enabled=dotted(args.rule_config, "compaction.enabled") is not False,
+            async_enabled=eval_setting(maintenance_layers, "compaction.asyncEnabled") is not False,
+            auto_enabled=eval_setting(maintenance_layers, "compaction.enabled") is not False,
+            mid_turn_enabled=child is not None or eval_setting(maintenance_layers, "compaction.midTurnEnabled") is not False,
         )
         bound = (router.route, router.credential)
 

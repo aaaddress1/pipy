@@ -603,13 +603,14 @@ class Compaction:
     def __init__(
         self, session, window, percent, keep_recent, summarize, executor, methods=("native", "shake", "soft"),
         native_compact=None, on_context_change=None, prepare_handoff=None, context_discount=None, disable_inline=None,
-        on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True,
+        on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True, mid_turn_enabled=True,
     ):
         self.session = session
         self.window = window
         self.percent = percent
         self.auto_enabled = auto_enabled
         self.async_enabled = async_enabled
+        self.mid_turn_enabled = mid_turn_enabled
         self.threshold = window * percent // 100 if window else None
         self.keep_recent = keep_recent
         self.summarize = summarize
@@ -626,6 +627,8 @@ class Compaction:
         self.native_speculation_failed = False
         self.last_cuts = {}
         self.measured = None
+        self.provider_context = 0
+        self.threshold_dead_end = None
 
     def discard_pending(self):
         if self.pending:
@@ -646,11 +649,23 @@ class Compaction:
         self.discard_pending()
         self.last_cuts.clear()
         self.measured = None
+        self.provider_context = 0
+        self.threshold_dead_end = None
         self.native_speculation_failed = False
 
     def observe(self, messages, usage):
-        if usage and usage.prompt_tokens:
-            self.measured = (self.context_cost(messages), usage.prompt_tokens)
+        self.provider_context = 0
+        if not usage:
+            return
+        prompt = getattr(usage, "context_prompt_tokens", None)
+        if prompt is None:
+            prompt = usage.prompt_tokens or 0
+        if prompt:
+            self.measured = (self.context_cost(messages), prompt)
+        context = getattr(usage, "context_tokens", None)
+        if context is None:
+            context = getattr(usage, "total_tokens", None) or prompt + (getattr(usage, "completion_tokens", 0) or 0)
+        self.provider_context = max(0, context)
 
     def native_tokens(self):
         archive = self.session.archive_view()
@@ -659,22 +674,24 @@ class Compaction:
         return (self.session.native_summary or {}).get("replacement_tokens", 0)
 
     def context_cost(self, messages, native_tokens=None):
-        if native_tokens is not None:
-            return tokens(messages) + native_tokens
-        saved = self.context_discount(messages) if self.context_discount else 0
-        return tokens(messages) + self.native_tokens() - saved
+        return self.context_sizes(messages, native_tokens)[0]
+
+    def context_sizes(self, messages, native_tokens):
+        stored = tokens(messages) + (self.native_tokens() if native_tokens is None else native_tokens)
+        discount = self.context_discount(messages) if native_tokens is None and self.context_discount else 0
+        return stored - discount, stored
 
     def messages(self, system, *args, **kwargs):
         return self.session.messages(system, *args, thinking_route=self.thinking_route(), **kwargs)
 
-    def estimate(self, messages, native_tokens=None):
-        estimated = self.context_cost(messages, native_tokens)
+    def estimate(self, messages, native_tokens=None, *, floor_stored=False):
+        estimated, stored = self.context_sizes(messages, native_tokens)
         if self.measured:
             estimate_at_request, actual_at_request = self.measured
-            return max(estimated, actual_at_request + estimated - estimate_at_request)
-        return estimated
+            estimated = max(estimated, actual_at_request + estimated - estimate_at_request)
+        return max(estimated, stored) if floor_stored else estimated
 
-    def snapshot(self, estimated):
+    def cut_index(self):
         if len(self.session.batches) < 2:
             return None
         budget = self.keep_recent
@@ -692,7 +709,10 @@ class Compaction:
             if kept > budget:
                 break
             cut = index
-        if cut == 0:
+        return cut or None
+
+    def snapshot(self, estimated):
+        if (cut := self.cut_index()) is None:
             return None
         prefix = [portable_message(message) for _, batch in self.session.batches[:cut] for message in batch]
         payload = pack({"previous_summary": self.session.summary, "discarded_messages": prefix})
@@ -727,23 +747,36 @@ class Compaction:
         self.discard_pending()
         self.last_cuts.clear()
         self.native_speculation_failed = False
+        self.provider_context = 0
+        self.threshold_dead_end = None
         print(f"[shake: reclaimed ~{savings} tokens in {elided} messages]", file=sys.stderr)
         return True
 
-    def maintain(self, system, reason="threshold", focus=None, *, methods=None):
-        if not self.auto_enabled and reason in ("threshold", "idle"):
+    def maintain(self, system, reason="threshold", focus=None, *, methods=None, phase="pre", promote=None):
+        if not self.auto_enabled and reason != "manual":
             return False
-        if reason == "threshold" and self.threshold is None:
-            return False
-        estimated = self.estimate(self.messages(system))
-        if reason == "threshold" and estimated <= self.threshold:
-            if estimated < self.threshold:
-                self.start_speculation(system, estimated)
-            return False
-
         methods = self.methods if methods is None else methods
-        if reason == "threshold" and self.start_speculation(system, estimated):
+        if not methods:
             return False
+        if reason == "threshold" and (self.threshold is None or phase == "mid" and not self.mid_turn_enabled):
+            return False
+        estimated = self.estimate(self.messages(system), floor_stored=reason == "threshold")
+        if reason == "threshold":
+            if phase in ("mid", "post"):
+                estimated = max(estimated, self.provider_context)
+            if self.threshold_dead_end is not None:
+                if self.threshold_dead_end == self.threshold_cut():
+                    return False
+                self.threshold_dead_end = None
+            if estimated <= self.threshold:
+                if estimated < self.threshold:
+                    self.start_speculation(system, estimated)
+                return False
+            if self.start_speculation(system, estimated):
+                return False
+            if promote and promote():
+                return False
+
         if self.pending:
             if reason in ("manual", "idle") or not self.pending.future.done():
                 self.discard_pending()
@@ -784,10 +817,16 @@ class Compaction:
             return True
         if reason in ("overflow", "incomplete") and "shake" in methods:
             changed = self.shake(RESCUE) or changed
+        if reason == "threshold" and phase == "mid" and not changed:
+            self.threshold_dead_end = self.threshold_cut()
         return changed and (
             reason not in ("overflow", "incomplete") or self.window is None
             or self.estimate(self.messages(system)) < self.window
         )
+
+    def threshold_cut(self):
+        index = self.cut_index()
+        return self.session.navigation_epoch, self.session.first_kept, self.session.batches[index][0] if index else None
 
     def method_usable(self, method, reason):
         if reason == "media" and method == "snapcompact":
@@ -861,6 +900,8 @@ class Compaction:
             self.discard_pending()
             self.last_cuts.clear()
             self.measured = None
+            self.provider_context = 0
+            self.threshold_dead_end = None
             print("[compaction: replaying context as text after a media rejection]", file=sys.stderr)
             if not self.window or self.estimate(self.messages(system)) < self.window:
                 return True
@@ -970,7 +1011,7 @@ class Compaction:
         """Start a side request if useful and return whether threshold maintenance should defer."""
         if self.threshold is None or not self.auto_enabled:
             return False
-        self.check_speculation(estimated, system=system if estimated < self.threshold else None)
+        self.check_speculation(estimated, system=system)
         if not self.async_enabled:
             return False
         method = next((item for item in self.methods if self.method_usable(item, "threshold")
@@ -1094,6 +1135,8 @@ class Compaction:
         self.discard_pending()
         self.last_cuts.clear()
         self.measured = None
+        self.provider_context = 0
+        self.threshold_dead_end = None
         self.native_speculation_failed = False
         print(f"[compaction: {before_tokens} → {after_tokens} estimated tokens]", file=sys.stderr)
         return True

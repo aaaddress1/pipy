@@ -113,20 +113,20 @@ class TurnRecovery:
         self.attempted_credentials = set()
         self.pending_credit = None
 
-    def maintain(self, system):
+    def maintain(self, system, phase="pre"):
         self.bind_context()
         if self.body_timeout_retry:
             self.body_timeout_retry = False
             return
         same_model, self.same_model_retry = self.same_model_retry, False
-        while (
-            not same_model and self.router.route.promote_to
-            and self.compaction.threshold is not None
-            and self.compaction.estimate(self.compaction.messages(system)) > self.compaction.threshold
-            and self.promote()
-        ):
-            self.bind_context()
-        self.compaction.maintain(system)
+
+        def promote_context():
+            if not same_model and self.router.route.promote_to and self.promote():
+                self.bind_context()
+                return True
+            return False
+
+        return self.compaction.maintain(system, phase=phase, promote=promote_context)
 
     def fallback(self, usage_limit=False, *, signer_can_retry=False, credit_targets=(), pinned=False):
         if not self.retry_enabled:
