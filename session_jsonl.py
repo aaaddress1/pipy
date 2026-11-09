@@ -193,6 +193,8 @@ def import_message(entry):
         return {"role": "developer", "content": str(entry.get("summary") or ""), "_branch_summary": True}
     if kind == "custom_message":
         message = {"role": "developer", "content": text_and_images(entry.get("content"))}
+        if entry.get("customType") == "eval-state-context":
+            message["_eval_state_context"] = True
         if entry.get("customType") in ("eager-todo-prelude", "mid-run-todo-nudge", "todo-reminder", "todo-error-reminder"):
             message["_todo_message"] = entry["customType"]
         if entry.get("customType") in ("goal-mode-context", "goal-continuation", "goal-budget-limit", "guided-goal-interview"):
@@ -707,6 +709,9 @@ def export_message(message, call_names):
         return {"type": "custom_message", "customType": kind, "content": custom_content,
                 "display": False, "attribution": "agent"}
     if role == "developer":
+        if message.get("_eval_state_context"):
+            return {"type": "custom_message", "customType": "eval-state-context", "content": custom_content,
+                    "display": False, "attribution": "agent"}
         if message.get("_compaction_continue"):
             return {"type": "custom_message", "customType": "compaction-auto-continue", "content": custom_content,
                     "display": False, "attribution": "agent", "synthetic": True}
@@ -894,7 +899,11 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
     """, (session,)):
         base = mapped[parent]
         payload = json.loads(data) if data else None
-        if kind == "batch":
+        if kind == "tool_retry":
+            # The legacy batch embeds results after its assistant entry. Retry
+            # children branch from the assistant, leaving the old results in place.
+            base = anchors[payload]
+        elif kind == "batch":
             raw, = db.execute("SELECT messages FROM batches WHERE session = ? AND seq = ?", (session, seq)).fetchone()
             batch = json.loads(raw)
             batch = [item for item in batch if not pending_result(item)]

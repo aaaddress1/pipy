@@ -277,10 +277,12 @@ class Session:
             return destination, draft, [portable_message(message) for message in abandoned]
 
     @session_write
-    def navigate(self, target, summary=None):
+    def navigate(self, target, summary=None, *, retry_tools=None):
         with database(self.path) as db:
             if target is not None:
                 graph.destination(db, self.id, target)
+            if retry_tools is not None:
+                target = graph.append(db, self.id, target, "tool_retry", payload=retry_tools)
             if summary:
                 batch = [{"role": "developer", "content": summary, "_branch_summary": True, "_branch_from_node": self.leaf}]
                 seq = db.execute(
@@ -587,20 +589,46 @@ class Session:
         return not assume_exit or not recorded or recorded["kind"] != "normal"
 
     @session_write
-    def prepare_tool_replay(self):
-        if len(self.batches) < 2 or len(self.batches[-1][1]) != 1 or not exit_log.interrupted(self.batches[-1][1][0]):
+    def retry_target(self):
+        for index in range(len(self.batches) - 1, -1, -1):
+            for message in reversed(self.batches[index][1]):
+                if exit_log.context_delivery(message) or exit_log.synthetic_result(message) or exit_log.pending_result(message):
+                    continue
+                return index if exit_log.failed_turn(message) else None
+        return None
+
+    @session_write
+    def prepare_retry(self):
+        if (index := self.retry_target()) is None:
             return False
-        seq, batch = self.batches[-2]
+        return self.prepare_tool_replay(index) or self.can_continue()
+
+    @session_write
+    def prepare_tool_replay(self, failed_index=None):
+        index = self.retry_target() if failed_index is None else failed_index
+        if index is None or not index:
+            return False
+        failure = self.batches[index][1]
+        if len(failure) != 1 or failure[0].get("tool_calls") or any(
+            not item.get("_eval_state_context") for _, batch in self.batches[index + 1:] for item in batch
+        ):
+            return False
+        seq, batch = self.batches[index - 1]
         calls = exit_log.runnable_calls(batch[0])
         if not calls or len(batch) != len(calls) + 1 or {item.get("tool_call_id") for item in batch[1:]
                 if item.get("_tool_error") is True} != {call["id"] for call in calls}:
             return False
+        if any(exit_log.synthetic_result(item) and (item["_tool_details"].get("source") or "").startswith("assistant_stop_")
+               for item in batch[1:]):
+            return False
         with database(self.path) as db:
             row = db.execute("""SELECT n.id,b.messages FROM session_nodes n JOIN batches b ON n.batch=b.seq
                               WHERE n.session=? AND n.kind='batch' AND n.batch=?""", (self.id, seq)).fetchone()
-        if row is None or not all(exit_log.pending_result(item) for item in json.loads(row[1])[1:]):
-            return False
-        self.navigate(row[0])
+            if row is None:
+                return False
+        anchor, raw = row
+        inline_results = any(not exit_log.pending_result(item) for item in json.loads(raw)[1:])
+        self.navigate(anchor, retry_tools=seq if inline_results else None)
         self.tool_replay = self.batches[-1]
         return True
 
@@ -684,6 +712,7 @@ class Session:
         yield ""
         records = [(node, parent, kind, seq, json.loads(raw) if raw else None) for node, parent, kind, seq, raw in rows]
         updated = {(payload[0], payload[1]) for _, _, kind, _, payload in records if kind == "tool_update"}
+        retried = {payload for _, _, kind, _, payload in records if kind == "tool_retry"}
         identifiers, anchors = {None: "root"}, {}
         for node, parent, kind, seq, payload in records:
             if kind == "elision":
@@ -696,7 +725,7 @@ class Session:
             if kind == "batch":
                 anchors[seq] = identifier
                 for position, message in enumerate(json.loads(batches[seq])):
-                    if (seq, position) not in updated:
+                    if (seq, position) not in updated and (seq not in retried or message["role"] != "tool"):
                         yield from render_message(message)
             elif kind == "tool_update":
                 yield from render_message(payload[2])
@@ -886,12 +915,12 @@ class Session:
             )
 
     def can_continue(self):
-        message = next((message for _, batch in reversed(self.batches) for message in reversed(batch)
-                        if "_session_transfer" not in message and not exit_log.cutoff(message)), None)
+        message = next((message for _, batch in reversed(self.batches) for message in reversed(list(exit_log.provider_batch(batch)))
+                        if "_session_transfer" not in message), None)
         if message is None and (covered := (self.native_summary or {}).get("replay_through")):
             with database(self.path) as db:
                 batches = self.read_batches(db, covered, covered + 1)
-            message = batches[-1][1][-1] if batches else None
+            message = next(reversed(list(exit_log.provider_batch(batches[-1][1]))), None) if batches else None
         if message is None:
             return False
         return message["role"] in ("user", "tool", "developer") or paused_turn(message) and not message.get("_pause_exhausted")
@@ -938,9 +967,8 @@ class Session:
              **({"_history_at": message["_history_at"]} if include_native and "_history_at" in message else {})}
             if message["role"] == "developer" else (message if include_native else portable_message(message, thinking_route))
             for seq, batch in self.batches if seq >= cut and (before is None or seq < before)
-            for message in batch
-            if not exit_log.cutoff(message)
-            and (include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak")))
+            for message in exit_log.provider_batch(batch)
+            if include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak"))
         ]
         if (notes := self.context_notes()) and notes["text"]:
             insert = 1

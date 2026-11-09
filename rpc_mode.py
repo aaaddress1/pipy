@@ -457,6 +457,14 @@ class RpcServer:
     def submit(self, command):
         work = self.parse_prompt(command)
         with self.lock:
+            retry = isinstance(work.content, str) and work.content.strip() == "/retry"
+            if retry:
+                if self.turn:
+                    raise RpcFailure("Wait for the current response to finish or abort it before retrying.", "session_busy")
+                if getattr(self, "retry_ready", None) and not self.retry_ready():
+                    self.response(command, {"message": "Nothing to retry."})
+                    self.result(work, "completed", True, invoked=False)
+                    return
             if self.turn and isinstance(work.content, str):
                 words = work.content.split(maxsplit=1)
                 if words and words[0] in ("/clear", "/fresh"):
@@ -710,8 +718,9 @@ class RpcServer:
             raise RpcFailure(f"Unknown command: {kind}")
         return None
 
-    def serve(self, run_task, record_input, commands, mcp=None, jobs=None):
+    def serve(self, run_task, record_input, commands, mcp=None, jobs=None, *, retry_ready=None):
         self.run_task, self.record_input, self.commands = run_task, record_input, commands
+        self.retry_ready = retry_ready
         if not self.ready:
             self.ready = True
             self.output.write({

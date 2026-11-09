@@ -38,6 +38,7 @@ COMMANDS = [
     {"name": "compact", "description": "Compact session context", "input": {"hint": "Optional summary focus"}},
     {"name": "handoff", "description": "Generate a handoff and retain recent context", "input": {"hint": "Optional handoff focus"}},
     {"name": "continue", "description": "Resume an unfinished turn"},
+    {"name": "retry", "description": "Retry the last failed agent turn"},
     {"name": "mcp", "description": "Manage the session's MCP servers",
      "input": {"hint": "list | resources | prompts | notifications | reconnect | reauth | unauth"}},
 ]
@@ -281,6 +282,10 @@ class AcpSession:
         if not keep_protocol_id:
             self.id = self.handle.session.id
 
+    @property
+    def ready(self):
+        return hasattr(self, "handle") and not self.closing
+
     def next_message(self):
         return str(uuid4())
 
@@ -487,7 +492,7 @@ class AcpSession:
                 raise AcpError("The session is closing.")
             if self.turn and isinstance(content, str):
                 words = content.split(maxsplit=1)
-                if words and words[0] in ("/clear", "/fresh"):
+                if words and words[0] in ("/clear", "/fresh", "/retry"):
                     raise AcpError(f"Wait for the current response to finish or cancel it before running {words[0]}.")
             self.background_suppressed = False
             turn = AcpTurn(self, identifier, content)

@@ -311,6 +311,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             recovery.maintain(system, phase)
             compaction.remind_context_notes(system)
             messages = compaction.messages(system)
+            attempted_route = recovery.router.route
             try:
                 active_tools = tools()
                 credit = recovery.consume_credit()
@@ -342,6 +343,16 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 if action == "finish":
                     return error.text
                 if action != "retry":
+                    error_text = redact_memory(str(error))
+                    model = rpc_mode.model_metadata(attempted_route, None)
+                    if draft := getattr(error, "unexecuted_turn", None):
+                        recovery.remember_unexecuted(error, exit_log.failure_message(model, error_text, draft=draft))
+                    else:
+                        text = getattr(error, "text", None)
+                        _, _, tail = session.conversation_tail()
+                        if tail and tail["role"] == "assistant" and tail.get("content") == text:
+                            text = None
+                        session.append([exit_log.failure_message(model, error_text, draft={"content": text or None})])
                     raise
         compaction.observe(messages, usage)
         force_todo = False
@@ -3361,8 +3372,24 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     else:
                         print(result)
                     return None
+                if task.strip() == "/retry":
+                    if cancellation:
+                        cancellation.check()
+                    if on_admitted:
+                        on_admitted()
+                    if not session.prepare_retry():
+                        notice = "Nothing to retry."
+                        if turn:
+                            turn.publish({"role": "assistant", "content": notice})
+                        else:
+                            print(notice)
+                        return None
+                    if session.tool_replay:
+                        reset_compaction_route()
+                    task = None
             tool_count = 0
             goal_started = goal_succeeded = goal_interrupted = False
+            agent_admitted = False
 
             def count_tools(count):
                 nonlocal tool_count
@@ -3448,16 +3475,19 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         else:
                             hindsight.settle_mental(wait=True)
                             initial_memory = hindsight.prepare(latest)
-                    admitted = on_admitted
-                    if initial_memory:
-                        def admitted():
+                    def admitted():
+                        nonlocal agent_admitted
+                        agent_admitted = True
+                        if initial_memory:
                             backend.commit(initial_memory)
-                            if on_admitted:
-                                on_admitted()
+                        if on_admitted:
+                            on_admitted()
                     if goal:
                         goal.begin(task)
                         goal_started = True
                     todo.begin()
+                    if task is None:
+                        agent_admitted = session.can_continue()
                     answer = run_agent(
                         task, partial(query, turn=turn, show=show, speculation=speculation), partial(configured_tools, active_tools),
                         args.max_steps, session, compaction,
@@ -3484,8 +3514,14 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         except (ValueError, OSError, RuntimeError) as error:
                             print(f"[auto-learn: capture setup failed ({type(error).__name__})]", file=sys.stderr)
                     return answer
-            except KeyboardInterrupt:
+            except (CancelledError, KeyboardInterrupt) as error:
                 goal_interrupted = True
+                if agent_admitted and session.can_continue() and not getattr(turn, "goal_internal_abort", False):
+                    draft = turn.snapshot() if getattr(turn, "steering_at_boundary", False) else getattr(turn, "draft", None)
+                    if draft and isinstance(draft.get("content"), list):
+                        draft = {"content": session_jsonl.plain_text(draft["content"])}
+                    model = rpc_mode.model_metadata(router.route, None)
+                    session.append([exit_log.failure_message(model, str(error) or "Turn aborted.", reason="aborted", draft=draft)])
                 raise
             except CostCapError as error:
                 if not child:
@@ -3692,6 +3728,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                             {"name": "todo", "description": "Manage phased session todos", "source": "builtin"},
                                             {"name": "clear", "description": "Clear conversation context in place", "source": "builtin"},
                                             {"name": "fresh", "description": "Reset provider stream state", "source": "builtin"},
+                                            {"name": "retry", "description": "Retry the last failed agent turn", "source": "builtin"},
                                             *(local_mcp.prompt_commands() if local_mcp else [])]}, False,
                 ),
             }
@@ -4065,7 +4102,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if lane and lane.busy() and command:
                     name = command[0]
                     changing = name in ("/branch", "/rewind", "/label", "/fork", "/handoff",
-                                        "/shake", "/memory", "/usage", "/mcp", "/continue") or (
+                                        "/shake", "/memory", "/usage", "/mcp", "/continue", "/retry") or (
                         name == "/tree" and len(command) > 1 or task.startswith("/btw --branch ")
                     )
                     if changing:
@@ -4179,7 +4216,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     settled = task != "/continue" or session.can_continue()
                     try:
                         if lane:
-                            lane.submit(TerminalWork(None if task == "/continue" else task), mode, loop_prompt=True)
+                            lane.submit(TerminalWork(None if task == "/continue" else task), mode, loop_prompt=task != "/retry")
                             settled = False
                         else:
                             answer = console_run(None if task == "/continue" else task)
@@ -4250,7 +4287,8 @@ def run_session(args, state, session_id, workspace, rpc=None, account=None):
                 message = content if isinstance(content, dict) else {"role": "user", "content": content}
                 handle.session.append([message])
 
-            target = rpc.serve(handle.run_task, record_input, handle.commands, handle.mcp, handle.jobs)
+            target = rpc.serve(handle.run_task, record_input, handle.commands, handle.mcp, handle.jobs,
+                               retry_ready=lambda: handle.session.retry_target() is not None and handle.session.can_continue())
             keep_spend = target and rpc.transition and rpc.transition[0]["type"] == "fork"
             return target, handle.account if keep_spend else None, handle.session.id
         if args.task is not None or args.continue_session:

@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from memory_transcript import user_turns
-from session_exit import pending_result
+from session_exit import pending_result, placeholder
 
 
 SCHEMA = """
@@ -221,12 +221,13 @@ def intact_compaction_prefix(db, session, leaf, snapshot_leaf, cut):
         SELECT coalesce(max(n.id = ?),0), coalesce(max(n.id > ? AND (
             n.kind IN ('compact','reset') OR
             (n.kind='tool_update' AND json_extract(n.payload,'$[0]') < ?) OR
+            (n.kind='tool_retry' AND json_extract(n.payload,'$') < ?) OR
             (n.kind='elision' AND EXISTS (
                 SELECT 1 FROM json_each(CASE WHEN n.kind='elision' THEN n.payload ELSE '[]' END) e
                 WHERE json_extract(e.value,'$[0]') < ?
             ))
         )),0) FROM suffix n
-    """, (leaf, session, session, snapshot_leaf, snapshot_leaf, snapshot_leaf, cut, cut)).fetchone()
+    """, (leaf, session, session, snapshot_leaf, snapshot_leaf, snapshot_leaf, cut, cut, cut)).fetchone()
     return bool(found and not rewritten)
 
 
@@ -278,12 +279,16 @@ def stored_batches(db, session, leaf, start=0, before=None, *, apply_elisions=Tr
     for kind, data in db.execute(ANCESTORS + """
         SELECT n.kind,n.payload FROM ancestry a JOIN session_nodes n ON n.id = a.id
         WHERE (n.kind = 'tool_update' AND json_extract(n.payload,'$[0]') >= ?
-            AND (? IS NULL OR json_extract(n.payload,'$[0]') < ?)) OR (? AND n.kind = 'elision') ORDER BY n.id
+            AND (? IS NULL OR json_extract(n.payload,'$[0]') < ?)) OR n.kind = 'tool_retry'
+            OR (? AND n.kind = 'elision') ORDER BY n.id
     """, (leaf, session, session, start, before, before, apply_elisions)):
         if kind == "tool_update":
             seq, index, message = json.loads(data)
             if seq in by_seq and 0 <= index <= len(by_seq[seq]):
                 by_seq[seq][index:index + 1] = [message]
+        elif kind == "tool_retry":
+            if (batch := by_seq.get(json.loads(data))) is not None:
+                batch[1:] = map(placeholder, batch[0]["tool_calls"])
         else:
             for seq, index, edit in json.loads(data):
                 if seq in by_seq and 0 <= index < len(by_seq[seq]):
@@ -437,6 +442,8 @@ def fork(db, source, target, leaf, workspace, timestamp, *, whole):
         elif kind == "tool_update":
             batch, index, message = payload
             payload = [batches[batch], index, message]
+        elif kind == "tool_retry":
+            payload = batches[payload]
         mapped[identifier] = append(db, target, mapped[parent], kind, seq, payload)
     for identifier, name in db.execute("SELECT node,label FROM session_labels WHERE session = ?", (source,)):
         if identifier in mapped:

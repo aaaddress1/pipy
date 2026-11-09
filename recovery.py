@@ -168,8 +168,8 @@ class TurnRecovery:
                 return credit
         return None
 
-    def remember_unexecuted(self, error):
-        assistant = error.unexecuted_turn
+    def remember_unexecuted(self, error, assistant=None):
+        assistant = assistant or error.unexecuted_turn
         self.session.append([assistant, *[
             {"role": "tool", "tool_call_id": call["id"], "_tool_error": True,
              "content": "Tool call was not executed because the provider stream ended with an error "
@@ -291,14 +291,14 @@ class TurnRecovery:
             self.same_model_retry = True
             return "retry"
         if isinstance(error, ClassifierRefusal):
-            if error.unexecuted_turn:
-                self.remember_unexecuted(error)
             if not error.safe:
                 return None
             source, credit = self.router.route, error.credit
             targets = source.fallback_credit_targets(error.refused_model) if credit and credit.live() else ()
             if not self.fallback(credit_targets=targets, pinned=True):
                 return None
+            if error.unexecuted_turn:
+                self.remember_unexecuted(error)
             target = self.router.route
             if credit and credit.live() and source.can_redeem_credit(target, targets):
                 self.pending_credit = (target, self.session.leaf, credit)
@@ -363,8 +363,10 @@ class TurnRecovery:
 
         if isinstance(error, StreamInterrupted):
             if error.unexecuted_turn:
-                self.remember_unexecuted(error)
-                return self.retry_or_fallback("stream interrupted", retry_first=True) if self.retry_enabled else None
+                if self.retry_enabled and self.retry_or_fallback("stream interrupted", retry_first=True):
+                    self.remember_unexecuted(error)
+                    return "retry"
+                return None
             if not self.retry_enabled:
                 return None
             if not error.text.strip() or error.tool_draft:

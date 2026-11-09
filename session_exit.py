@@ -9,6 +9,7 @@ SESSION_EXIT = "session_exit"
 MISSING_RESULT = "Interrupted before result was recorded. Check workspace state before repeating this action."
 UNKNOWN_RESULT = "Previous OMP process exited before this tool returned; its outcome is unknown."
 INTERRUPTED_TURN = "Previous OMP process exited before completing the turn."
+DELIVERY_MARKERS = ("_goal_message", "_async_jobs", "_mcp_notification", "_service_runs", "_irc_messages")
 
 
 def timestamp():
@@ -58,6 +59,28 @@ def stop_reason(message):
     )
 
 
+def failed_turn(message):
+    return message["role"] == "assistant" and stop_reason(message) in ("aborted", "error")
+
+
+def context_delivery(message):
+    return (message["role"] == "developer" and not message.get("userInitiated")
+            or message["role"] == "user" and any(key in message for key in DELIVERY_MARKERS))
+
+
+def synthetic_result(message):
+    return message["role"] == "tool" and (message.get("_tool_details") or {}).get("__synthetic") is True
+
+
+def provider_batch(batch):
+    failed_calls = set()
+    for message in batch:
+        if failed_turn(message):
+            failed_calls.update(call["id"] for call in message.get("tool_calls", ()))
+        elif not cutoff(message) and (message["role"] != "tool" or message.get("tool_call_id") not in failed_calls):
+            yield message
+
+
 def cutoff(message):
     return (message["role"] == "assistant" and stop_reason(message) in ("aborted", "error", "length")
             and not message.get("tool_calls") and not str(message.get("content") or "").strip())
@@ -77,6 +100,12 @@ def runnable_calls(assistant):
 
 def interrupted(message):
     return cutoff(message) and (message.get("_rpc") or {}).get("errorMessage") == INTERRUPTED_TURN
+
+
+def failure_message(model, error, *, reason="error", draft=None):
+    message = {"role": "assistant", "content": None, **(draft or {})}
+    message["_rpc"] = {**model, **(message.get("_rpc") or {}), "stopReason": reason, "errorMessage": error}
+    return message
 
 
 def abort_message(recorded_at, previous=None):
