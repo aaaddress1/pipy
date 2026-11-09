@@ -195,7 +195,8 @@ class AcpBridge:
 
 class AcpTurn(RpcTurn):
     def __init__(self, record, request_id, content, background=False):
-        super().__init__(record, Work({"type": "background" if background else "prompt"}, content), record.server.budget)
+        super().__init__(record, Work({"type": "background" if background else "prompt"}, content), record.server.budget,
+                         live_steering=False)
         self.record, self.request_id, self.content = record, request_id, content
         self.steers = deque()
         self.follow_ups = deque()
@@ -264,7 +265,7 @@ class PermissionInterrupted(Exception):
 class AcpSession:
     message_updates = "delta"
 
-    def __init__(self, server, identifier, cwd):
+    def __init__(self, server, identifier, cwd, *, keep_protocol_id=False):
         self.server, self.id, self.cwd = server, identifier, cwd
         self.lock = RLock()
         self.turn = self.worker = None
@@ -277,6 +278,8 @@ class AcpSession:
         self.background_suppressed = False
         self.context = server.open_session(identifier, cwd, self)
         self.handle = self.context.__enter__()
+        if not keep_protocol_id:
+            self.id = self.handle.session.id
 
     def next_message(self):
         return str(uuid4())
@@ -840,19 +843,19 @@ class AcpServer:
                         record.require_idle()
                         identifier = self.fork_session(record.handle.session, workspace=cwd)
                 else:
-                    with self.open_session(identifier, source) as handle:
+                    with self.open_session(identifier, source, protect_moved=False) as handle:
                         identifier = self.fork_session(handle.session, workspace=cwd)
                 record = None
             elif self.stored_workspace(identifier) != cwd:
                 raise AcpError("The session belongs to a different workspace.")
         if not record:
-            record = AcpSession(self, identifier, cwd)
+            record = AcpSession(self, identifier, cwd, keep_protocol_id=method in ("session/load", "session/resume"))
             try:
                 record.configure_mcp(configs)
             except Exception:
                 record.close()
                 raise
-            self.sessions[identifier] = record
+            self.sessions[record.id] = record
         else:
             record.configure_mcp(configs)
         if method == "session/load":
@@ -861,7 +864,7 @@ class AcpServer:
                 record.replay()
         result = record.state()
         if method in ("session/new", "session/fork"):
-            result["sessionId"] = identifier
+            result["sessionId"] = record.id
         return result, record
 
     def dispatch(self, method, params, identifier):

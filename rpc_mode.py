@@ -192,7 +192,7 @@ class Work:
 
 
 class RpcTurn(Cancellation):
-    def __init__(self, server, work, budget=None):
+    def __init__(self, server, work, budget=None, *, live_steering=True):
         super().__init__(budget, reason="Turn aborted.")
         self.server = server
         self.works = work if isinstance(work, list) else [work]
@@ -204,8 +204,9 @@ class RpcTurn(Cancellation):
         self.withdrawn = []
         self.claimed = []
         self.interrupt_responses = []
-        self.live = LiveQueue(self, server.steering, lambda: server.steering_mode,
-                              lambda: server.event("queue_update", **server.queues()))
+        if live_steering:
+            self.live = LiveQueue(self, server.steering, lambda: server.steering_mode,
+                                  lambda: server.event("queue_update", **server.queues()))
 
     def publish(self, message):
         wire = wire_message(message, self.call_names)

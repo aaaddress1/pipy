@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 import tarfile
+from contextlib import nullcontext
 from pathlib import Path, PureWindowsPath
 from sqlite3 import Error as SQLiteError
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -16,15 +17,16 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from filelock import FileLock, Timeout
 
+import session_graph as graph
 from runtime import Session, database, initialize, pack
 from session_artifacts import artifact_files, sidecar
 from session_blobs import BLOB_HASH, blob_path, hydrate_images, references, sha256_file
-from session_jsonl import export_journal, import_journal, import_message, journal_entries, ordered_rows, read_journal
+from session_jsonl import export_journal, export_message, import_journal, import_message, journal_entries, ordered_rows, read_journal, timestamp
+from session_leases import SESSION_ID, upstream_held, upstream_lease
 
 
 ARCHIVE_VERSION = 1
 ARCHIVE_LIMIT = 2 * 1024**3
-SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 WINDOWS_SPECIAL = re.compile(r'[<>:"\\|?*\x00-\x1f]')
 
 
@@ -35,10 +37,25 @@ def local_id(identifier):
         return str(uuid5(NAMESPACE_URL, "oh-my-pi:session:" + identifier))
 
 
-def lease(state, identifier):
+def lease(state, identifier, *, thread_local=True):
     directory = state / "locks"
     directory.mkdir(parents=True, exist_ok=True)
-    return FileLock(directory / (identifier + ".lock"), timeout=0)
+    return FileLock(directory / (identifier + ".lock"), timeout=0, thread_local=thread_local)
+
+
+def archive_session_id(db, identifier):
+    row = db.execute("SELECT json_extract(header, '$.id') FROM session_imports WHERE session = ?", (identifier,)).fetchone()
+    origin = row[0] if row else None
+    if isinstance(origin, str) and SESSION_ID.fullmatch(origin) and local_id(origin) == identifier:
+        return origin
+    return identifier
+
+
+def require_journal_id(header):
+    identifier = header.get("id")
+    if not isinstance(identifier, str) or not SESSION_ID.fullmatch(identifier):
+        raise ValueError("The session journal must have a valid id.")
+    return identifier
 
 
 def signature(info):
@@ -55,22 +72,22 @@ def add_file(archive, name, path):
             raise ValueError(f"Session file changed while packing: {path}")
 
 
-def pack_journal(source, output, blob_dirs):
+def pack_journal(source, output, blob_dirs, *, claim=True):
     source = source.resolve(strict=True)
     if output == source:
         raise ValueError("The archive path must differ from the source journal.")
     before = signature(source.stat())
     header, _, _ = read_journal(source)
-    identifier, cwd = header.get("id"), header.get("cwd")
-    if not isinstance(identifier, str) or not SESSION_ID.fullmatch(identifier) or not isinstance(cwd, str):
-        raise ValueError("The session journal must have a valid id and working directory.")
+    identifier, cwd = require_journal_id(header), header.get("cwd")
+    if not isinstance(cwd, str):
+        raise ValueError("The session journal must have a working directory.")
     manifest = (pack({"version": ARCHIVE_VERSION, "id": identifier, "cwd": cwd, "omp": "pipy"}) + "\n").encode()
     directory = sidecar(source)
     artifacts = list(artifact_files(directory))
     if output in artifacts:
         raise ValueError("The archive path must differ from the source artifacts.")
     missing = []
-    with TemporaryDirectory(prefix="pipy-pack-") as temporary:
+    with upstream_lease(identifier) if claim else nullcontext(), TemporaryDirectory(prefix="pipy-pack-") as temporary:
         journal = source
         with source.open("rb") as probe:
             compressed = probe.read(2) == b"\x1f\x8b"
@@ -125,17 +142,16 @@ def pack_session(state, source, output, blob_dirs):
     with lease(state, identifier), TemporaryDirectory(prefix="pipy-session-pack-") as temporary:
         initialize(path)
         with database(path) as db:
-            row = db.execute("""SELECT s.workspace, json_extract(i.header, '$.id') FROM sessions s
-                                LEFT JOIN session_imports i ON i.session = s.id WHERE s.id = ?""",
-                             (identifier,)).fetchone()
+            row = db.execute("SELECT workspace FROM sessions WHERE id = ?", (identifier,)).fetchone()
+            header_id = archive_session_id(db, identifier)
         if row is None:
             raise ValueError(f"Session {identifier} was not found.")
-        workspace, origin = row
-        header_id = origin if isinstance(origin, str) and SESSION_ID.fullmatch(origin) and local_id(origin) == identifier else None
-        session = Session(path, identifier, workspace)
-        journal = Path(temporary) / "session.jsonl"
-        export_journal(path, identifier, workspace, session.leaf, journal, header_id=header_id)
-        return pack_journal(journal, output, blob_dirs)
+        with upstream_lease(header_id):
+            workspace = row[0]
+            session = Session(path, identifier, workspace)
+            journal = Path(temporary) / "session.jsonl"
+            export_journal(path, identifier, workspace, session.leaf, journal, header_id=header_id)
+            return pack_journal(journal, output, blob_dirs, claim=False)
 
 
 def validate_name(name):
@@ -220,8 +236,8 @@ def prefix_matches(local, incoming):
     for entry in local:
         if next_entry is not None and comparable(entry) == comparable(next_entry):
             next_entry = next(pending, None)
-        elif not (entry.get("customType") == "session-transfer" and isinstance(entry.get("details"), dict)
-                  and entry["details"].get("kind") == "departed"):
+        elif not (entry.get("type") == "custom_message" and entry.get("customType") == "session-transfer"
+                  and (details := graph.transfer_details(entry.get("details"))) and details["kind"] == "departed"):
             return False
     return True
 
@@ -245,14 +261,7 @@ def unpack_session(state, archive, workspace):
         journal, header, rows, manifest = stage_archive(archive, staging)
         old_cwd = header.get("cwd") or manifest["cwd"]
         scope = os.path.normcase(str(workspace))
-        notice = {
-            "role": "developer",
-            "content": f"This session was moved here from another machine. It ran in `{old_cwd}` there; "
-                       f"its working directory is now `{workspace}`. Paths from earlier turns under `{old_cwd}` now live "
-                       f"under `{workspace}`. Running processes, shell state, and files outside the working directory "
-                       "did not move with it.",
-            "_session_transfer": {"kind": "arrived", "fromCwd": old_cwd, "cwd": str(workspace)},
-        }
+        notice = graph.transfer_message("arrived", fromCwd=old_cwd, cwd=str(workspace))
         if (staging / "artifacts").is_dir():
             (staging / "artifacts").rename(sidecar(journal))
         state.mkdir(parents=True, exist_ok=True)
@@ -267,7 +276,7 @@ def unpack_session(state, archive, workspace):
         identifier = local_id(manifest["id"])
         mode = unpack_mode(path, identifier, incoming)
         if mode != "forked":
-            with lease(state, identifier):
+            with lease(state, identifier), upstream_lease(manifest["id"]):
                 mode = unpack_mode(path, identifier, incoming)
                 if mode != "forked":
                     import_journal(path, scope, journal, session_id=identifier, replace=mode == "replaced", notice=notice,
@@ -278,31 +287,127 @@ def unpack_session(state, archive, workspace):
         return identifier, "forked"
 
 
+def mark_journal_moved(source, notice):
+    source = source.expanduser().resolve(strict=True)
+    before = signature(source.stat())
+    header, rows, _ = read_journal(source)
+    identifier = require_journal_id(header)
+    with upstream_lease(identifier):
+        if signature(source.stat()) != before:
+            raise ValueError("The source journal changed before it could be marked moved.")
+        tail = rows[-1] if rows else {}
+        parent = tail.get("activeLeafId", tail.get("id"))
+        ids = {entry["id"] for entry in rows if isinstance(entry.get("id"), str)}
+        entry_id = uuid4().hex[:8]
+        while entry_id in ids:
+            entry_id = uuid4().hex[:8]
+        entry = export_message(notice, {}) | {
+            "id": entry_id, "parentId": parent if isinstance(parent, str) and parent in ids else None,
+            "timestamp": timestamp(),
+        }
+        with source.open("rb") as probe:
+            opener = gzip.open if probe.read(2) == b"\x1f\x8b" else open
+        with NamedTemporaryFile(dir=source.parent, delete=False) as temporary:
+            staged = Path(temporary.name)
+        try:
+            with opener(source, "rb") as reader, opener(staged, "wb") as writer:
+                tail_bytes = b""
+                while block := reader.read(1024 * 1024):
+                    writer.write(block)
+                    tail_bytes = block[-1:]
+                if tail_bytes != b"\n":
+                    writer.write(b"\n")
+                writer.write((pack(entry) + "\n").encode("utf-8"))
+            if signature(source.stat()) != before:
+                raise ValueError("The source journal changed while it was being marked moved.")
+            os.chmod(staged, source.stat().st_mode & 0o777)
+            os.replace(staged, source)
+        finally:
+            staged.unlink(missing_ok=True)
+
+
+def mark_moved(state, source, label):
+    label = label.strip()
+    if not label:
+        raise ValueError("The move label must not be empty.")
+    notice = graph.transfer_message("departed", to=label)
+    try:
+        identifier = str(UUID(source))
+    except ValueError:
+        mark_journal_moved(Path(source), notice)
+        return
+    path = state / "sessions.sqlite3"
+    if not path.is_file():
+        raise ValueError(f"Session {identifier} was not found.")
+    with lease(state, identifier):
+        initialize(path)
+        with database(path) as db:
+            row = db.execute("SELECT workspace FROM sessions WHERE id = ?", (identifier,)).fetchone()
+            header_id = archive_session_id(db, identifier)
+        if row is None:
+            raise ValueError(f"Session {identifier} was not found.")
+        with upstream_lease(header_id):
+            Session(path, identifier, row[0]).append([notice])
+
+
+def print_leases(identifiers, as_json):
+    held, unknown = [], []
+    for identifier in identifiers:
+        try:
+            owned = upstream_held(identifier)
+        except (OSError, ValueError):
+            owned = None
+        if owned is None:
+            unknown.append(identifier)
+        elif owned:
+            held.append(identifier)
+    if as_json:
+        print(pack({"held": held, "unknown": unknown}))
+    else:
+        for identifier in held:
+            print(f"held\t{identifier}")
+        for identifier in unknown:
+            print(f"unknown\t{identifier}")
+
+
 def run(argv, agent_dir):
     parser = argparse.ArgumentParser(prog="mini_pi.py session", description=__doc__)
-    parser.add_argument("action", choices=("pack", "unpack"))
-    parser.add_argument("source")
-    parser.add_argument("output", type=Path, nargs="?")
+    parser.add_argument("action", choices=("pack", "unpack", "moved", "lease"))
+    parser.add_argument("paths", nargs="+")
     parser.add_argument("--cwd", type=Path)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".mini-pi")
     parser.add_argument("--blobs-dir", type=Path, help="additional upstream blob store for pack")
+    parser.add_argument("--to", help="destination label for moved")
+    parser.add_argument("--json", action="store_true", help="print the lease report as JSON")
     args = parser.parse_args(argv)
+    if args.cwd is not None and args.action != "unpack" or args.blobs_dir is not None and args.action != "pack":
+        parser.error("--cwd applies to unpack and --blobs-dir applies to pack")
+    if args.to is not None and args.action != "moved" or args.json and args.action != "lease":
+        parser.error("--to applies to moved and --json applies to lease")
+    if args.action == "lease":
+        print_leases(args.paths, args.json)
+        return 0
+    source = args.paths[0]
     state = args.state_dir.expanduser().resolve()
     try:
         if args.action == "pack":
-            if args.output is None or args.cwd is not None:
+            if len(args.paths) != 2:
                 parser.error("pack requires a source and output archive")
-            output = args.output.expanduser().resolve()
+            output = Path(args.paths[1]).expanduser().resolve()
             blob_dirs = (state / "blobs", (args.blobs_dir or agent_dir / "blobs").expanduser().resolve())
-            if missing := pack_session(state, args.source, output, blob_dirs):
+            if missing := pack_session(state, source, output, blob_dirs):
                 print(f"warning: {len(missing)} referenced blob(s) are missing from the archive.", file=sys.stderr)
             print(output)
-        else:
-            if args.cwd is None or args.output is not None or args.blobs_dir is not None:
+        elif args.action == "unpack":
+            if args.cwd is None or len(args.paths) != 1:
                 parser.error("unpack requires an archive and --cwd")
-            identifier, mode = unpack_session(state, Path(args.source).expanduser().resolve(), args.cwd.expanduser().resolve())
+            identifier, mode = unpack_session(state, Path(source).expanduser().resolve(), args.cwd.expanduser().resolve())
             print(f"Unpacked session ({mode}): {identifier}", file=sys.stderr)
             print(identifier)
+        else:
+            if args.to is None or len(args.paths) != 1:
+                parser.error("moved requires a source and --to")
+            mark_moved(state, source, args.to)
     except Timeout:
         print("mini-pi: the session is already open", file=sys.stderr)
         return 1

@@ -164,8 +164,8 @@ def import_message(entry):
         message = {"role": "developer", "content": plain_text(text_and_images(entry.get("content")))}
         if entry.get("customType") == "thinking-loop-redirect":
             message["_thinking_loop_redirect"] = True
-        if entry.get("customType") == "session-transfer":
-            message["_session_transfer"] = mapping(entry.get("details"))
+        if entry.get("customType") == "session-transfer" and (marker := graph.transfer_details(entry.get("details"))):
+            message["_session_transfer"] = marker
         if entry.get("customType") == "memory-recall-changes":
             message["_memory_recall_changes"] = mapping(entry.get("details"))
         if entry.get("customType") == "async-result":
@@ -265,7 +265,7 @@ def text_only(messages):
 
 def insert_batch(db, session, parent, batch):
     seq = db.execute("INSERT INTO batches(session,messages) VALUES (?,?)", (session, pack(batch))).lastrowid
-    return graph.append(db, session, parent, "batch", seq), seq
+    return graph.append(db, session, parent, "batch", seq, graph.batch_payload(batch)), seq
 
 
 def source_metadata(entry):
@@ -348,6 +348,12 @@ def import_journal(db_path, workspace, source, *, session_id=None, replace=False
     source = source.resolve(strict=True)
     header, rows, skipped = read_journal(source)
     order, missing = ordered_rows(rows)
+    if notice is None and session_id is None:
+        marker = next((details for entry in reversed(rows)
+                       if entry["type"] == "custom_message" and entry.get("customType") == "session-transfer"
+                       and (details := graph.transfer_details(entry.get("details")))), None)
+        if marker and marker["kind"] == "departed":
+            notice = graph.transfer_message("forked", source=str(source), to=marker["to"])
     session = session_id or str(uuid4())
     initialize(db_path)
     mapped, batches, pending = {None: None}, {None: 0}, {None: {}}
@@ -362,9 +368,8 @@ def import_journal(db_path, workspace, source, *, session_id=None, replace=False
         db.execute("INSERT INTO sessions(id,workspace,updated) VALUES (?,?,?)", (session, workspace, time.time()))
         db.executemany("INSERT INTO artifacts(session,id,content) VALUES (?,?,?)",
                        ((session, identifier, text) for identifier, text in stored_artifacts(artifacts)))
-        db.execute("INSERT INTO session_imports VALUES (?,?)", (session, pack({
-            key: header[key] for key in ("id", "version", "title", "titleSource", "timestamp") if key in header
-        })))
+        saved_header = {key: header[key] for key in ("id", "version", "title", "titleSource", "timestamp") if key in header}
+        db.execute("INSERT INTO session_imports VALUES (?,?)", (session, pack({**saved_header, "_pipyTransferIndexed": True})))
         if isinstance(title := header.get("title"), str) and title.strip():
             title_source = "auto" if header.get("titleSource") == "auto" else "user"
             db.execute("INSERT INTO session_titles VALUES (?,?,?)", (session, title, title_source))
@@ -564,6 +569,7 @@ def export_message(message, call_names):
 def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=None):
     imported = db.execute("SELECT header FROM session_imports WHERE session = ?", (session,)).fetchone()
     header = json.loads(imported[0]) if imported else {}
+    header.pop("_pipyTransferIndexed", None)
     created = header.get("timestamp")
     origin = db.execute("SELECT parent,prompt_cache_key FROM session_origins WHERE session = ?", (session,)).fetchone()
     header = {**header, "type": "session", "id": header_id or session, "version": VERSION, "cwd": workspace,

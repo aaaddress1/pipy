@@ -285,6 +285,8 @@ Muse Code 可設定 `providers.museCode.storeResponses: true`，或用 `PI_MUSE_
 
 跨機器可用 `session pack <UUID 或 JSONL> <archive.tar>` 和 `session unpack <archive.tar> --cwd <工作目錄>`。tar 使用 Oh My Pi 的 v1 格式，包含日誌、artifact 目錄及日誌引用的 blob。打包原版日誌時可用 `--blobs-dir` 指定上游 blob 目錄。解包前會驗證成員路徑與 SHA-256。如果本機已有較早且相容的歷史，會沿用工作階段 ID 更新。若本機歷史已分歧，會建立分支並保留原工作階段。`unpack` 在 stdout 輸出可交給 `--session` 的 UUID。 [上游 session transfer](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/session-transfer.ts)
 
+用 `session moved <UUID 或 JSONL> --to <目的地名稱>` 標記留在原機的副本。再次開啟該副本時，pipy 會從新 UUID 續跑，保留原來的工作階段和工具結果，並在分支中補記缺失的工具結果。`session lease --json -- <ID>...` 可查詢 Oh My Pi 相容的所有權鎖。已有程序持鎖時，同 ID 的打包、標記和更新會回報工作階段忙碌。 [上游搬移標記與續跑防護](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/session-transfer.ts#L651)
+
 `/fresh` 會關閉已快取的模型 HTTP 連線、清除帳號釘選並換一個暫時的供應商識別碼，同一份工作階段逐字稿會繼續用於模型請求。JSONL RPC 可用 `fresh_session` 取得本次刷新資訊。 [上游供應商工作階段刷新](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/session-operations-export-share-fork-resume.md)
 
 `/clear` 在同一工作階段新增重置邊界，保留工作階段 ID、標題和完整逐字稿。模型回放、原生壓縮狀態與自動回憶查詢從新邊界重新開始。Hindsight 和 Mnemopi 會用新的逐字稿識別碼保存後續對話。互動終端會清除畫面與捲動區，仍可透過 `/tree` 回到較早的分支。JSONL 匯出包含重置前的歷史與 `reset_boundary`。CLI 與 ACP 支援 `/clear`，JSONL RPC 也可直接呼叫 `reset_context`。 [上游工作階段重置](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/agent-session.ts#L6864)

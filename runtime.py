@@ -179,15 +179,17 @@ class Session:
         with database(self.path) as db:
             return list(graph.tree(db, self.id, self.leaf))
 
-    def fork(self, workspace, new_id, target=None, *, messages=()):
+    def fork(self, workspace, new_id, target=None, *, messages=(), repair_tail=False):
         with database(self.path) as db:
             leaf = graph.fork(
                 db, self.id, new_id, self.leaf if target is None else target, workspace, time.time(),
                 whole=target is None,
             )
+            if repair_tail:
+                graph.repair_fork_tail(db, new_id, leaf)
             for message in messages:
                 seq = db.execute("INSERT INTO batches(session,messages) VALUES (?,?)", (new_id, pack([message]))).lastrowid
-                leaf = graph.append(db, new_id, leaf, "batch", seq)
+                leaf = graph.append(db, new_id, leaf, "batch", seq, graph.batch_payload([message]))
             if messages:
                 graph.set_head(db, new_id, leaf)
 
@@ -359,7 +361,8 @@ class Session:
                 "INSERT INTO batches(session, messages) VALUES (?, ?)", (self.id, pack(stored)),
             ).lastrowid
             leaf = graph.append(db, self.id, self.leaf, "foreign", payload=before) if before else self.leaf
-            payload = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds")} if self.timestamp_batches else None
+            stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds") if self.timestamp_batches else None
+            payload = graph.batch_payload(messages, stamp)
             leaf = graph.append(db, self.id, leaf, "batch", seq, payload)
             injected = list(dict.fromkeys(name for message in messages for name in message.get("_ttsr_rules", ())))
             if injected:

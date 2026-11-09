@@ -118,6 +118,57 @@ def set_head(db, session, leaf):
     db.execute("INSERT OR REPLACE INTO session_heads VALUES (?,?)", (session, leaf))
 
 
+def transfer_details(value):
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        return None
+    fields = {"arrived": ("fromCwd", "cwd"), "departed": ("to",), "forked": ("source", "to")}.get(value["kind"])
+    if fields and all(isinstance(value.get(key), str) for key in fields):
+        return {key: value[key] for key in ("kind", *fields)}
+    return None
+
+
+def transfer_message(kind, **fields):
+    templates = {
+        "arrived": "This session was moved here from another machine. It ran in `{fromCwd}` there; "
+                   "its working directory is now `{cwd}`. Paths from earlier turns under `{fromCwd}` now live under "
+                   "`{cwd}`. Running processes, shell state, and files outside the working directory did not move with it.",
+        "departed": "This session was moved to {to} and continues there. This copy stops here.",
+        "forked": "This session had moved to {to} when it was resumed here, so it continues as a fork of the stale local "
+                  "copy `{source}`. Work done on {to} after the move is not part of this conversation.",
+    }
+    return {"role": "developer", "content": templates[kind].format_map(fields),
+            "_session_transfer": {"kind": kind, **fields}}
+
+
+def batch_payload(messages, timestamp=None):
+    payload = {"timestamp": timestamp} if timestamp else {}
+    for message in reversed(messages):
+        if marker := transfer_details(message.get("_session_transfer")):
+            payload["sessionTransfer"] = marker
+            break
+    return payload or None
+
+
+def last_transfer(db, session):
+    row = db.execute("""
+        SELECT json_extract(payload, '$.sessionTransfer') FROM session_nodes
+        WHERE session = ? AND kind = 'batch' AND json_type(payload, '$.sessionTransfer') = 'object'
+        ORDER BY id DESC LIMIT 1
+    """, (session,)).fetchone()
+    if row:
+        return transfer_details(json.loads(row[0]))
+    imported = db.execute("SELECT json_extract(header, '$._pipyTransferIndexed') FROM session_imports WHERE session = ?",
+                          (session,)).fetchone()
+    if imported is None or imported[0]:
+        return None
+    for raw, in db.execute("SELECT messages FROM batches WHERE session = ? AND instr(messages, ?) > 0 ORDER BY seq DESC",
+                           (session, '"_session_transfer":')):
+        payload = batch_payload(json.loads(raw))
+        if payload:
+            return payload["sessionTransfer"]
+    return None
+
+
 def initialize_session(db, session, cut, summary, native):
     row = db.execute("SELECT leaf FROM session_heads WHERE session = ?", (session,)).fetchone()
     if row is not None:
@@ -193,6 +244,32 @@ def active_raw_batches(db, session, before=None):
             (session, before, before),
         )
     ]
+
+
+def repair_fork_tail(db, session, leaf):
+    start = checkpoint(db, session, leaf)[0]
+    answered = set()
+    for seq, batch in reversed(stored_batches(db, session, leaf, start, apply_elisions=False)):
+        for message in reversed(batch):
+            if message["role"] == "tool":
+                answered.add(message.get("tool_call_id"))
+            if message["role"] != "assistant":
+                continue
+            missing = [call["id"] for call in message.get("tool_calls", ()) if call["id"] not in answered]
+            if missing:
+                limited = message.get("_tool_stop") == "length"
+                content = ("Tool call was not executed because the assistant reached its output limit. "
+                           "Split the work into smaller tool calls." if limited else
+                           "The parent session may still be running this tool; its outcome is unknown.")
+                raw, = db.execute("SELECT messages FROM batches WHERE session = ? AND seq = ?", (session, seq)).fetchone()
+                original = json.loads(raw)
+                for call_id in missing:
+                    result = {"role": "tool", "tool_call_id": call_id, "content": content, "_tool_error": True}
+                    if limited:
+                        result["_tool_details"] = {"__synthetic": True, "source": "assistant_stop_length", "executed": False}
+                    original.append(result)
+                db.execute("UPDATE batches SET messages = ? WHERE session = ? AND seq = ?", (encode(original), session, seq))
+            return
 
 
 def checkpoint(db, session, leaf):

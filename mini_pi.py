@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import httpx
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from openai import AsyncOpenAI, OpenAIError
 
 import anthropic_messages
@@ -98,7 +98,9 @@ from routing import Router, load_routes
 from runtime import Compaction, Session, database, initialize, pack, paused_turn, responses_replay_scope
 from session_artifacts import ARTIFACT_URL
 import dsml
-from session_graph import SUMMARY_PROMPT, stored_batches
+from session_graph import SUMMARY_PROMPT, last_transfer, stored_batches, transfer_message
+from session_leases import upstream_lease
+from session_transfer import archive_session_id, lease as session_lease
 from shake import MANUAL
 from snapcompact_inline import InlineImages, chat_tool_images
 from snapcompact_render import SHAPES
@@ -1079,7 +1081,12 @@ def tool_schemas(tools):
 
 def fork_session(session, state, workspace, target=None, *, messages=(), copy_artifacts=True):
     identifier = str(uuid4())
-    session.fork(os.path.normcase(str(workspace)), identifier, target, messages=messages)
+    with database(session.path) as db:
+        marker = last_transfer(db, session.id)
+    departed = marker and marker["kind"] == "departed"
+    if departed:
+        messages = (*messages, transfer_message("forked", source=session.id, to=marker["to"]))
+    session.fork(os.path.normcase(str(workspace)), identifier, target, messages=messages, repair_tail=bool(departed))
     old_artifacts = state / "artifacts" / session.id
     if copy_artifacts and old_artifacts.is_dir():
         try:
@@ -1094,25 +1101,23 @@ def fork_on_start(state, workspace, source):
     path = state / "sessions.sqlite3"
     if not path.is_file():
         raise ValueError("Source session was not found.")
-    locks = state / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
     initialize(path)
-    with FileLock(locks / (source + ".lock"), timeout=0):
+    with session_lease(state, source):
         with database(path) as db:
             row = db.execute("SELECT workspace FROM sessions WHERE id = ?", (source,)).fetchone()
+            header_id = archive_session_id(db, source)
         if row is None:
             raise ValueError("Source session was not found.")
-        return fork_session(Session(path, source, row[0]), state, workspace)
+        with upstream_lease(header_id):
+            return fork_session(Session(path, source, row[0]), state, workspace)
 
 
 def export_on_exit(state, session_id, output):
     path = state / "sessions.sqlite3"
     if not path.is_file():
         raise ValueError("Session was not found.")
-    locks = state / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
     initialize(path)
-    with FileLock(locks / (session_id + ".lock"), timeout=0):
+    with session_lease(state, session_id):
         with database(path) as db:
             row = db.execute("SELECT workspace FROM sessions WHERE id = ?", (session_id,)).fetchone()
         if row is None:
@@ -1144,21 +1149,44 @@ class OpenSession:
 
 
 @contextmanager
-def open_session(args, state, session_id, workspace, rpc=None, account=None, *, child=None, parent_gate=None,
-                 inherited_mcp=None, peer_bus=None, ancestors=None, parent_hindsight=None, parent_mnemopi=None):
-    run_budget = getattr(args, "run_budget", None)
-    locks = state / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
+def locked_agent_session(state, session_id, workspace, *, child=False, protect_moved=True):
     path = state / "sessions.sqlite3"
+    state.mkdir(parents=True, exist_ok=True)
     initialize(path)
+    scope = os.path.normcase(str(workspace))
+    with ExitStack() as locks:
+        def load(identifier):
+            locks.enter_context(session_lease(state, identifier, thread_local=not child))
+            with database(path) as db:
+                header_id = archive_session_id(db, identifier)
+            locks.enter_context(upstream_lease(header_id))
+            return Session(path, identifier, scope)
+
+        session = load(session_id)
+        if protect_moved and not child:
+            with database(path) as db:
+                marker = last_transfer(db, session_id)
+            if marker and marker["kind"] == "departed":
+                fork = fork_session(session, state, workspace)
+                locks.close()
+                session = load(fork)
+                print(f"[resumed moved session {session_id} as fork {fork}]", file=sys.stderr)
+        yield session
+
+
+@contextmanager
+def open_session(args, state, session_id, workspace, rpc=None, account=None, *, child=None, parent_gate=None,
+                 inherited_mcp=None, peer_bus=None, ancestors=None, parent_hindsight=None, parent_mnemopi=None,
+                 protect_moved=True):
+    run_budget = getattr(args, "run_budget", None)
     with (
-        FileLock(locks / (session_id + ".lock"), timeout=0, thread_local=not child),
+        locked_agent_session(state, session_id, workspace, child=bool(child), protect_moved=protect_moved) as session,
         ExitStack() as client_stack,
         ThreadPoolExecutor(max_workers=2) as workers,
         ThreadPoolExecutor(max_workers=32, thread_name_prefix="mini-pi-tools") as tool_workers,
     ):
-        scope = os.path.normcase(str(workspace))
-        session = Session(path, session_id, scope)
+        session_id, path = session.id, session.path
+        scope, locks = os.path.normcase(str(workspace)), state / "locks"
         agent_dir = args.task_user_dir.parent
         memory_files = MemoryFiles(agent_dir, scope, redact_memory) if args.memory == "local" else None
         mnemopi = None
@@ -3694,14 +3722,14 @@ def run_session(args, state, session_id, workspace, rpc=None, account=None):
 
             target = rpc.serve(handle.run_task, record_input, handle.commands, handle.mcp, handle.jobs)
             keep_spend = target and rpc.transition and rpc.transition[0]["type"] == "fork"
-            return target, handle.account if keep_spend else None
+            return target, handle.account if keep_spend else None, handle.session.id
         if args.task is not None or args.continue_session:
             wait_async = args.wait_async and handle.jobs is not None
             if not wait_async:
                 answer = handle.run_task(args.task, show=args.max_cost is None)
                 if args.max_cost is not None and answer:
                     print(answer)
-                return None, None
+                return None, None, handle.session.id
             task, background = args.task, False
             while True:
                 failure = None
@@ -3724,9 +3752,9 @@ def run_session(args, state, session_id, workspace, rpc=None, account=None):
                         print(answer)
                     break
                 background = True
-            return None, None
+            return None, None, handle.session.id
         target = handle.interactive()
-        return target, handle.account if target else None
+        return target, handle.account if target else None, handle.session.id
 
 
 def max_time_seconds(value):
@@ -3771,7 +3799,7 @@ def serve_sessions(args, state, session_id, workspace):
         previous = account = None
         while session_id:
             try:
-                next_session, next_account = run_session(args, state, session_id, workspace, rpc, account)
+                next_session, next_account, opened = run_session(args, state, session_id, workspace, rpc, account)
             except (Timeout, OpenAIError, RuntimeError, ValueError, OSError, SQLiteError) as error:
                 if not (rpc and rpc.transition and previous):
                     raise
@@ -3783,7 +3811,7 @@ def serve_sessions(args, state, session_id, workspace):
                 session_id, account = previous
                 previous = None
             else:
-                previous = session_id, account
+                previous = opened, account
                 session_id, account = next_session, next_account
     finally:
         if rpc:
