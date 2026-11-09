@@ -143,7 +143,7 @@ def load_prices(name, value):
 
 def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, context_promotion=False,
                 allow_unmatched=False, configured_models=None, extended_context=False, allow_judge=False,
-                responses_websockets=False):
+                responses_websockets=False, codex_websockets=None):
     registry = configured_models or model_catalog
     if path is None:
         if not model_catalog.select_routed(registry, primary):
@@ -221,6 +221,10 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
         prefer_websockets = fields.get("prefer_websockets", same_endpoint and api == "openai-responses"
                                        and policy.get("supportsWebsockets") is True and websocket_preference is not False
                                        and (responses_websockets or websocket_preference is True))
+        if api == codex_responses.API:
+            configured = fields.get("prefer_websockets", codex_websockets != "off")
+            prefer_websockets = (codex_responses.websocket_enabled(catalog, configured)
+                                 if type(configured) is bool else configured)
         vision = fields.get("vision", "image" in (catalog.get("input") or ()) and not compat.get("stripImageInput"))
         image_max_edge = fields.get("image_max_edge", compat.get("maxImageDimension"))
         official = api == "anthropic-messages" and isinstance(endpoint, str) and official_endpoint(endpoint)
@@ -331,7 +335,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             or type(native_compaction) is not bool
             or type(responses_compaction_v2) is not bool
             or type(prefer_websockets) is not bool
-            or "prefer_websockets" in fields and api != "openai-responses"
+            or "prefer_websockets" in fields and api not in model_catalog.RESPONSES_APIS
             or "responses_compaction_v2" in fields and api not in model_catalog.RESPONSES_APIS
             or responses_compaction_v2 and not native_compaction
             or api != "anthropic-messages" and {"auth", "cache_retention"} & fields.keys()
@@ -390,7 +394,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
                     matched = load_routes(
                         None, target, None, anthropic_server_side_fallback=anthropic_server_side_fallback,
                         configured_models=configured_models, extended_context=extended_context,
-                        responses_websockets=responses_websockets,
+                        responses_websockets=responses_websockets, codex_websockets=codex_websockets,
                     )[target]
             if matched and matched.window and matched.window > route.window and matched.name != name:
                 routes[matched.name] = matched
@@ -690,11 +694,20 @@ class Router:
             socket.close()
         return count
 
-    def responses_socket(self):
-        route, credential = self.route, self.credential
+    def responses_socket(self, route=None, credential=None, *, lite=None, model=None):
+        route, credential = (self.route, self.credential) if route is None else (route, credential)
         if not route.prefer_websockets or not self.transport_loop:
             return None
         key = route.identity(), credential, self.session.transcript_id
+        if route.api == codex_responses.API:
+            lite = codex_responses.lite_enabled(route) if lite is None else lite
+            model = model or (route.catalog_model or {}).get("requestModelId") or route.model
+            key += (lite, model)
+            if key not in self.responses_sockets:
+                self.responses_sockets[key] = codex_responses.CodexSocket(
+                    self.transport_loop, route.endpoint(), partial(self.responses_headers, route, credential),
+                )
+            return self.responses_sockets[key]
         if key not in self.responses_sockets:
             compat = (route.catalog_model or {}).get("compat") or {}
             setting = os.getenv("PI_OPENAI_STATEFUL", "").strip().lower()
@@ -724,7 +737,11 @@ class Router:
             return [(key, value) for key, value in request.headers.items() if key != "host"]
         if isinstance(auth, ConfigRequestAuth):
             return list(auth.resolved_headers().items())
-        return [("Authorization", "Bearer " + os.environ[credential])]
+        key = os.environ[credential]
+        headers = httpx.Headers({"Authorization": "Bearer " + key})
+        if route.api == codex_responses.API:
+            codex_responses.account_headers(headers, key)
+        return list(headers.items())
 
     def new_client(self, route, credential, timeout=120):
         transport = {"transport": CancellableTransport(self.transport_loop)} if self.transport_loop else {}

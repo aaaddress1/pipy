@@ -239,7 +239,7 @@ Anthropic 快取續期需要啟用 `cache_retention`，並在路由的 `cache_pr
 
 標準 Responses 的 V2 壓縮使用 HTTP/SSE。背景壓縮使用獨立的工作階段識別，手動壓縮沿用目前的識別。V2 若收到上下文溢位，會先用 V2 重試保留尾段之前的歷史，再考慮 V1。`compaction.remoteStreamingV2Enabled: false` 可停用 V2。`compaction.v2RetainedMessageBudget` 控制替換歷史保留的使用者訊息預算，預設及上限都是 64,000 tokens。 [上游 V2 設定與傳輸](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md#summary-generation)
 
-Codex 模型可用 `--model openai-codex/gpt-6-sol` 選擇，憑證來自 `OPENAI_CODEX_OAUTH_TOKEN` 或既有 OAuth 帳號。Codex SSE 會在同一回合重用伺服器的路由識別，並回放加密推理與完整工具結果。V2 壓縮使用獨立的請求身分。目錄標示支援 Responses Lite 的模型會在原生壓縮使用 Lite 格式。 [上游 Codex Responses](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-codex-responses.ts)
+Codex 模型可用 `--model openai-codex/gpt-6-sol` 選擇，憑證來自 `OPENAI_CODEX_OAUTH_TOKEN` 或既有 OAuth 帳號。Codex 預設優先用 WebSocket，可用 `PI_CODEX_WEBSOCKET=0` 或自訂路由的 `prefer_websockets: false` 改走 HTTP/SSE。續接會回放加密推理與完整工具結果，同一回合沿用伺服器的路由識別。完整 Responses 與 Lite 的連線狀態各自保存。同步 V2 壓縮可走 WebSocket，斷線時以 HTTP 重送完整壓縮請求。背景 V2 壓縮使用獨立識別碼並走 HTTP/SSE。 [上游 Codex Responses](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-codex-responses.ts)
 
 視覺路由可設定 `vision: true`，讓 Snapcompact 在本機把舊歷史排成依序重放的文字和 PNG。原文與圖框一併保存在 SQLite，再次壓縮時會重新排版。切換到文字路由或供應商拒絕圖像時，會改用同一份封存文字。`--snapcompact-shape` 預設 `auto`，也可指定版型。路由可用 `image_max_edge`、`image_count_budget`、`image_byte_budget`、`image_tokens` 和 `image_detail` 配合實際部署。字型採上游資產，Silver 的授權與作者資訊隨附。[上游 Snapcompact](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md#snapcompact-method)
 
@@ -320,4 +320,4 @@ Python 與 Oh My Pi 可互讀 AES-256-GCM 加密的 v2 broker 快照。預設在
 
 用 `--mcp-notifications` 或 `/mcp notifications on` 訂閱資源更新。同一資源的短時間連續通知會合併，預設等待 500 毫秒。通知會在模型請求邊界交付，或在 ACP、JSONL RPC 和互動終端空閒時啟動背景回合。宿主取消回合後，更新會留待下一次明確送出的 prompt。透過管線輸入的 CLI 會在下一個 prompt 交付更新。
 
-目前快取續期支援 Anthropic Messages。Codex 專用 WebSocket、裝置證明、其他記憶後端、外部 artifact／blob 互通、完整的樹狀選擇器與指令檔探索、RPC 宿主擴充、其餘 ACP 擴充和完整工具集仍需移植。[上游壓縮行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md) · [上游記憶行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/memory.md)
+目前快取續期支援 Anthropic Messages。Codex 即時 steering、裝置證明、其他記憶後端、外部 artifact／blob 互通、完整的樹狀選擇器與指令檔探索、RPC 宿主擴充、其餘 ACP 擴充和完整工具集仍需移植。[上游壓縮行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md) · [上游記憶行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/memory.md)

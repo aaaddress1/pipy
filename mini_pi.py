@@ -2188,6 +2188,13 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         if route.api == codex_responses.API:
                             options.update(codex_session=router.codex_session(session_id or session.transcript_id),
                                            automatic=cancellation.automatic)
+                            remote = openai_responses.remote_settings(route)
+                            if (v2_enabled and route.responses_compaction_v2 and not speculative
+                                and not (remote.get("v2Endpoint") or remote.get("streamingEndpoint"))):
+                                options["websocket"] = router.responses_socket(
+                                    route, credential, lite=codex_responses.lite_enabled(route, compact=True),
+                                    model=remote.get("model"),
+                                )
                     else:
                         options = {"replay": anthropic_replay(route), "metadata": provider_metadata()}
                     with router.new_client(route, credential) as client:
@@ -3834,6 +3841,7 @@ def main():
             args.fallback_on = "off"
         route_options = {
             "responses_websockets": dotted(settings, "providers.openaiResponsesWebsockets") is True,
+            "codex_websockets": dotted(settings, "providers.openaiWebsockets"),
             "anthropic_server_side_fallback": dotted(settings, "providers.anthropic.serverSideFallback") is True,
             "context_promotion": dotted(settings, "contextPromotion.enabled") is True,
             "extended_context": dotted(settings, "extendedContext") is True,

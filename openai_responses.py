@@ -197,21 +197,51 @@ def compaction_sse(lines):
             name, data = None, []
 
 
-def collect_v2(client, body, endpoint, headers, meter=None, identity=None):
+@contextmanager
+def raw_response(client, body, endpoint, headers):
+    response = client.post(endpoint, body={**body, "stream": True}, options={"headers": headers},
+                           cast_to=httpx.Response, stream=True)
+    with closing(response):
+        yield response
+
+
+@contextmanager
+def v2_events(client, body, endpoint, headers, identity, websocket, lite):
+    if websocket:
+        saved = identity.state, websocket.models_etag
+        try:
+            with websocket.exchange(body, headers, identity, lite=lite, compaction=True) as stream:
+                buffered = list(stream) if stream is not None else None
+        except httpx.RemoteProtocolError:
+            identity.state, websocket.models_etag = saved
+            websocket.sse_only = True
+        else:
+            if buffered is not None:
+                for event in buffered:
+                    if event["type"] == "response.metadata":
+                        websocket.observe(identity, event.get("headers") or {})
+                response = httpx.Response(200, request=httpx.Request("POST", endpoint))
+                yield ((event["type"], event) for event in buffered), response
+                return
+    with raw_response(client, body, endpoint, headers) as stream:
+        if identity:
+            identity.observe(stream.headers)
+        yield compaction_sse(stream.iter_lines()), stream
+
+
+def collect_v2(client, body, endpoint, headers, meter=None, identity=None, *, websocket=None, lite=False):
     compactions = []
     completed = False
     if meter:
         meter.admit()
-    response = client.post(endpoint, body={**body, "stream": True}, options={"headers": headers},
-                           cast_to=httpx.Response, stream=True)
-    with closing(response) as stream:
-        if identity:
-            identity.observe(stream.headers)
-        for kind, event in compaction_sse(stream.iter_lines()):
+    with v2_events(client, body, endpoint, headers, identity, websocket, lite) as (events, stream):
+        for kind, event in events:
             if kind == "response.output_item.done":
                 item = event.get("item") or {}
                 if item.get("type") == "compaction":
                     compactions.append(item)
+            elif kind == "response.metadata" and identity:
+                identity.observe(event.get("headers") or {})
             elif kind in ("response.completed", "response.done"):
                 if meter and not completed:
                     meter.observe((event.get("response") or {}).get("usage"))
@@ -262,7 +292,7 @@ def compaction_headers(route, model, session_id, prompt_cache_key):
 
 
 def compact_v2(client, route, body, user_items, *, retry, meter, session_id, prompt_cache_key, retained_budget,
-               identity=None, operation=None):
+               identity=None, operation=None, websocket=None):
     remote = remote_settings(route)
     endpoint = remote.get("v2Endpoint") or remote.get("streamingEndpoint") or "/responses"
     request = {**body, "input": [*body["input"], {"type": "compaction_trigger"}]}
@@ -275,6 +305,7 @@ def compact_v2(client, route, body, user_items, *, retry, meter, session_id, pro
         request["prompt_cache_key"] = key
     if request.get("tools"):
         request["tool_choice"] = "auto"
+    lite = False
     if identity:
         endpoint = remote.get("v2Endpoint") or remote.get("streamingEndpoint") or codex_responses.endpoint(route.endpoint())
         lite = codex_responses.lite_enabled(route, compact=True)
@@ -288,7 +319,7 @@ def compact_v2(client, route, body, user_items, *, retry, meter, session_id, pro
         try:
             with deadline(V2_TIMEOUT, turn) as limit:
                 try:
-                    item = collect_v2(client, request, endpoint, headers, meter, identity)
+                    item = collect_v2(client, request, endpoint, headers, meter, identity, websocket=websocket, lite=lite)
                     limit.check()
                 except (CancelledError, APIConnectionError) as error:
                     if turn:
@@ -317,7 +348,7 @@ def remote_settings(route):
 
 def compact(client, route, messages, schemas, effort, instructions, *, retry=True, meter=None, prefix=None,
             session_id=None, prompt_cache_key=None, v2_enabled=True, retained_budget=64_000,
-            codex_session=None, automatic=False):
+            codex_session=None, automatic=False, websocket=None):
     remote = remote_settings(route)
     client = client.with_options(timeout=300)
     identity = codex_session.turn() if codex_session else None
@@ -345,6 +376,7 @@ def compact(client, route, messages, schemas, effort, instructions, *, retry=Tru
             return whole_then_prefix(lambda body, users: compact_v2(
                 client, route, body, users, retry=retry, meter=meter, session_id=session_id,
                 prompt_cache_key=prompt_cache_key, retained_budget=retained_budget, identity=identity, operation=operation,
+                websocket=websocket,
             ))
         except CostCapError:
             raise
@@ -443,11 +475,8 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None)
         codex_responses.request_shape(codex_route, body, lite=lite)
         headers = identity.decorate(body, lite=lite)
         endpoint = codex_responses.endpoint(codex_route.endpoint())
-        response = client.post(endpoint, body={**body, "stream": True}, options={"headers": headers},
-                               cast_to=httpx.Response, stream=True)
-        with closing(response):
-            identity.observe(response.headers)
-            yield codex_events(compaction_sse(response.iter_lines()), identity, response)
+        with closing(codex_live_events(client, body, endpoint, headers, identity, websocket, lite)) as stream:
+            yield stream
         return
     if websocket is not None and websocket.open():
         with closing(websocket.events(body)) as stream:
@@ -457,27 +486,49 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None)
             yield (event.to_dict() for event in stream)
 
 
+def codex_live_events(client, body, endpoint, headers, identity, websocket, lite):
+    if websocket:
+        saved = identity.state, websocket.models_etag
+        for attempt in range(codex_responses.WEBSOCKET_RETRIES + 1):
+            exposed = False
+            try:
+                with websocket.exchange(body, headers, identity, lite=lite) as stream:
+                    if stream is None:
+                        break
+                    for event in stream:
+                        kind = event["type"]
+                        if kind == "response.metadata":
+                            websocket.observe(identity, event.get("headers") or {})
+                        exposed |= kind.startswith(("response.output_text.", "response.refusal.", "response.reasoning_",
+                                                    "response.function_call_arguments.")) or (
+                            kind in ("response.output_item.added", "response.output_item.done")
+                            and (event.get("item") or {}).get("type") in ("function_call", "custom_tool_call")
+                        )
+                        yield event
+                return
+            except (httpx.RemoteProtocolError, APIStatusError) as error:
+                if isinstance(error, APIStatusError) and error.code != "websocket_connection_limit_reached":
+                    raise
+                if exposed:
+                    websocket.sse_only = True
+                    raise httpx.RemoteProtocolError("Codex WebSocket interrupted streamed output.") from error
+                identity.state, websocket.models_etag = saved
+                if attempt == codex_responses.WEBSOCKET_RETRIES:
+                    websocket.sse_only = True
+                    break
+                codex_responses.websocket_backoff(attempt + 1)
+    with raw_response(client, body, endpoint, headers) as response:
+        identity.observe(response.headers)
+        yield from codex_events(compaction_sse(response.iter_lines()), identity, response)
+
+
 def codex_events(frames, identity, transport):
-    items = {}
+    output = codex_responses.OutputItems()
     for kind, event in frames:
         if not kind:
             continue
         if kind == "response.metadata":
             identity.observe(event.get("headers") or {})
-        elif kind == "response.output_item.done":
-            index = event.get("output_index", len(items))
-            items[index] = event["item"]
-        elif kind in ("response.done", "response.completed", "response.incomplete", "response.failed"):
-            response = event.setdefault("response", {})
-            status = response.get("status") or {
-                "response.done": "completed", "response.completed": "completed",
-                "response.incomplete": "incomplete", "response.failed": "failed",
-            }[kind]
-            response["status"] = status
-            if not response.get("output"):
-                response["output"] = [items[index] for index in sorted(items)]
-            if kind == "response.done":
-                kind = f"response.{status}"
         elif kind == "error":
             error = event.get("error") or event
             code = error.get("code")
@@ -487,7 +538,8 @@ def codex_events(frames, identity, transport):
             raise APIStatusError(str(error.get("message") or code or "Codex stream failed."),
                                  response=httpx.Response(status, headers=transport.headers, request=transport.request),
                                  body=error)
-        yield {**event, "type": kind}
+        event["type"] = kind
+        yield output.normalize(event)
 
 
 def stream_attempt(

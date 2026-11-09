@@ -3,15 +3,20 @@
 import json
 import os
 import re
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from functools import cache
 from hashlib import sha256
-from time import time
+from threading import Lock
+from time import sleep, time
 from uuid import UUID, uuid4
 
+import httpx
+
 from auth_broker_cache import config_root
+from cancellable_http import active_turn
 from local_oauth import jwt_payload
+from responses_websocket import ResponsesSocket, delta_input
 
 
 API = "openai-codex-responses"
@@ -22,6 +27,8 @@ TURN_METADATA = "x-codex-turn-metadata"
 LITE_HEADER = "x-openai-internal-codex-responses-lite"
 INSTALLATION_ID = "x-codex-installation-id"
 WINDOW_ID = "x-codex-window-id"
+MODELS_ETAG = "x-models-etag"
+WEBSOCKET_RETRIES = 5
 TOOL_CALLS = {"function_call": "function_call_output", "custom_tool_call": "custom_tool_call_output",
               "computer_call": "computer_call_output"}
 TOOL_OUTPUTS = frozenset(TOOL_CALLS.values())
@@ -128,7 +135,7 @@ def sanitize_call_id(value):
     return (clean or "call")[:47] + "_" + digest
 
 
-def history_items(items):
+def replay_items(items):
     cleaned = []
     for item in items:
         kind = item.get("type")
@@ -141,6 +148,11 @@ def history_items(items):
         if kind in ("message", "function_call", "custom_tool_call"):
             item.pop("status", None)
         cleaned.append(item)
+    return cleaned
+
+
+def history_items(items):
+    cleaned = replay_items(items)
     calls = {item["call_id"]: TOOL_CALLS[item["type"]] for item in cleaned
              if item.get("type") in TOOL_CALLS and "call_id" in item}
     outputs = {(item.get("call_id"), item["type"]) for item in cleaned if item.get("type") in TOOL_OUTPUTS}
@@ -169,6 +181,18 @@ def lite_enabled(route, *, compact=False):
     if compact:
         return (route.catalog_model or {}).get("useResponsesLite") is True
     return os.getenv("PI_CODEX_RESPONSES_LITE", "").strip().lower() in ("1", "true")
+
+
+def websocket_enabled(catalog, preference):
+    override = os.getenv("PI_CODEX_WEBSOCKET")
+    return catalog.get("preferWebsockets") is not False and (
+        preference if override is None else override.strip().lower() in ("1", "true", "on", "yes")
+    )
+
+
+def websocket_backoff(attempt):
+    turn = active_turn()
+    (turn.wait if turn else sleep)(0.5 * attempt)
 
 
 def lite_shape(body):
@@ -212,3 +236,107 @@ def request_shape(route, body, *, lite=False):
     if lite:
         lite_shape(body)
     body["include"] = ["reasoning.encrypted_content"]
+
+
+class OutputItems:
+    def __init__(self):
+        self.items = {}
+
+    def normalize(self, event):
+        kind = event["type"]
+        if kind == "response.output_item.done":
+            index = event.get("output_index", len(self.items))
+            self.items[index] = event["item"]
+        elif kind in ("response.done", "response.completed", "response.incomplete", "response.failed"):
+            response = event.setdefault("response", {})
+            status = response.get("status") or {
+                "response.done": "completed", "response.completed": "completed",
+                "response.incomplete": "incomplete", "response.failed": "failed",
+            }[kind]
+            response["status"] = status
+            if not response.get("output"):
+                response["output"] = [self.items[index] for index in sorted(self.items)]
+            if kind == "response.done":
+                event["type"] = f"response.{status}"
+        return event
+
+
+class CodexSocket(ResponsesSocket):
+    receive_seconds = 300
+    ping_interval = 10
+    ping_timeout = 60
+    connect_failure_limit = WEBSOCKET_RETRIES + 1
+    stale_anchor_limit = float("inf")
+
+    def __init__(self, loop, base_url, headers):
+        super().__init__(loop, endpoint(base_url).removesuffix("/responses"), headers)
+        self.lock = Lock()
+        self.models_etag = None
+        self.metadata_credentials = None
+
+    def append_input(self, baseline, request):
+        delta = delta_input(baseline, request, codex=True)
+        if baseline is not None and delta is None:
+            self.models_etag = None
+        return delta
+
+    def replay_output(self, output):
+        replay = replay_items(output)
+        return replay if len(replay) == len(output) else None
+
+    def starts_response(self, kind):
+        return kind not in ("response.created", "response.in_progress", "response.queued", "response.metadata")
+
+    def rejects_anchor(self, error):
+        if error.get("code") == "codex_previous_response_stale" or super().rejects_anchor(error):
+            self.models_etag = None
+            return True
+        return False
+
+    def observe(self, identity, headers):
+        headers = httpx.Headers(headers)
+        identity.observe(headers)
+        if value := headers.get(MODELS_ETAG):
+            self.models_etag = value
+
+    @contextmanager
+    def exchange(self, body, headers, identity, *, lite=False, compaction=False):
+        if self.sse_only or not self.lock.acquire(blocking=False):
+            yield None
+            return
+        try:
+            credentials = httpx.Headers(self.headers())
+            upgrade = credentials.copy()
+            upgrade.update(headers)
+            if self.metadata_credentials is not None and credentials != self.metadata_credentials:
+                self.models_etag = identity.state = None
+                upgrade.pop(TURN_STATE, None)
+            self.metadata_credentials = credentials
+            for key in ("accept", "content-type", "x-codex-beta-features"):
+                upgrade.pop(key, None)
+            upgrade["OpenAI-Beta"] = "responses_websockets=2026-02-06"
+            if self.models_etag:
+                upgrade[MODELS_ETAG] = self.models_etag
+            connection = self.connection
+            for attempt in range(self.connect_failure_limit):
+                if self.open(headers=list(upgrade.items()), connection_key=credentials):
+                    break
+                if self.sse_only:
+                    yield None
+                    return
+                websocket_backoff(attempt + 1)
+            else:
+                yield None
+                return
+            if self.connection is not connection:
+                self.observe(identity, list(self.connection.response.headers.raw_items()))
+            metadata = body["client_metadata"].copy()
+            if lite:
+                metadata["ws_request_header_x_openai_internal_codex_responses_lite"] = "true"
+            if identity.state:
+                metadata[TURN_STATE] = identity.state
+            wire = {**body, "stream": True, "client_metadata": metadata}
+            with closing(self.events(wire, normalize=OutputItems().normalize, retain_baseline=not compaction)) as stream:
+                yield stream
+        finally:
+            self.lock.release()

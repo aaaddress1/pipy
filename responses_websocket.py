@@ -32,11 +32,15 @@ def replay_item(item):
     return {key: value for key, value in item.items() if key not in ignore}
 
 
-def delta_input(baseline, request):
+def delta_input(baseline, request, *, codex=False):
     if baseline is None:
         return None
     _, previous, output = baseline
     excluded = {"input", "client_metadata"}
+    if codex:
+        if (previous.get("service_tier") == "ultrafast") != (request.get("service_tier") == "ultrafast"):
+            return None
+        excluded.add("service_tier")
     if ({key: item for key, item in previous.items() if key not in excluded}
         != {key: item for key, item in request.items() if key not in excluded}):
         return None
@@ -56,6 +60,13 @@ def stale_anchor(error):
 
 
 class ResponsesSocket:
+    idle_seconds = IDLE_SECONDS
+    receive_seconds = 120
+    ping_interval = 20
+    ping_timeout = 20
+    connect_failure_limit = 2
+    stale_anchor_limit = 3
+
     def __init__(self, loop, base_url, headers, *, chain=True):
         url = urlsplit(base_url)
         if url.scheme not in ("http", "https") or not url.hostname or url.username is not None or url.query or url.fragment:
@@ -80,28 +91,32 @@ class ResponsesSocket:
     def close(self):
         self.loop.call(self.disconnect())
 
-    async def connect(self, headers):
+    async def connect(self, headers, connection_key):
         if self.timer:
             self.timer.cancel()
             self.timer = None
-        if self.connection and self.connection.state is State.OPEN and headers == self.connected_headers:
+        if self.connection and self.connection.state is State.OPEN and connection_key == self.connected_headers:
             return
         await self.disconnect()
         self.connection = await NoRedirectConnect(self.url, additional_headers=headers, open_timeout=10,
-                                                   close_timeout=1, max_size=16 * 1024 * 1024)
-        self.connected_headers = headers
+                                                   close_timeout=1, max_size=16 * 1024 * 1024,
+                                                   ping_interval=self.ping_interval, ping_timeout=self.ping_timeout)
+        self.connected_headers = connection_key
 
     def status_error(self, status, body=None, headers=None):
         body = body or {}
         response = httpx.Response(status, headers=headers, request=httpx.Request("POST", self.http_url))
         return APIStatusError(body.get("message") or f"Responses WebSocket HTTP {status}.", response=response, body=body)
 
-    def open(self):
+    def open(self, *, headers=None, connection_key=None):
         if self.sse_only:
             return False
-        headers = self.headers()
+        if headers is None:
+            headers = self.headers()
+        if connection_key is None:
+            connection_key = headers
         try:
-            self.loop.call(self.connect(headers), active_turn())
+            self.loop.call(self.connect(headers, connection_key), active_turn())
         except InvalidStatus as error:
             status = error.response.status_code
             if status not in UNSUPPORTED_UPGRADE:
@@ -110,26 +125,45 @@ class ResponsesSocket:
             return False
         except (OSError, TimeoutError, WebSocketException):
             self.connect_failures += 1
-            self.sse_only = self.connect_failures >= 2
+            self.sse_only = self.connect_failures >= self.connect_failure_limit
             return False
         return True
 
     async def arm_idle(self):
-        self.timer = asyncio.get_running_loop().call_later(IDLE_SECONDS, lambda: asyncio.create_task(self.disconnect()))
+        self.timer = asyncio.get_running_loop().call_later(self.idle_seconds, lambda: asyncio.create_task(self.disconnect()))
 
-    def events(self, body):
+    def append_input(self, baseline, request):
+        return delta_input(baseline, request)
+
+    def replay_output(self, output):
+        return output
+
+    def starts_response(self, kind):
+        return kind != "response.metadata"
+
+    def rejects_anchor(self, error):
+        return stale_anchor(error)
+
+    def events(self, body, *, normalize=None, retain_baseline=True):
         turn = active_turn()
         request = {**body, "type": "response.create"}
         baseline, self.baseline = self.baseline, None
-        delta = delta_input(baseline, request) if self.chain and self.stale_anchors < 3 else None
+        delta = self.append_input(baseline, request) if self.chain and self.stale_anchors < self.stale_anchor_limit else None
         wire = {**request, "previous_response_id": baseline[0], "input": delta} if delta is not None else request
         ended = False
         try:
             self.loop.call(self.connection.send(json.dumps(wire)), turn)
             first = True
             while True:
-                raw = self.loop.call(asyncio.wait_for(self.connection.recv(), 120), turn)
-                event = json.loads(raw)
+                raw = self.loop.call(asyncio.wait_for(self.connection.recv(), self.receive_seconds), turn)
+                try:
+                    event = json.loads(raw)
+                except (ValueError, UnicodeError) as error:
+                    raise httpx.RemoteProtocolError("Responses WebSocket sent invalid JSON.") from error
+                if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                    raise httpx.RemoteProtocolError("Responses WebSocket sent an invalid event.")
+                if normalize:
+                    event = normalize(event)
                 kind = event["type"]
                 response = event.get("response") or {}
                 error = (response.get("error") or event.get("error") or event) if kind in ("error", "response.failed") else {}
@@ -139,16 +173,17 @@ class ResponsesSocket:
                     isinstance(usage.get(key), (int, float)) and usage[key] > 0
                     for key in ("input_tokens", "output_tokens", "total_tokens")
                 )
-                if first and delta is not None and not generated and status in (None, 400, 422) and stale_anchor(error):
+                if first and delta is not None and not generated and status in (None, 400, 422) and self.rejects_anchor(error):
                     self.stale_anchors += 1
                     delta = None
                     self.loop.call(self.connection.send(json.dumps(request)), turn)
                     continue
-                first = False
+                if self.starts_response(kind):
+                    first = False
                 if kind == "error":
                     if not isinstance(status, int) or not 400 <= status <= 599:
                         code = error.get("code") or ""
-                        status = 429 if code in ("rate_limit_exceeded", "insufficient_quota") else 400
+                        status = 429 if code in ("rate_limit_exceeded", "usage_limit_reached", "insufficient_quota") else 400
                     raise self.status_error(status, error)
                 if kind in TERMINAL:
                     if kind == "response.done" and response.get("status") in ("completed", "incomplete", "failed"):
@@ -158,9 +193,11 @@ class ResponsesSocket:
                         self.connect_failures = 0
                         if delta is not None:
                             self.stale_anchors = 0
-                    if event["type"] == "response.completed" and response.get("status") == "completed":
+                    if retain_baseline and event["type"] == "response.completed" and response.get("status") == "completed":
                         if isinstance(response.get("id"), str) and isinstance(response.get("output"), list):
-                            self.baseline = (response["id"], deepcopy(request), deepcopy(response["output"]))
+                            output = self.replay_output(response["output"])
+                            if output is not None:
+                                self.baseline = (response["id"], deepcopy(request), deepcopy(output))
                     yield event
                     return
                 yield event
