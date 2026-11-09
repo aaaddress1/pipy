@@ -697,43 +697,56 @@ class Tasks:
         path = self.session.path
         for owner in owners:
             with database(path) as db:
-                candidates = [(sid, name, scope, data, archive_session_id(db, sid)) for sid, name, scope, data in db.execute("""
-                    SELECT l.child,l.name,s.workspace,spec.data FROM subagent_links l
-                    JOIN subagent_specs spec ON spec.child=l.child JOIN sessions s ON s.id=l.child
+                candidates = [(*row, archive_session_id(db, row[0])) for row in db.execute("""
+                    SELECT l.child,l.name,s.workspace,spec.data,
+                           dead.child IS NOT NULL OR coalesce(json_extract(l.result,'$.status'),'')='cancelled'
+                           OR EXISTS(SELECT 1 FROM subagent_deliveries d WHERE d.child=l.child AND d.settled_leaf=head.leaf)
+                    FROM subagent_links l LEFT JOIN subagent_specs spec ON spec.child=l.child
+                    LEFT JOIN sessions s ON s.id=l.child
+                    LEFT JOIN session_heads head ON head.session=l.child
                     LEFT JOIN subagent_tombstones dead ON dead.child=l.child
-                    WHERE l.owner=? AND dead.child IS NULL
-                    AND coalesce(json_extract(l.result,'$.status'),'')<>'cancelled' ORDER BY l.rowid
+                    WHERE l.owner=? ORDER BY l.rowid
                 """, (owner,))]
-            for sid, name, scope, data, upstream_id in candidates:
+            for sid, name, scope, data, killed, upstream_id in candidates:
                 if sid in visited:
                     continue
                 visited.add(sid)
                 try:
-                    task = Task.restore(json.loads(data))
-                    if task.sid != sid or task.name != name or task.repo_root or task.workpool or not Path(scope).is_dir():
-                        continue
                     with lease(path.parent, sid), upstream_lease(upstream_id):
+                        owners.append(sid)
+                        if killed or not data or not scope or not Path(scope).is_dir():
+                            continue
+                        task = Task.restore(json.loads(data))
+                        if task.sid != sid or task.name != name or task.repo_root or task.workpool:
+                            continue
                         child = Session(path, sid, scope)
                         if not child.has_restorable_turn():
                             continue
                     plan.setdefault(owner, []).append(replace(task, workspace=scope))
-                    owners.append(sid)
                 except Timeout:
                     continue
                 except (KeyError, OSError, SQLiteError, TypeError, ValueError):
                     logger.warning("Unable to read the interrupted task %s", name, exc_info=True)
         return plan
 
-    def restore_children(self, plan):
-        tasks = plan.get(self.session.id)
+    def restore_detached(self, plan):
+        resumed = {self.session.id, *(task.sid for tasks in plan.values() for task in tasks)}
+        for owner in plan:
+            if owner not in resumed:
+                self.restore_children(plan, delivery_owner=owner)
+
+    def restore_children(self, plan, *, delivery_owner=None):
+        owner = delivery_owner or self.session.id
+        tasks = plan.get(owner)
         if not tasks or not self.jobs:
             return
 
         def reserve():
             if self.peer:
                 self.peer.bus.mark(*(task.sid for task in tasks))
-            for task in tasks:
-                self.observe(task, "running")
+            if not delivery_owner:
+                for task in tasks:
+                    self.observe(task, "running")
 
         def release_unclaimed(owner):
             if self.peer:
@@ -744,16 +757,17 @@ class Tasks:
         def resume(task, cancel):
             try:
                 if task.eval_schema_source is not None and self.resume_eval:
-                    return self.resume_eval(task, cancel, restore_plan=plan)
-                return self.execute(task, cancel, restore_plan=plan)
+                    identifier = f"{owner}/{task.name}" if delivery_owner else None
+                    return self.resume_eval(task, cancel, restore_plan=plan, owner=delivery_owner, job_id=identifier)
+                return self.execute(task, cancel, restore_plan=plan, delivery_owner=delivery_owner)
             finally:
                 release_unclaimed(task.sid)
 
         try:
             self.jobs.spawn([(task.name, task.eval_label or task.assignment, task.sid, lambda cancel, task=task: resume(task, cancel))
-                             for task in tasks], reserve, resuming=True)
+                             for task in tasks], reserve, resuming=True, delivery_owner=delivery_owner)
         except ValueError:
-            release_unclaimed(self.session.id)
+            release_unclaimed(owner)
             raise
 
     def revive(self, target):
@@ -835,7 +849,7 @@ class Tasks:
             db.execute("INSERT OR IGNORE INTO subagent_specs(child,data) VALUES (?,?)", (task.sid, pack(task.spec())))
         return task
 
-    def execute(self, task, cancel, *, revived=False, restore_plan=None):
+    def execute(self, task, cancel, *, revived=False, restore_plan=None, delivery_owner=None):
         if revived:
             self.observe(task, "running")
         try:
@@ -843,15 +857,25 @@ class Tasks:
         except BaseException:
             self.observe(task, "failed")
             raise
-        return self.complete(task, result, data)
+        return self.complete(task, result, data, delivery_owner=delivery_owner)
 
-    def complete(self, task, result, data):
+    def complete(self, task, result, data, *, delivery_owner=None):
         completed = False
         try:
             with database(self.session.path) as db:
                 db.execute("UPDATE subagent_links SET result = ? WHERE child = ?", (pack({**result, "data": data}), task.sid))
+                if delivery_owner:
+                    summary = {"jobId": task.name, "type": "task", "status": result["status"],
+                               "label": task.eval_label or task.assignment, "durationMs": result["durationMs"],
+                               "result": {key: value for key, value in result.items() if key != "report"}}
+                    db.execute("DELETE FROM subagent_deliveries WHERE child=? AND consumed=1", (task.sid,))
+                    db.execute("""INSERT INTO subagent_deliveries(owner,child,summary,report,settled_leaf)
+                                  SELECT l.owner,l.child,?,?,head.leaf FROM subagent_links l
+                                  LEFT JOIN session_heads head ON head.session=l.child WHERE l.owner=? AND l.child=?""",
+                               (pack(summary), result["report"], delivery_owner, task.sid))
             completed = result["status"] == "completed"
-            self.observe(task, result["status"])
+            if not delivery_owner:
+                self.observe(task, result["status"])
             return result
         finally:
             if self.peer:

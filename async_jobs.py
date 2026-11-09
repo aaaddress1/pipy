@@ -25,6 +25,23 @@ def tool_result(text, details, failed=False):
     return ExternalToolResult([{"type": "text", "text": text}], details, failed)
 
 
+def job_delivery(reports):
+    lines = []
+    for summary, text in reports:
+        label = summary["label"].replace("\r", r"\r").replace("\n", r"\n")
+        if len(label) > 400:
+            label = label[:198] + " ... " + label[-197:]
+        lines.append((summary["jobId"], HARNESS_TAG.sub("&lt;", label), HARNESS_TAG.sub("&lt;", text)))
+    if len(lines) == 1:
+        identifier, label, body = lines[0]
+        header = f"Background job {identifier} ({label}) has completed. Resume your work using the result below."
+    else:
+        header = f"{len(lines)} background jobs have completed. Resume your work using the results below."
+        body = "\n\n".join(f"── Job {identifier} ({label}) ──\n{text}" for identifier, label, text in lines)
+    return {"role": "developer", "content": f"<system-notice>\n{header}\n\n{body}\n</system-notice>",
+            "_async_jobs": {"jobs": [summary for summary, _ in reports]}}
+
+
 @dataclass
 class Job:
     id: str
@@ -46,6 +63,7 @@ class Job:
     agent_id: str | None = None
     queued: bool = False
     suppress_delivery: bool = False
+    delivery_owner: str | None = None
 
     def summary(self):
         return {"jobId": self.id, "type": self.kind, "status": self.status, "label": self.command,
@@ -68,6 +86,7 @@ class AsyncJobs:
         self.execute, self.archive, self.limit, self.budget = execute, archive, limit, budget
         self.condition = Condition()
         self.claimed_peer = set()
+        self.claimed_restored = set()
         self.jobs = {}
         self.ids = count(1)
         self.directory = None
@@ -134,14 +153,17 @@ class AsyncJobs:
              **({"timeoutSeconds": timeout} if timeout else {"timeoutDisabled": True})},
         )
 
-    def spawn(self, items, reserve, *, kind="task", queued=False, suppress_delivery=False, resuming=False):
+    def spawn(self, items, reserve, *, kind="task", queued=False, suppress_delivery=False, resuming=False, delivery_owner=None):
         """Register a batch before any member starts executing."""
         with self.condition:
             self.prune()
             running = sum(job.status == "running" and not job.queued for job in self.jobs.values())
             if self.closed or not resuming and not queued and running + len(items) > self.limit:
                 raise ValueError("Too many background jobs are running.")
-            identifiers = {item[0] for item in items}
+            def key(identifier):
+                return f"{delivery_owner}/{identifier}" if delivery_owner else identifier
+
+            identifiers = {key(item[0]) for item in items}
             if len(identifiers) != len(items) or identifiers & self.jobs.keys():
                 raise ValueError("A background job with this id already exists.")
             reserve()
@@ -149,9 +171,11 @@ class AsyncJobs:
             for identifier, label, agent_id, execute in items:
                 job = Job(identifier, label, None, 0, Cancellation(self.budget, reason=f"{kind.title()} cancelled."),
                           True, time.monotonic(), kind=kind, agent_id=agent_id, queued=queued,
-                          suppress_delivery=suppress_delivery)
+                          suppress_delivery=suppress_delivery or bool(delivery_owner), delivery_owner=delivery_owner)
                 job.worker = Thread(target=self.run_registered, args=(job, execute), name=f"mini-pi-{kind}-{identifier}", daemon=True)
-                self.jobs[identifier] = job
+                self.jobs[key(identifier)] = job
+                if delivery_owner and self.peer:
+                    self.peer.bus.track_owned_job(job)
                 spawned.append(job)
             for job in spawned:
                 job.worker.start()
@@ -265,7 +289,7 @@ class AsyncJobs:
     def finish(self, job, status, text, *, discard=False):
         if self.peer and job.agent_id:
             try:
-                self.peer.bus.record_job_reply(job.agent_id, self.peer.sid)
+                self.peer.bus.record_job_reply(job.agent_id, job.delivery_owner or self.peer.sid)
             except SQLiteError:
                 logger.exception("Unable to record the reply from job %s", job.id)
         with self.condition:
@@ -281,6 +305,8 @@ class AsyncJobs:
             wake = self.wake if job.background and not job.suppress_delivery and not self.closed else None
             self.condition.notify_all()
         if self.peer and job.kind == "task":
+            if job.delivery_owner:
+                self.peer.bus.finish_owned_job(job)
             self.peer.bus.recover_deferred()
         if wake:
             wake(self)
@@ -292,6 +318,14 @@ class AsyncJobs:
         if wake:
             wake(self)
 
+    def scoped_jobs(self):
+        local = [job for job in self.jobs.values() if not job.delivery_owner]
+        return local + (self.peer.bus.owner_jobs(self.peer.sid) if self.peer else [])
+
+    def restored_deliveries(self):
+        return [(identifier, summary, report) for identifier, summary, report in self.peer.restored_deliveries()
+                if identifier not in self.claimed_restored] if self.peer else []
+
     def pending(self, include_peer=True):
         if include_peer and self.peer and self.peer.ready():
             return True
@@ -300,7 +334,8 @@ class AsyncJobs:
         if include_peer and self.rules and (self.rule_notice or self.rules.judgment_pending()):
             return True
         with self.condition:
-            return any(job.background and not job.suppress_delivery and job.delivered_at is None for job in self.jobs.values())
+            return bool(self.restored_deliveries()) or any(job.background and job.delivered_at is None
+                and (not job.suppress_delivery or job.delivery_owner and job.status == "running") for job in self.scoped_jobs())
 
     def ready(self):
         if self.peer and self.peer.ready():
@@ -310,30 +345,23 @@ class AsyncJobs:
         if self.rules and (self.rule_notice or self.rules.judgment_ready()):
             return True
         with self.condition:
-            return any(job.background and not job.suppress_delivery and job.delivered_at is None and job.status != "running"
-                       for job in self.jobs.values())
+            return bool(self.restored_deliveries()) or any(job.background and not job.suppress_delivery
+                and job.delivered_at is None and job.status != "running" for job in self.jobs.values())
 
-    def take(self):
+    def take(self, *, claim=False):
         with self.condition:
             ready = [job for job in self.jobs.values() if job.background and not job.suppress_delivery
                      and job.delivered_at is None and job.status != "running"]
             for job in ready:
                 self.consume(job)
-        if not ready:
-            return None
-        jobs = [job.summary() for job in ready]
-        labels = [job.command.replace("\r", r"\r").replace("\n", r"\n") for job in ready]
-        labels = [label if len(label) <= 400 else label[:198] + " ... " + label[-197:] for label in labels]
-        labels = [HARNESS_TAG.sub("&lt;", label) for label in labels]
-        if len(ready) == 1:
-            header = f"Background job {ready[0].id} ({labels[0]}) has completed. Resume your work using the result below."
-            body = HARNESS_TAG.sub("&lt;", ready[0].text)
-        else:
-            header = f"{len(ready)} background jobs have completed. Resume your work using the results below."
-            body = "\n\n".join(f"── Job {job.id} ({label}) ──\n" + HARNESS_TAG.sub("&lt;", job.text)
-                                 for job, label in zip(ready, labels))
-        return {"role": "developer", "content": f"<system-notice>\n{header}\n\n{body}\n</system-notice>",
-                "_async_jobs": {"jobs": jobs}}
+            restored = self.restored_deliveries()
+            if claim:
+                self.claimed_restored.update(identifier for identifier, _, _ in restored)
+        if ready or restored:
+            notice = job_delivery([(job.summary(), job.text) for job in ready] + [(summary, text) for _, summary, text in restored])
+            if restored:
+                notice["_restored_jobs"] = [identifier for identifier, _, _ in restored]
+            return notice
 
     def consume(self, job):
         with self.condition:
@@ -375,8 +403,8 @@ class AsyncJobs:
                 if self.steered(turn):
                     self.wait_index = 0
                     return tool_result("Wait interrupted by message.", {"op": "wait", "interrupted": True})
-                running = [job for job in self.jobs.values() if job.background and not job.suppress_delivery and job.status == "running"
-                           and job.delivered_at is None]
+                running = [job for job in self.scoped_jobs() if job.background and job.status == "running"
+                           and (not job.suppress_delivery or job.delivery_owner) and job.delivered_at is None]
                 service_running = self.services and not drain and self.services.active()
                 if self.peer and (message := self.peer.peek(waiting=not drain, watch_replies=not running and not service_running,
                                                            exclude=self.claimed_peer)):
@@ -386,12 +414,15 @@ class AsyncJobs:
                         return message
                     self.claimed_peer.update(row["id"] for row in message["_irc_messages"])
                     return tool_result(message["content"], {"op": "wait", "waited": message["_irc_messages"]})
-                if delivery := self.take():
+                if delivery := self.take(claim=not drain):
                     self.wait_index = 0
                     self.last_wait = time.monotonic()
                     if drain:
                         return delivery
-                    return tool_result(delivery["content"], {"op": "wait", **delivery["_async_jobs"]})
+                    details = {"op": "wait", **delivery["_async_jobs"]}
+                    if ids := delivery.get("_restored_jobs"):
+                        details["_restored_jobs"] = ids
+                    return tool_result(delivery["content"], details)
                 if self.services and (completion := self.services.peek()):
                     if drain:
                         return completion
@@ -438,16 +469,21 @@ class AsyncJobs:
                 self.condition.wait(0.1)
 
     def release_tool_delivery(self, result):
-        if rows := result.get("_irc_messages"):
+        rows, restored = result.get("_irc_messages"), result.get("_restored_jobs")
+        if rows or restored:
             with self.condition:
-                self.claimed_peer.difference_update(row["id"] for row in rows)
+                self.claimed_peer.difference_update(row["id"] for row in rows or ())
+                self.claimed_restored.difference_update(restored or ())
                 self.condition.notify_all()
 
     def inspect(self, identifier):
         with self.condition:
             self.prune()
-            jobs = [job for job in self.jobs.values() if job.background and (not identifier or job.id == identifier)]
-            if identifier and not jobs:
+            jobs = [job for job in self.scoped_jobs() if job.background and (not identifier or job.id == identifier)]
+            current = {job.id for job in jobs}
+            durable = [(summary, report) for _, summary, report in self.restored_deliveries()
+                       if summary["jobId"] not in current and (not identifier or summary["jobId"] == identifier)]
+            if identifier and not jobs and not durable:
                 raise ValueError(f"Unknown job {identifier!r}.")
             text = []
             for job in jobs:
@@ -461,12 +497,17 @@ class AsyncJobs:
                             output.seek(max(0, size - 4000))
                             row += "\n" + output.read(4000).decode("utf-8", errors="replace")
                 text.append(row)
-            return "\n".join(text) or "No background jobs.", [job.summary() for job in jobs]
+            for summary, report in durable:
+                row = f"{summary['jobId']} [task] {summary['status']} — {summary['label']}"
+                text.append(row + "\n" + report if identifier else row)
+            return "\n".join(text) or "No background jobs.", [job.summary() for job in jobs] + [summary for summary, _ in durable]
 
     def kill(self, identifier):
         with self.condition:
-            job = self.jobs.get(identifier)
+            job = next((job for job in self.scoped_jobs() if job.id == identifier), None)
             if not job or not job.background:
+                if any(summary["jobId"] == identifier for _, summary, _ in self.restored_deliveries()):
+                    return f"Job {identifier} has already settled."
                 raise ValueError(f"Unknown job {identifier!r}.")
             if job.status != "running":
                 return f"Job {identifier} has already settled."
@@ -496,7 +537,7 @@ class AsyncJobs:
 
     def discard(self):
         with self.condition:
-            for job in self.jobs.values():
+            for job in self.scoped_jobs():
                 job.background = False
                 job.delivered_at = time.monotonic()
                 if job.status == "running":

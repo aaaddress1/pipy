@@ -230,9 +230,9 @@ class AgentBridge:
             tasks.jobs.progress(job_id or task.name, {"progress": details}, f"Running agent {task.name}...")
 
         result, value = tasks.run_task(task, cancellation, revived, progress=progress, restore_plan=restore_plan)
-        return self.finish(task, result, value, owner)
+        return self.finish(task, result, value, owner, delivery_owner=owner if restore_plan is not None else None)
 
-    def finish(self, task, result, value, owner=None):
+    def finish(self, task, result, value, owner=None, *, delivery_owner=None):
         error = result.get("error")
         isolation = result.get("isolation", {})
         if result["status"] == "completed" and isolation and task.isolation_apply:
@@ -256,7 +256,7 @@ class AgentBridge:
         except OSError as error:
             report = f"Could not save the agent output: {error}"
             result.update(status="failed", error=report, report=report)
-        return self.tasks.complete(task, result, value)
+        return self.tasks.complete(task, result, value, delivery_owner=delivery_owner)
 
     @staticmethod
     def save(artifacts, name, text):

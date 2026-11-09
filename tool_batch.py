@@ -106,6 +106,9 @@ def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cance
                             result["_tool_useless"] = True
                         if output.details.get("op") == "wait" and (waited := output.details.get("waited")):
                             result["_irc_messages"] = waited
+                        if output.details.get("op") == "wait" and (ids := output.details.get("_restored_jobs")):
+                            result["_restored_jobs"] = ids
+                            result["_tool_details"] = {key: value for key, value in output.details.items() if key != "_restored_jobs"}
                     else:
                         result["content"] = output
                         if isinstance(output, ReadText):

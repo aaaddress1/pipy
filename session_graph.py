@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS subagent_links (
 CREATE INDEX IF NOT EXISTS subagent_links_child ON subagent_links(child);
 CREATE TABLE IF NOT EXISTS subagent_specs (child TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS subagent_tombstones (child TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS subagent_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, child TEXT NOT NULL,
+    summary TEXT NOT NULL, report TEXT NOT NULL, settled_leaf INTEGER, consumed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS subagent_deliveries_owner ON subagent_deliveries(owner, consumed, id);
+CREATE INDEX IF NOT EXISTS subagent_deliveries_child ON subagent_deliveries(child, settled_leaf);
 CREATE TABLE IF NOT EXISTS speculative_task_roots (session TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS peer_messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, root TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
@@ -81,6 +87,7 @@ def delete_task_subtree(db, children):
     db.executemany("DELETE FROM peer_messages WHERE sender = ? OR recipient = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM subagent_specs WHERE child = ?", ((sid,) for sid in children))
     db.executemany("DELETE FROM subagent_tombstones WHERE child = ?", ((sid,) for sid in children))
+    db.executemany("DELETE FROM subagent_deliveries WHERE owner = ? OR child = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM subagent_links WHERE owner = ? OR child = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM sessions WHERE id = ?", ((sid,) for sid in children))
 
@@ -88,6 +95,7 @@ def delete_task_subtree(db, children):
 def drop_journal(db, session):
     for table in JOURNAL_TABLES:
         db.execute(f"DELETE FROM {table} WHERE session = ?", (session,))
+    db.execute("DELETE FROM subagent_deliveries WHERE owner=? OR child=?", (session, session))
     db.execute("DELETE FROM sessions WHERE id = ?", (session,))
 
 

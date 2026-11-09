@@ -77,7 +77,8 @@ def portable_message(message, thinking_route=None):
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
                "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment", "_compaction_continue",
-               "_tool_pending", "_interrupt_blocks", "_live_interruption", "_retry_omit", "_interrupted_replay")
+               "_tool_pending", "_interrupt_blocks", "_live_interruption", "_retry_omit", "_interrupted_replay",
+               "_restored_jobs")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -662,6 +663,10 @@ class Session:
         if services:
             db.executemany("UPDATE service_runs SET consumed=1 WHERE owner=? AND id=? AND finished IS NOT NULL",
                            ((self.id, identifier) for identifier in services))
+        restored = {identifier for message in messages for identifier in message.get("_restored_jobs", ())}
+        if restored:
+            db.executemany("UPDATE subagent_deliveries SET consumed=1,summary='{}',report='' WHERE owner=? AND id=?",
+                           ((self.id, identifier) for identifier in restored))
 
     @session_write
     def record_metadata(self, *payloads):

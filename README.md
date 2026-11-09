@@ -322,7 +322,7 @@ Muse Code 可設定 `providers.museCode.storeResponses: true`，或用 `PI_MUSE_
 
 互動終端可用 `--restore <UUID>` 接續前一個程序中斷的回合，包含來不及寫下退出紀錄的情況。工作階段會分別記錄工具開始、工具結果與程序退出。若整批工具都失敗或沒有留下結果，且日誌保留可執行的呼叫與參數，會直接重跑該批。已留下成功結果的批次會保留既有結果，並交由模型從中斷處繼續。 [上游中斷恢復](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/agent-session.ts#L12936)
 
-啟用背景工作時，`--restore` 會沿用中斷子代理的工作 ID 和工作階段，先登記直屬工作，再讓各層父代理接續。父代理原本的 `wait` 可以等到恢復後的結果。已結束、明確取消或使用隔離工作目錄的子代理會略過。現階段會接回同樣中斷的父子鏈，已結束的中間父代理所屬工作及 `workpool` 批次仍待移植。 [上游子代理恢復](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/task/restore.ts)
+啟用背景工作時，`--restore` 會沿用中斷子代理的工作 ID 和工作階段，先登記工作，再讓各層父代理接續。父代理原本的 `wait` 可以等到恢復後的結果。中間父代理已結束時，仍會恢復它底下符合條件的工作，並把通知保存給原本的擁有者。通知寫進該工作階段日誌後才會標為已接收。已結束、明確取消或使用隔離工作目錄的子代理會略過。`workpool` 批次仍待移植。 [上游子代理恢復](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/task/restore.ts)
 
 互動終端、RPC 和 ACP 可用 `/retry` 重試上一個失敗或中止的回合。失敗輸出保留在日誌中，下一次模型請求會略過它。若上一批工具的每個結果都失敗，且呼叫參數完整、之後沒有需要保留的背景通知，代理會直接重跑該批。舊版 pipy 日誌也支援這項重跑，原本的失敗結果仍保留在舊分支。 [上游手動重試](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/turn-recovery.ts#L3429)
 

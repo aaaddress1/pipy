@@ -1,5 +1,6 @@
 """Durable peer mailboxes and wake routing within one agent tree."""
 
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from html import escape
@@ -44,6 +45,7 @@ class PeerBus:
         self.closing = False
         self.scheduled = set()
         self.restoring = set()
+        self.owned_jobs = {}
         self.waiting = {}
         self.deferred = set()
         self.revive = None
@@ -150,6 +152,25 @@ class PeerBus:
                 return False
             self.restoring.remove(sid)
             return True
+
+    def track_owned_job(self, job):
+        with self.lock:
+            self.owned_jobs.setdefault(job.delivery_owner, {})[job.id] = job
+
+    def finish_owned_job(self, job):
+        with self.lock:
+            jobs = self.owned_jobs.get(job.delivery_owner)
+            if jobs and jobs.get(job.id) is job:
+                jobs.pop(job.id)
+                if not jobs:
+                    self.owned_jobs.pop(job.delivery_owner)
+            endpoint = self.endpoints.get(job.delivery_owner) if not self.closing else None
+        if endpoint and endpoint.wake:
+            endpoint.wake()
+
+    def owner_jobs(self, owner):
+        with self.lock:
+            return list(self.owned_jobs.get(owner, {}).values())
 
     def discard_speculation(self, children):
         with self.condition:
@@ -326,6 +347,12 @@ class Endpoint:
 
     def ready(self):
         return self.bus.pending(self.sid)
+
+    def restored_deliveries(self):
+        with database(self.bus.path) as db:
+            rows = db.execute("SELECT id,summary,report FROM subagent_deliveries WHERE owner=? AND consumed=0 ORDER BY id",
+                              (self.sid,))
+            return [(identifier, json.loads(summary), report) for identifier, summary, report in rows]
 
     def rows(self):
         with database(self.bus.path) as db:

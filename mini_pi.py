@@ -2165,7 +2165,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     for seq, batch in handle.session.batches:
                         if seq > start:
                             received.extend(row for message in batch for row in message.get("_irc_messages", ()))
-                    owner_reply = handle.peer.relay({"_irc_messages": received}, relay, session.id)
+                    owner = lineage[0].id if restoring and lineage else session.id
+                    owner_reply = handle.peer.relay({"_irc_messages": received}, relay, owner)
                     runtime.suppress_delivery = bool(revived and relay and received and not owner_reply)
                 if runtime.submitted is not None:
                     return runtime.submitted["data"], runtime.submitted["error"]
@@ -3864,6 +3865,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                             if peer:
                                 peer_bus.reserve_restoration(task.sid for batch in plan.values() for task in batch)
                             tasks.restore_children(plan)
+                            tasks.restore_detached(plan)
                         if peer:
                             peer_bus.recover()
                         if restore_pending:
