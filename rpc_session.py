@@ -123,7 +123,8 @@ class SessionRpc:
         summary = self.session.summary
         messages = [wire_message(message, call_names) for _, batch in batches for message in batch]
         if summary:
-            messages.insert(0, {"role": "compactionSummary", "summary": summary, "tokensBefore": 0})
+            messages.insert(0, {"role": "compactionSummary", "summary": summary, "tokensBefore": 0,
+                                **self.session.compaction_diagnostics()})
         return messages
 
     def page(self, command):

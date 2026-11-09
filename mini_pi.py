@@ -1493,6 +1493,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         ) if part)
         if not child or not child.provisional:
             print(f"[session: {session_id}]", file=sys.stderr)
+            if warning := session.compaction_diagnostics().get("warning"):
+                warning = "".join(char if char.isprintable() else " " for char in warning[:512])
+                print(f"[compaction: {warning}]", file=sys.stderr)
         shell_env = task_isolation.checkout_environment() if child and child.task.repo_root else None
         shell_runner = partial(run_shell, env=shell_env) if shell_env is not None else run_shell
         jobs = (AsyncJobs(shell_runner, partial(shell_output, session), args.async_max_jobs, run_budget)
@@ -3570,7 +3573,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 entries, _, _ = binding.journal()
                 latest = next((entry for entry in reversed(entries) if entry["type"] == "compaction"), None)
                 result = {"summary": session.summary, "firstKeptEntryId": latest["firstKeptEntryId"] if latest else "",
-                          "tokensBefore": before}
+                          "tokensBefore": before, **session.compaction_diagnostics()}
                 rpc.event("manual_compaction_end", aborted=False, result=result)
                 return result
 
@@ -4083,6 +4086,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 elif task == "/shake":
                     if not compaction.shake(MANUAL):
                         print("No eligible context regions to shake.")
+                elif task == "/shake images":
+                    if not compaction.drop_images():
+                        print("No attached images in this branch.")
                 elif command and command[0] == "/memory":
                     try:
                         print(memory_command(command[1] if len(command) > 1 else ""))

@@ -68,6 +68,20 @@ def portable_message(message, thinking_route=None):
     return message
 
 
+def developer_content(message):
+    content = message["content"]
+    if message.get("_branch_summary"):
+        return graph.SUMMARY_CONTEXT.replace("{{summary}}", content)
+    if any(message.get(key) for key in (
+        "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
+        "_thinking_loop_redirect", "_session_transfer", "_goal_message", "_todo_message", "_compaction_continue",
+    )):
+        return content
+    if isinstance(content, list):
+        return [{"type": "text", "text": "[Agent recovery]"}, *content]
+    return "[Agent recovery]\n" + content
+
+
 @contextmanager
 def database(path):
     db = connect(path, timeout=15)
@@ -353,8 +367,30 @@ class Session:
                 payload=[(seq, index, text) for (seq, index), text in replacements.items()],
             )
             graph.set_head(db, self.id, leaf)
+            if check:
+                check()
         self.leaf = leaf
         self.apply_elisions(replacements)
+
+    @session_write
+    def drop_images(self, check=None):
+        if check:
+            check()
+        with database(self.path) as db:
+            batches = graph.stored_batches(db, self.id, self.leaf)
+        replacements, removed = {}, 0
+        for seq, batch in batches:
+            if check:
+                check()
+            for index, message in enumerate(batch):
+                _, count = graph.without_images(message)
+                if count:
+                    replacements[seq, index] = {"drop_images": True}
+                    removed += count
+        if replacements:
+            self.archive_elisions(replacements, {}, check=check)
+            self._rollover_request = UNREAD
+        return removed
 
     def save_artifact(self, text):
         identifier = artifact_id(text)
@@ -561,14 +597,14 @@ class Session:
             _, start = graph.transcript_boundary(db, self.id, leaf)
             parents = {owner for owner, in db.execute("SELECT owner FROM subagent_links WHERE child=?", (self.id,))}
             rows = db.execute(graph.ANCESTORS + """
-                SELECT b.seq,j.value FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                SELECT b.seq,j.key,j.value FROM ancestry a JOIN session_nodes n ON n.id=a.id
                 JOIN batches b ON b.session=n.session AND b.seq=n.batch JOIN json_each(b.messages) j
                 WHERE b.seq>=? AND (json_extract(j.value,'$.role')='user'
                     OR json_type(j.value,'$._parent_assignment')='true'
                     OR json_type(j.value,'$._irc_messages')='array')
                 ORDER BY b.seq DESC,j.key DESC
             """, (leaf, self.id, self.id, start))
-            for seq, raw in rows:
+            for seq, position, raw in rows:
                 message = json.loads(raw)
                 user = message["role"] == "user" and not any(message.get(key) for key in (
                     "_mcp_notification", "_async_jobs", "_service_runs", "_irc_messages", "_goal_message",
@@ -577,7 +613,10 @@ class Session:
                     row.get("sender") in parents for row in message.get("_irc_messages", ())
                 )
                 if user or parent:
-                    return {"role": "user", "content": message["content"]} if seq < cut else None
+                    if seq >= cut:
+                        return None
+                    projected = graph.stored_batches(db, self.id, self.leaf, seq, seq + 1)[0][1][position]
+                    return {"role": "user", "content": projected["content"]}
         return None
 
     def goal_record(self):
@@ -755,15 +794,7 @@ class Session:
         if provenance and len(head) > 1:
             head[-1].update(provenance)
         messages = head + [
-            {**provenance, "role": "user", "content": (
-                graph.SUMMARY_CONTEXT.replace("{{summary}}", message["content"])
-                if message.get("_branch_summary") else (
-                    message["content"] if any(message.get(key) for key in (
-                        "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
-                        "_thinking_loop_redirect", "_session_transfer", "_goal_message", "_todo_message", "_compaction_continue"))
-                    else "[Agent recovery]\n" + message["content"]
-                )
-            )}
+            {**provenance, "role": "user", "content": developer_content(message)}
             if message["role"] == "developer" else (message if include_native else portable_message(message, thinking_route))
             for seq, batch in self.batches if seq >= cut and (before is None or seq < before)
             for message in batch
@@ -811,6 +842,40 @@ class Session:
         self._rollover_request = UNREAD
         self._archive_view = None
         self.batches = [(seq, batch) for seq, batch in self.batches if seq >= cut]
+
+    @session_write
+    def update_compaction_metadata(self, node, *, tokens_after, warning=None, check=None):
+        if node is None:
+            return
+        with database(self.path) as db:
+            row = db.execute(graph.ANCESTORS + """
+                SELECT n.id,n.kind,n.payload FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                WHERE n.kind IN ('compact','reset') ORDER BY n.id DESC LIMIT 1
+            """, (self.leaf, self.id, self.id)).fetchone()
+            if not row or row[:2] != (node, "compact"):
+                return
+            cut, summary, existing = json.loads(row[2])
+            metadata = {**(existing or {}), "tokensAfter": tokens_after}
+            if warning:
+                metadata["warning"] = warning
+            if metadata == existing:
+                return
+            if check:
+                check()
+            db.execute("UPDATE session_nodes SET payload=? WHERE session=? AND id=?",
+                       (pack([cut, summary, metadata]), self.id, node))
+            graph.projection(db, self.id, cut, summary, metadata)
+            if check:
+                check()
+        self.native_summary = metadata
+
+    def compaction_diagnostics(self):
+        data = self.native_summary or {}
+        result = {key: data[key] for key in ("tokensBefore", "tokensAfter")
+                  if type(data.get(key)) is int and data[key] >= 0}
+        if isinstance(warning := data.get("warning"), str) and warning.strip():
+            result["warning"] = warning
+        return result
 
     def file_operations(self, before):
         with database(self.path) as db:
@@ -891,6 +956,7 @@ class Compaction:
         self.provider_context = 0
         self.threshold_dead_end = None
         self.continuation_blocked = False
+        self.last_commit_node = None
 
     def discard_pending(self):
         if self.pending:
@@ -916,6 +982,7 @@ class Compaction:
         self.provider_context = 0
         self.threshold_dead_end = None
         self.continuation_blocked = False
+        self.last_commit_node = None
         self.native_speculation_failed = False
 
     def observe(self, messages, usage):
@@ -1076,6 +1143,8 @@ class Compaction:
         return True
 
     def maintain(self, system, reason="threshold", focus=None, *, methods=None, phase="pre", promote=None):
+        if phase == "post" or reason in ("overflow", "incomplete"):
+            self.last_commit_node = None
         if not self.auto_enabled and reason != "manual":
             return False
         if methods is None and not focus and self.context_windows() and reason in (
@@ -1151,6 +1220,10 @@ class Compaction:
             changed = True
         if retrying and "shake" in methods:
             changed = self.shake(RESCUE) or changed
+        if retrying and (not changed or not self.fits_prompt(system)) and self.drop_images(system):
+            if self.fits_prompt(system):
+                return True
+            return self.maintain(system, reason, focus, methods=methods, phase=phase, promote=promote)
         if reason == "threshold" and phase in ("mid", "post") and not changed:
             self.threshold_dead_end = self.threshold_cut()
         return changed and (not retrying or self.fits_prompt(system))
@@ -1164,29 +1237,35 @@ class Compaction:
                             or max(estimate, self.provider_context) <= self.threshold):
             return True
 
-        def has_headroom():
+        def residual():
             messages = self.messages(system)
             stored = self.context_sizes(messages, None)[1] + max(0, tokens(schemas) - tokens([]))
-            return max(stored, self.estimate(messages, floor_stored=True)) <= self.threshold * 80 // 100
+            return max(stored, self.estimate(messages, floor_stored=True))
 
-        if has_headroom():
-            return True
-        if changed and not self.context_windows():
-            cancellation = active_turn()
-            check = cancellation.check if cancellation else None
-            if check:
-                check()
-            if self.shrink_archive(system) and has_headroom():
-                return True
-            if self.shake(RESCUE, check=check) and has_headroom():
-                return True
-        self.continuation_blocked = True
-        self.threshold_dead_end = self.threshold_cut()
-        warning = "Compaction could not create enough headroom. Automatic continuation was paused."
-        if self.on_event:
-            self.on_event("notice", level="warning", source="compaction", message=warning)
-        print(f"[{warning}]", file=sys.stderr)
-        return False
+        band = self.threshold * 80 // 100
+        after = residual()
+        cancellation = active_turn()
+        check = cancellation.check if cancellation else None
+        if after > band and not self.context_windows():
+            for rescue in (partial(self.shrink_archive, system), partial(self.shake, RESCUE, check=check),
+                           partial(self.drop_images, system)):
+                if check:
+                    check()
+                if rescue():
+                    after = residual()
+                    if after <= band:
+                        break
+        warning = None
+        if after > band:
+            self.continuation_blocked = True
+            self.threshold_dead_end = self.threshold_cut()
+            warning = "Compaction could not create enough headroom. Automatic continuation was paused."
+        self.session.update_compaction_metadata(self.last_commit_node, tokens_after=after, warning=warning, check=check)
+        if warning:
+            if self.on_event:
+                self.on_event("notice", level="warning", source="compaction", message=warning)
+            print(f"[{warning}]", file=sys.stderr)
+        return warning is None
 
     def remind_context_notes(self, system):
         if not self.auto_enabled or self.threshold is None or not self.context_windows():
@@ -1304,17 +1383,31 @@ class Compaction:
     def recover_media(self, system):
         archive = self.session.disable_archive_images()
         inline = self.disable_inline() if self.disable_inline else False
-        if archive or inline:
+        removed = self.drop_images(system)
+        if (archive or inline) and not removed:
             self.on_context_change()
             self.discard_pending()
             self.last_cuts.clear()
             self.measured = None
             self.provider_context = 0
             self.threshold_dead_end = None
+        if archive or inline or removed:
             print("[compaction: replaying context as text after a media rejection]", file=sys.stderr)
             if not self.window or self.estimate(self.messages(system)) < self.window:
                 return True
         return self.maintain(system, reason="media")
+
+    def drop_images(self, system=None):
+        if system is not None and not any(graph.without_images(message)[1] for message in self.messages(system)):
+            return 0
+        cancellation = active_turn()
+        removed = self.session.drop_images(cancellation.check if cancellation else None)
+        if removed:
+            node = self.last_commit_node
+            self.reset_context()
+            self.last_commit_node = node
+            print(f"[compaction: removed {removed} image blocks from the active context]", file=sys.stderr)
+        return removed
 
     def shrink_archive(self, system):
         archive = (self.session.native_summary or {}).get("snapcompact")
@@ -1546,7 +1639,9 @@ class Compaction:
                 return False
             cut, before_tokens, after_tokens = costs
             self.on_context_change()
-            self.session.compact(cut, summary.text, summary.native, check=check)
+            metadata = {"tokensBefore": snapshot.context_tokens, "tokensAfter": after_tokens, **(summary.native or {})}
+            self.session.compact(cut, summary.text, metadata, check=check)
+            self.last_commit_node = self.session.leaf
         self.discard_pending()
         self.last_cuts.clear()
         self.measured = None

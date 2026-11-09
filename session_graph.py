@@ -203,8 +203,35 @@ def nodes(db, session, leaf, after=0):
     """, (leaf, session, session, after)).fetchall()
 
 
+def without_images(message):
+    """Strip projected image blocks while preserving text, tool details and pairing."""
+    if message.get("role") not in ("user", "developer", "tool"):
+        return message, 0
+    content = message.get("content")
+    details = message.get("_tool_details")
+    image_types = ("image", "image_url", "input_image")
+
+    def keep(parts):
+        return [part for part in parts if not isinstance(part, dict) or part.get("type") not in image_types]
+
+    changes, removed = {}, 0
+    if isinstance(content, list):
+        kept = keep(content)
+        if len(kept) != len(content):
+            removed += len(content) - len(kept)
+            changes["content"] = kept or [{"type": "text", "text": "[image removed]"}]
+    if isinstance(details, dict) and isinstance(images := details.get("images"), list):
+        kept = keep(images)
+        if len(kept) != len(images):
+            removed += len(images) - len(kept)
+            changes["_tool_details"] = {**details, "images": kept}
+    return ({**message, **changes}, removed) if removed else (message, 0)
+
+
 def apply_elision(message, edit):
     if isinstance(edit, dict):
+        if edit.get("drop_images") is True:
+            return without_images(message)[0]
         if "pruned_at" in edit:
             return {**message, "content": edit["pruned_content"], "_tool_pruned_at": edit["pruned_at"]}
         if saved := message.get("_responses"):

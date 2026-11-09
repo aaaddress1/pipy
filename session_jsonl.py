@@ -146,6 +146,8 @@ def text_and_images(content):
 
 def valid_elision(edit):
     if isinstance(edit, dict):
+        if set(edit) == {"drop_images"}:
+            return edit["drop_images"] is True
         if set(edit) == {"pruned_content", "pruned_at"}:
             return isinstance(edit["pruned_content"], str) and type(edit["pruned_at"]) is int and edit["pruned_at"] >= 0
         return set(edit) == {"responses_prefix"} and isinstance(edit["responses_prefix"], str)
@@ -163,7 +165,7 @@ def import_message(entry):
     if kind == "branch_summary":
         return {"role": "developer", "content": str(entry.get("summary") or ""), "_branch_summary": True}
     if kind == "custom_message":
-        message = {"role": "developer", "content": plain_text(text_and_images(entry.get("content")))}
+        message = {"role": "developer", "content": text_and_images(entry.get("content"))}
         if entry.get("customType") in ("eager-todo-prelude", "mid-run-todo-nudge", "todo-reminder", "todo-error-reminder"):
             message["_todo_message"] = entry["customType"]
         if entry.get("customType") in ("goal-mode-context", "goal-continuation", "goal-budget-limit", "guided-goal-interview"):
@@ -258,7 +260,7 @@ def import_message(entry):
             result["_input_transformations"] = message["inputTransformations"]
         return result
     if role in ("custom", "hookMessage", "developer"):
-        return {"role": "developer", "content": plain_text(text_and_images(message.get("content")))}
+        return {"role": "developer", "content": text_and_images(message.get("content"))}
     return None
 
 
@@ -334,6 +336,12 @@ def import_compaction(db, session, parent, entry, batches):
         text = archive.get("text") or "\n".join(archive.get(key) or "" for key in ("textHead", "textTail"))
         if text.strip():
             summary += "\n\n" + text.replace("█", "\n").replace("\x0e", "").replace("\x0f", "")
+    diagnostics = {key: entry[key] for key in ("tokensBefore", "tokensAfter")
+                   if type(entry.get(key)) is int and entry[key] >= 0}
+    if isinstance(warning := entry.get("warning"), str) and warning.strip():
+        diagnostics["warning"] = warning
+    if diagnostics:
+        native = {**(native or {}), **diagnostics}
     return graph.append(db, session, parent, "compact", payload=[cut, summary, native])
 
 
@@ -489,45 +497,47 @@ def export_parts(content):
 
 def export_message(message, call_names):
     role = message["role"]
+    source = message.get("content")
+    custom_content = export_parts(source) if isinstance(source, list) else source
     if kind := message.get("_goal_message") or message.get("_todo_message"):
-        return {"type": "custom_message", "customType": kind, "content": message["content"],
+        return {"type": "custom_message", "customType": kind, "content": custom_content,
                 "display": False, "attribution": "agent"}
     if role == "developer":
         if message.get("_compaction_continue"):
-            return {"type": "custom_message", "customType": "compaction-auto-continue", "content": message["content"],
+            return {"type": "custom_message", "customType": "compaction-auto-continue", "content": custom_content,
                     "display": False, "attribution": "agent", "synthetic": True}
         if message.get("_thinking_loop_redirect"):
-            return {"type": "custom_message", "customType": "thinking-loop-redirect", "content": message["content"],
+            return {"type": "custom_message", "customType": "thinking-loop-redirect", "content": custom_content,
                     "display": False, "attribution": "agent"}
         if details := message.get("_session_transfer"):
-            return {"type": "custom_message", "customType": "session-transfer", "content": message["content"],
+            return {"type": "custom_message", "customType": "session-transfer", "content": custom_content,
                     "display": True, "details": details}
         if message.get("_branch_summary"):
             return {"type": "branch_summary", "summary": message["content"], "fromId": ""}
         if changes := message.get("_memory_recall_changes"):
-            return {"type": "custom_message", "customType": "memory-recall-changes", "content": message["content"],
+            return {"type": "custom_message", "customType": "memory-recall-changes", "content": custom_content,
                     "display": False, "attribution": "agent", "details": changes}
         if details := message.get("_async_jobs"):
-            return {"type": "custom_message", "customType": "async-result", "content": message["content"],
+            return {"type": "custom_message", "customType": "async-result", "content": custom_content,
                     "display": True, "attribution": "agent", "details": details}
         if (peers := message.get("_irc_messages")) or message.get("_parent_assignment"):
             details = {"messages": peers or []}
             if message.get("_parent_assignment"):
                 details["fromParent"] = True
-            return {"type": "custom_message", "customType": "irc:incoming", "content": message["content"],
+            return {"type": "custom_message", "customType": "irc:incoming", "content": custom_content,
                     "display": True, "attribution": "agent", "details": details}
         if services := message.get("_service_runs"):
-            return {"type": "custom_message", "customType": "launch-completion", "content": message["content"],
+            return {"type": "custom_message", "customType": "launch-completion", "content": custom_content,
                     "display": True, "attribution": "agent", "details": {"daemons": services}}
         if rules := message.get("_ttsr_rules"):
             if message.get("_ttsr_kind") == "tool":
                 return {"type": "message", "message": {"role": "developer", "content": export_parts(message["content"]),
                                                        "timestamp": int(time.time() * 1000), "attribution": "agent"},
                         "miniPi": {"message": message}}
-            return {"type": "custom_message", "customType": "ttsr-injection", "content": message["content"],
+            return {"type": "custom_message", "customType": "ttsr-injection", "content": custom_content,
                     "display": False, "attribution": "agent", "details": {"rules": rules, "kind": message.get("_ttsr_kind")}}
-        return {"type": "custom_message", "customType": "mini-pi.recovery", "content": message["content"], "display": True}
-    content = export_parts(message.get("content"))
+        return {"type": "custom_message", "customType": "mini-pi.recovery", "content": custom_content, "display": True}
+    content = custom_content if isinstance(source, list) else export_parts(source)
     now = int(time.time() * 1000)
     if role == "tool":
         text = plain_text(content)
@@ -707,11 +717,12 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                 record = {"type": "compaction", "summary": portable_summary,
                           "firstKeptEntryId": anchor(portable_cut, parent) or "", "tokensBefore": 0,
                           "miniPi": {"native": native, "cut": anchor(cut, parent), "summary": summary}}
+                if native:
+                    record.update({key: native[key] for key in ("tokensBefore", "tokensAfter", "warning") if key in native})
                 if native and native.get("method") == "handoff":
                     record["method"] = "handoff"
                 if native and native.get("method") == "experimental-context-rollover":
                     record["details"] = {"kind": "experimental-context-rollover", "version": 1}
-                    record["tokensBefore"] = native.get("tokensBefore", 0)
             elif kind == "elision":
                 record = {"type": "custom", "customType": "mini-pi.elision",
                           "data": [(anchors[batch], position, value) for batch, position, value in payload]}

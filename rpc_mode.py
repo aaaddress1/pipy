@@ -164,11 +164,11 @@ def wire_message(message, call_names):
     if entry["type"] == "message":
         return entry["message"]
     if message.get("_goal_message") or message.get("_todo_message") or entry.get("customType") in (
-        "async-result", "irc:incoming", "launch-completion", "ttsr-injection", "thinking-loop-redirect",
+        "async-result", "irc:incoming", "launch-completion", "ttsr-injection", "thinking-loop-redirect", "compaction-auto-continue",
     ):
         return {"role": "custom", **{key: value for key, value in entry.items() if key != "type"},
                 "timestamp": int(time() * 1000)}
-    return {"role": "custom", "customType": entry["type"], "content": message["content"], "display": True}
+    return {"role": "custom", "customType": entry["type"], "content": entry.get("content", message["content"]), "display": True}
 
 
 @dataclass

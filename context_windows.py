@@ -133,6 +133,10 @@ def render_metadata(kind, payload, anchors):
         yield f"First kept entry: {anchors.get(cut, '')}"
         if metadata and "tokensBefore" in metadata:
             yield f"Tokens before: {metadata['tokensBefore']}"
+        if metadata and "tokensAfter" in metadata:
+            yield f"Tokens after: {metadata['tokensAfter']}"
+        if metadata and "warning" in metadata:
+            yield f"Warning: {metadata['warning']}"
         yield from summary.splitlines()
     elif kind == "reset":
         yield "> Context window boundary: reset"
