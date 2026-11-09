@@ -1,0 +1,7 @@
+{
+  "name": "mini-pi-eval-worker",
+  "private": true,
+  "dependencies": {
+    "@babel/parser": "7.29.9"
+  }
+}
