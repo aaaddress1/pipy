@@ -110,6 +110,14 @@ uv run mini_pi.py ttsr scan src --json
 
 在互動終端輸入 `/omfg <抱怨>`，目前的模型會在輸入區上方串流顯示候選規則，並以所選分支的歷史輸出驗證。生成時仍可編輯或提交主對話，按 `Esc` 會取消側請求並保留草稿。長規則可用 `PgUp`、`PgDn` 檢視。你可以要求修改、存到專案或存到目前 profile。未確認命中的規則會另外詢問是否儲存。生成與裁判請求不會增加對話訊息。 [上游 `/omfg` 流程](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/controllers/omfg-controller.ts)
 
+## 重複執行 `/loop`
+
+在互動終端輸入 `/loop 3 review the failing tests`，會先送出提示，再自動重送最多三次。可用 `10m` 或 `1h30m` 改設時間上限。省略提示時，迴圈會等下一次手動送出。按 `Esc` 暫停，手動送出新提示可接續並替換重送內容。再輸入 `/loop` 關閉。 [上游排程與暫停](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/interactive-mode.ts#L3303)
+
+`/loop 10 --until 'pytest -q' fix the failing tests` 在每次重送前執行條件。`--until` 在退出碼 `0` 時停止，`--while` 在退出碼 `1` 時停止。其他退出碼和逾時會報錯並停止。首輪直接執行。`loop.conditionTimeoutMs` 預設 `30000`，`0` 代表無限期等待。條件在工作目錄中的獨立 shell 程序執行。 [上游條件判定](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/loop-condition.ts)
+
+`loop.mode` 可設為 `prompt`、`compact` 或 `reset`，依序表示直接重送、手動壓縮後重送、開新會話後重送。`/loop` 開啟期間會暫停 `/goal` 的自動接續。 [上游重送模式](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/settings.ts#L992)
+
 ## 長程目標 `/goal`
 
 在互動模式輸入 `/goal <目標>` 開始，或用 `--goal "<目標>"` 開一個新的互動會話。`/guided-goal [初步想法]` 先讓模型釐清需求與驗收證據。可用 `/goal show`、`pause`、`resume`、`drop`，或用 `/goal budget N` 設定 token 預算。`/goal budget off` 清除預算，`/goal set <目標>` 可替換活動中的目標。目標狀態寫入會話分支，重新開啟程序後可用 `/goal resume` 接續。 [上游目標狀態與預算](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/goals/runtime.ts)

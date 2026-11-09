@@ -836,9 +836,9 @@ def clipped(text):
     return text
 
 
-def run_shell(command, workspace, output, turn=None, timeout=300, *, env=None):
+def run_shell(command, workspace, output, turn=None, timeout=300, *, env=None, shell=True):
     options = {
-        "cwd": workspace, "shell": True, "stdin": subprocess.DEVNULL,
+        "cwd": workspace, "shell": shell, "stdin": subprocess.DEVNULL,
         "stdout": output, "stderr": subprocess.STDOUT, "env": env,
     }
     if turn:
@@ -3502,6 +3502,26 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 ),
             }
 
+        def maintain_terminal(turn, *, focus=None, methods=None, queued=False, resume=False):
+            with turn_scope(turn):
+                while queued and jobs and jobs.pending():
+                    delivery = jobs.wait(turn, drain=True)
+                    if not delivery:
+                        break
+                    run_task(delivery, turn, background=True)
+                turn.compacting = True
+                terminal_lane.repaint()
+                warmer.invalidate()
+                compaction.discard_pending()
+                no_cut = resume and compaction.snapshot(0) is None
+                changed = compaction.maintain(system_prompt(), reason="manual", focus=focus, methods=methods)
+                turn.check()
+                if not changed:
+                    print("[No context was compacted.]", file=sys.stderr)
+                if resume and (changed or no_cut) and session.can_continue() and not terminal_lane.has_queued():
+                    return run_task(None, turn)
+            return None
+
         def interactive():
             nonlocal terminal_lane
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -3509,8 +3529,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             from prompt_toolkit import PromptSession
 
             from btw_panel import BtwPanel
+            from loop_mode import TIME_REACHED
             from omfg_panel import OmfgPanel
-            from terminal_turn import TerminalLane
+            from service_shell import shell_environment, shell_plan, windows_arguments
+            from terminal_turn import TerminalLane, TerminalWork
             from todo_hud import TodoHUD
 
             editor = PromptSession()
@@ -3529,14 +3551,26 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 else:
                     refresh_rules()
 
+            def loop_shell(command, output, cancellation, timeout):
+                environment = os.environ if shell_env is None else shell_env
+                argv = shell_plan(command, args.launch_shell, environment)
+                env = shell_environment(argv, environment)
+                if os.name == "nt":
+                    argv = subprocess.list2cmdline(argv[:1]) + " " + windows_arguments(argv)
+                return run_shell(argv, workspace, output, cancellation, timeout, env=env, shell=False)
+
             with (
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="mini-pi-terminal") as main_worker,
                 ThreadPoolExecutor(max_workers=2, thread_name_prefix="mini-pi-omfg") as side_workers,
             ):
                 delay = layered_setting(maintenance_layers, "tasks.todoClearDelay", 60)
                 hud = TodoHUD(todo, delay if number(delay) else 60, editor.app.invalidate)
+                loop_timeout = layered_setting(maintenance_layers, "loop.conditionTimeoutMs", 30000)
                 terminal_lane = TerminalLane(editor, main_worker, run_task, run_budget, flow_settings,
-                                             jobs.notify if jobs else None, goal_status=goal_status, todo_hud=hud)
+                                             jobs.notify if jobs else None, goal_status=goal_status, todo_hud=hud,
+                                             loop_action=layered_setting(maintenance_layers, "loop.mode", "prompt"),
+                                             loop_timeout=loop_timeout / 1000 if number(loop_timeout) and loop_timeout >= 0 else 30,
+                                             loop_shell=loop_shell, loop_compact=maintain_terminal)
                 if tasks:
                     tasks.observer = hud.observe
                 panel = OmfgPanel(
@@ -3545,9 +3579,14 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     apply_saved_rule,
                 )
                 try:
-                    if getattr(args, "goal", None) and not getattr(args, "internal_session_switch", False):
-                        from terminal_turn import TerminalWork
-
+                    if loop := getattr(args, "pending_loop", None):
+                        del args.pending_loop
+                        if loop.expired():
+                            print(TIME_REACHED, file=sys.stderr)
+                        else:
+                            terminal_lane.loop = loop
+                            terminal_lane.submit(TerminalWork(loop.prompt))
+                    elif getattr(args, "goal", None) and not getattr(args, "internal_session_switch", False):
                         goal_operation("create", args.goal)
                         terminal_lane.submit(TerminalWork(args.goal.strip(), expand_prompt=False))
                     return interactive_loop(editor, panel, side)
@@ -3555,7 +3594,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     if tasks:
                         tasks.observer = None
                     hud.close()
-                    terminal_lane.abort()
+                    terminal_lane.close()
                     panel.cancel()
 
         def btw_command(arguments, side):
@@ -3620,6 +3659,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         def interactive_loop(editor=None, panel=None, side=None):
             lane = terminal_lane
             if lane:
+                from loop_mode import LoopReset
                 from terminal_turn import TerminalWork, clear_terminal
 
             automatic = getattr(args, "auto_reset", None)
@@ -3665,26 +3705,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         resume_enabled = setting
                 resume = resume_enabled and lane.busy() and not queued
 
-                def maintain(turn):
-                    with turn_scope(turn):
-                        while queued and jobs and jobs.pending():
-                            delivery = jobs.wait(turn, drain=True)
-                            if not delivery:
-                                break
-                            run_task(delivery, turn, background=True)
-                        turn.compacting = True
-                        lane.repaint()
-                        warmer.invalidate()
-                        compaction.discard_pending()
-                        no_cut = resume and compaction.snapshot(0) is None
-                        changed = compaction.maintain(system_prompt(), reason="manual", focus=focus, methods=methods)
-                        turn.check()
-                        if not changed:
-                            print("[No context was compacted.]", file=sys.stderr)
-                        if resume and (changed or no_cut) and session.can_continue() and not lane.has_queued():
-                            return run_task(None, turn)
-                    return None
-
+                maintain = partial(maintain_terminal, focus=focus, methods=methods, queued=queued, resume=resume)
                 lane.submit(TerminalWork(text, operation=maintain), "followUp", urgent=not queued)
 
             maintenance = None
@@ -3719,6 +3740,14 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     mode = "steer"
                     if maintenance:
                         line = asyncio.run(maintenance.prompt(settled, can_recap, draft))
+                        if isinstance(line, LoopReset):
+                            if loop := lane.take_loop_reset(line):
+                                close_side_views()
+                                clear_terminal(editor)
+                                args.pending_loop = loop
+                                print("New loop session started.")
+                                return str(uuid4())
+                            continue
                     else:
                         if draft:
                             print(f"Draft: {draft}")
@@ -3735,6 +3764,17 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if task == "/exit":
                     break
                 command = task.split(maxsplit=1)
+                if command[:1] == ["/loop"]:
+                    try:
+                        if not lane:
+                            raise ValueError("/loop requires an interactive terminal.")
+                        task = lane.toggle_loop(command[1] if len(command) > 1 else "")
+                    except ValueError as error:
+                        print(f"mini-pi: {error}", file=sys.stderr)
+                        continue
+                    if not task:
+                        continue
+                    command = task.split(maxsplit=1)
                 if command[:1] == ["/todo"]:
                     try:
                         arguments = command[1] if len(command) > 1 else ""
@@ -3947,7 +3987,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     settled = task != "/continue" or session.can_continue()
                     try:
                         if lane:
-                            lane.submit(TerminalWork(None if task == "/continue" else task), mode)
+                            lane.submit(TerminalWork(None if task == "/continue" else task), mode, loop_prompt=True)
                             settled = False
                         else:
                             answer = console_run(None if task == "/continue" else task)

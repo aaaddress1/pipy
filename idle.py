@@ -100,6 +100,11 @@ class IdleMaintenance:
                                          or self.take_confirmation or lane or panel and panel.busy()):
                 wake.clear()
                 if lane:
+                    if (reset := lane.loop_reset) is not None and not lane.busy() and not self.editor.default_buffer.text:
+                        app = self.editor.app
+                        if app.is_running and not app.is_done:
+                            app.exit(result=reset)
+                            return
                     if returned := lane.take_returned():
                         lane.restore(self.editor.default_buffer, returned)
                     if (completed := lane.take_settled()) is not None:
@@ -158,6 +163,10 @@ class IdleMaintenance:
                     armed_at = None
                     continue
 
+                if lane and lane.loop_pending():
+                    await self.wait(wake, None)
+                    continue
+
                 if armed_at is None:
                     armed_at = now()
                 compact_due = (
@@ -170,10 +179,19 @@ class IdleMaintenance:
                     await self.cancel_recap(recap_job)
                     recap_job = None
                     if not reader.done() and not self.editor.default_buffer.text and self.needs_compaction():
+                        if lane:
+                            with lane.lock:
+                                if lane.busy() or lane.loop_pending():
+                                    continue
+                                lane.idle_compacting = True
                         try:
                             await asyncio.to_thread(self.compact)
                         except Exception as error:
                             print(f"[idle compaction failed: {type(error).__name__}]", file=sys.stderr)
+                        finally:
+                            if lane:
+                                with lane.lock:
+                                    lane.idle_compacting = False
                     if not (lane or run_background or self.take_confirmation or panel and panel.busy()):
                         return
                     recap_owed = compaction_owed = False

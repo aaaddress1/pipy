@@ -5,7 +5,7 @@ from collections import deque
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, RLock, Timer
+from threading import Lock, RLock, Timer, current_thread
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.document import Document
@@ -19,6 +19,7 @@ from btw import ANSI
 from cost_gate import usd
 from handoff import Cancellation
 from live_steering import LiveQueue
+from loop_mode import LIMIT_REACHED, TIME_REACHED, Loop, LoopReset, condition_stop, parse
 from thinking_loop import ThinkingLoop
 from todo_hud import COMPACT_ROWS, truncate as truncate_cells
 
@@ -171,7 +172,8 @@ class TerminalTurn(Cancellation):
 
 
 class TerminalLane:
-    def __init__(self, editor, executor, run_task, budget, settings, notify_jobs, *, goal_status=None, todo_hud=None):
+    def __init__(self, editor, executor, run_task, budget, settings, notify_jobs, *, goal_status=None, todo_hud=None,
+                 loop_action="prompt", loop_timeout=30, loop_shell=None, loop_compact=None):
         self.editor, self.executor, self.run_task, self.budget = editor, executor, run_task, budget
         self.notify_jobs = notify_jobs
         self.goal_status = goal_status
@@ -187,6 +189,11 @@ class TerminalLane:
         self.turn, self.settled = None, None
         self.background_paused = False
         self.goal_timer = None
+        self.loop = self.loop_timer = self.loop_gate = self.loop_reset = None
+        self.loop_workers = set()
+        self.loop_action, self.loop_timeout = loop_action, loop_timeout
+        self.loop_shell, self.loop_compact = loop_shell, loop_compact
+        self.idle_compacting = False
         self.wake = None
         self.keys = KeyBindings()
 
@@ -201,8 +208,8 @@ class TerminalLane:
             if text := self.dequeue():
                 self.restore(event.current_buffer, [text])
 
-        @self.keys.add("escape", filter=Condition(self.busy))
-        @self.keys.add("c-c", filter=Condition(self.busy), eager=True)
+        @self.keys.add("escape", filter=Condition(lambda: self.busy() or self.loop is not None))
+        @self.keys.add("c-c", filter=Condition(lambda: self.busy() or self.loop_pending()), eager=True)
         def interrupt(event):
             self.restore(event.current_buffer, self.abort())
 
@@ -232,11 +239,14 @@ class TerminalLane:
         if wake := self.wake:
             wake()
 
-    def submit(self, work, mode="steer", *, urgent=False):
+    def submit(self, work, mode="steer", *, urgent=False, loop_prompt=False):
         with self.lock:
             self.cancel_goal()
             if self.budget:
                 self.budget.check()
+            if self.loop and loop_prompt and isinstance(work.content, str):
+                self.cancel_loop_pending()
+                self.loop.capture(work.content)
             if not work.background:
                 self.background_paused = False
             self.settled = None
@@ -295,7 +305,13 @@ class TerminalLane:
                     turn = self.turn = TerminalTurn(self, queued) if queued else None
                     if not turn:
                         self.settled = bool(answer and answer.strip())
-                    if next_goal:
+                    if not turn and self.loop:
+                        if failed and not work.background:
+                            self.cancel_loop_pending()
+                            self.loop.capture(None)
+                        else:
+                            self.schedule_loop()
+                    elif next_goal:
                         self.schedule_goal(next_goal)
                 self.changed()
 
@@ -307,7 +323,7 @@ class TerminalLane:
     def schedule_goal(self, next_goal):
         with self.lock:
             self.cancel_goal()
-            if self.turn or not next_goal():
+            if self.turn or self.loop or not next_goal():
                 return
 
             def admit():
@@ -322,6 +338,125 @@ class TerminalLane:
             timer = self.goal_timer = Timer(.8, admit)
             timer.daemon = True
             timer.start()
+
+    def cancel_loop_pending(self):
+        if self.loop_timer:
+            self.loop_timer.cancel()
+        if self.loop_gate:
+            self.loop_gate.cancel()
+        self.loop_timer = self.loop_gate = self.loop_reset = None
+
+    def disable_loop(self, message="Loop mode disabled."):
+        self.cancel_loop_pending()
+        self.loop = None
+        print(message, file=sys.stderr)
+        self.changed()
+
+    def toggle_loop(self, arguments):
+        with self.lock:
+            if self.loop:
+                self.disable_loop()
+                return ""
+            count, seconds, condition, prompt = parse(arguments)
+            self.cancel_goal()
+            self.loop = Loop(count, seconds, condition)
+            print("Loop mode enabled. Esc pauses. /loop disables.", file=sys.stderr)
+        self.changed()
+        return prompt
+
+    def loop_pending(self):
+        return bool(self.loop_timer or self.loop_gate or self.loop_reset)
+
+    def schedule_loop(self):
+        loop = self.loop
+        if not (loop and loop.prompt) or self.loop_pending():
+            return
+
+        def admit():
+            with self.lock:
+                if self.loop_timer is not timer:
+                    return
+                self.loop_timer = None
+                if self.budget and self.budget.is_cancelled():
+                    self.disable_loop("Loop stopped because the run deadline was reached.")
+                    return
+                if loop.exhausted():
+                    self.disable_loop(LIMIT_REACHED)
+                    return
+                if self.loop_blocked():
+                    self.schedule_loop()
+                    return
+                gate = self.loop_gate = Cancellation(self.budget)
+                self.loop_workers.add(current_thread())
+            try:
+                verdict = condition_stop(loop.condition, self.loop_shell, self.loop_timeout, gate) if loop.condition else None
+                with self.lock:
+                    if self.loop_gate is gate and not gate.is_cancelled():
+                        self.loop_gate = None
+                        self.admit_loop(loop, verdict)
+            except CancelledError:
+                pass
+            finally:
+                with self.lock:
+                    self.loop_workers.discard(current_thread())
+                    if self.loop_gate is gate:
+                        self.loop_gate = None
+                        if self.budget and self.budget.is_cancelled():
+                            self.disable_loop("Loop stopped because the run deadline was reached.")
+                self.changed()
+
+        timer = self.loop_timer = Timer(.8, admit)
+        timer.daemon = True
+        timer.start()
+
+    def loop_blocked(self):
+        return self.turn or self.idle_compacting or self.editor.default_buffer.text or not self.editor.app.is_running
+
+    def admit_loop(self, loop, verdict):
+        if verdict:
+            self.disable_loop(verdict)
+            return
+        if self.loop_blocked():
+            self.schedule_loop()
+            return
+        if not loop.consume():
+            self.disable_loop(LIMIT_REACHED)
+            return
+        if self.loop_action == "reset":
+            self.loop_reset = LoopReset(loop)
+        elif self.loop_action == "compact":
+            revision = loop.revision
+
+            def compact_then_run(turn):
+                self.loop_compact(turn)
+                with self.lock:
+                    turn.check()
+                    if self.loop is not loop or loop.revision != revision:
+                        return None
+                    if loop.expired():
+                        self.disable_loop(TIME_REACHED)
+                        return None
+                    prompt = loop.prompt
+                    turn.works[0].operation = None
+                return self.run_task(prompt, turn)
+
+            self.submit(TerminalWork(None, operation=compact_then_run))
+        else:
+            self.submit(TerminalWork(loop.prompt))
+
+    def take_loop_reset(self, reset):
+        with self.lock:
+            if self.loop_reset is not reset:
+                return None
+            self.loop_reset = self.loop = None
+            return reset.loop
+
+    def close(self):
+        self.abort()
+        with self.lock:
+            workers = tuple(self.loop_workers)
+        for worker in workers:
+            worker.join()
 
     def take_settled(self):
         with self.lock:
@@ -340,6 +475,9 @@ class TerminalLane:
     def abort(self):
         with self.lock:
             self.cancel_goal()
+            self.cancel_loop_pending()
+            if self.loop:
+                self.loop.capture(None)
             turn = self.turn
             waiting = [*self.steers, *([self.priority] if self.priority else []), *self.followups]
             self.priority = None
@@ -396,6 +534,7 @@ class TerminalLane:
         with self.lock:
             steers, followups = tuple(self.steers), tuple(self.followups)
             batches = tuple(self.judgment_batches.values())
+            loop_status = self.loop.status() if self.loop else ""
         size = self.editor.app.output.get_size()
         width = max(12, size.columns - 3)
         progress = []
@@ -407,6 +546,8 @@ class TerminalLane:
                 progress.extend(self.todo_hud.full(width))
         if self.goal_status and (status := self.goal_status()):
             progress.append(("dim", status + "\n"))
+        if loop_status:
+            progress.append(("dim", truncate_cells(loop_status, width) + "\n"))
         for batch in batches:
             intent = " ".join(ANSI.sub("", batch["intent"]).split())
             row = f"{intent} · {batch['done']}/{batch['total']}"
