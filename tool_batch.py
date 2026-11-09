@@ -7,6 +7,7 @@ from contextvars import copy_context
 from cancellable_http import turn_scope
 from handoff import Cancellation
 from mcp_tools import ExternalToolResult
+from todos import Todos, committed_phases
 
 
 class BatchSignal(Cancellation):
@@ -60,14 +61,20 @@ def dispatch(calls, tools, executor, signal, invoke, finish):
             if shared:
                 wave(shared)
                 shared = []
-            wave([index])
+            tool = tools.get(call["function"]["name"])
+            if isinstance(tool, Todos):
+                with tool.lock:
+                    finish(index, invoke(index))
+            else:
+                wave([index])
         else:
             shared.append(index)
     if shared:
         wave(shared)
 
 
-def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cancellation=None, child=None, jobs=None):
+def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cancellation=None, child=None, jobs=None,
+            on_result=None):
     """Run one assistant batch and publish tool messages in call order."""
     calls = batch[0]["tool_calls"]
     signal = BatchSignal(cancellation, turn)
@@ -107,12 +114,18 @@ def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cance
         if index in finished:
             return
         result, ran = outcome
+        call = calls[index]
+        if (call["function"]["name"] == "todo" and isinstance(tools.get("todo"), Todos) and not result.get("_tool_error")
+                and committed_phases(result.get("_tool_details")) is not None):
+            result["_todo_snapshot"] = True
         try:
             session.update_tool_result(seq, index + 1, result)
         finally:
             if jobs:
                 jobs.release_tool_delivery(result)
         batch[index + 1] = result
+        if on_result:
+            on_result(call, result)
         if child and calls[index]["function"]["name"] == "yield":
             child.yield_result(result)
         finished.add(index)

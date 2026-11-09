@@ -163,7 +163,7 @@ def wire_message(message, call_names):
     entry = export_message(message, call_names)
     if entry["type"] == "message":
         return entry["message"]
-    if message.get("_goal_message") or entry.get("customType") in (
+    if message.get("_goal_message") or message.get("_todo_message") or entry.get("customType") in (
         "async-result", "irc:incoming", "launch-completion", "ttsr-injection", "thinking-loop-redirect",
     ):
         return {"role": "custom", **{key: value for key, value in entry.items() if key != "type"},

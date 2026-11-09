@@ -116,6 +116,12 @@ uv run mini_pi.py ttsr scan src --json
 
 預設只有互動模式會自動續跑。RPC 可設定 `goal.continuationModes: [interactive, rpc]`，用 `{"type":"goal","op":"create","objective":"…","token_budget":50000}` 建立目標，並用 `get`、`pause`、`resume`、`drop` 管理。預算計入新輸入、輸出及快取寫入，快取命中不計入。續跑若沒有工具活動或重複同一組工具與結果，就會停在目前進度。預算耗盡會請模型收尾，模型驗證完全部交付項目後可透過 `goal` 工具回報完成。 [上游 RPC 續跑控制](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/rpc/rpc-goal.ts)
 
+### 階段式待辦
+
+`todo` 工具依階段保存工作，以任務原文定位項目。完成、移除或阻塞目前項目後，工具會自動選取下一個可執行項目。`/todo` 可查看，`/todo edit` 可在互動終端編輯，`/todo export` 與 `/todo import` 可用 Markdown 交換清單。RPC 可在 `get_state.todoPhases` 讀取，並用 `set_todos` 更新。待辦會隨分支回溯與會話重開恢復。只剩阻塞項目時，`/goal` 會等使用者或外部工作推進。 [上游待辦工具](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/tools/todo.ts)
+
+模型收尾時若還有可執行的待辦，系統會送出有限次提醒。等待使用者或背景工作的回合會延後提醒。`todo.reminders: false` 可關閉提醒，`todo.remindersMax` 可調整收尾提醒的上限。`todo.eager` 可設為 `preferred` 建議首次先建清單，或設為 `always` 在支援指定工具的模型上要求先呼叫 `todo`。 [上游待辦提醒](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/todo-tracker.ts)
+
 ## 側對話 `/btw`
 
 輸入 `/btw <問題>` 可在目前上下文中開啟側對話。終端會串流顯示答案，也可同時編輯或提交主對話。單獨輸入 `/btw` 開啟歷史，用方向鍵和 `Enter` 瀏覽，`f` 追問，`c` 複製答案。`Esc` 可取消進行中的請求，並保留已收到的答案。歷史按工作階段保存在 `artifacts/<session>/btw-history/`。 [上游側回合生命週期](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/btw-turn.ts)

@@ -7,9 +7,10 @@ from concurrent.futures import CancelledError, Future
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from sqlite3 import Error as SQLiteError, connect
+from threading import RLock
 from uuid import uuid4
 
 from openai import APIStatusError
@@ -55,7 +56,8 @@ def portable_message(message, thinking_route=None):
     private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
-               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message")
+               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
+               "_todo_message", "_todo_snapshot")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -127,10 +129,19 @@ def initialize(path):
         db.executescript(SERVICE_SCHEMA)
 
 
+def session_write(method):
+    @wraps(method)
+    def serialized(session, *args, **kwargs):
+        with session.writer:
+            return method(session, *args, **kwargs)
+    return serialized
+
+
 class Session:
     def __init__(self, path, session_id, workspace):
         self.path = path
         self.id = session_id
+        self.writer = RLock()
         self.archive_route, self.archive_shape, self.archive_threshold = None, "auto", None
         self._archive_view = None
         self.archive_images_disabled = False
@@ -222,6 +233,7 @@ class Session:
             abandoned = graph.abandoned(db, self.id, self.leaf, destination) if summarize else []
             return destination, draft, [portable_message(message) for message in abandoned]
 
+    @session_write
     def navigate(self, target, summary=None):
         with database(self.path) as db:
             if target is not None:
@@ -246,6 +258,7 @@ class Session:
         self._archive_view = None
         self.navigation_epoch += 1
 
+    @session_write
     def reset_context(self):
         dropped = sum(len(batch) for _, batch in self.batches) + bool(self.summary)
         with database(self.path) as db:
@@ -318,6 +331,7 @@ class Session:
                 if (seq, index) in replacements:
                     batch[index] = graph.apply_elision(message, replacements[seq, index])
 
+    @session_write
     def archive_elisions(self, replacements, artifacts, *, check=None):
         with database(self.path) as db:
             db.executemany(
@@ -354,6 +368,7 @@ class Session:
             return numbered
         raise ValueError("Artifact not found in this session.")
 
+    @session_write
     def append(self, messages, *, before=None):
         attempts = [message["_usage_attempt"] for message in messages if "_usage_attempt" in message]
         stored = [{key: value for key, value in message.items() if key != "_usage_attempt"} for message in messages] if attempts else messages
@@ -420,6 +435,7 @@ class Session:
             db.executemany("UPDATE service_runs SET consumed=1 WHERE owner=? AND id=? AND finished IS NOT NULL",
                            ((self.id, identifier) for identifier in services))
 
+    @session_write
     def record_metadata(self, *payloads):
         with database(self.path) as db:
             leaf = self.leaf
@@ -437,6 +453,36 @@ class Session:
                 ORDER BY n.id DESC LIMIT 1
             """, (self.leaf, self.id, self.id)).fetchone()
         return json.loads(row[0]) if row else {}
+
+    def todo_snapshots(self):
+        with database(self.path) as db:
+            rows = db.execute(graph.ANCESTORS + """
+                , tool_results(node, position, message) AS (
+                    SELECT n.id, CAST(part.key AS INTEGER), part.value
+                    FROM ancestry a JOIN session_nodes n ON n.id = a.id
+                    JOIN batches b ON b.session = n.session AND b.seq = n.batch
+                    JOIN json_each(b.messages) part
+                    WHERE n.kind = 'batch' AND b.messages LIKE '%"_todo_snapshot":true%'
+                    UNION ALL
+                    SELECT n.id, 0, json_extract(n.payload, '$[2]')
+                    FROM ancestry a JOIN session_nodes n ON n.id = a.id WHERE n.kind = 'tool_update'
+                ), snapshots(node, position, phases) AS (
+                    SELECT node, position, json_extract(message, '$._tool_details.phases') FROM tool_results
+                    WHERE json_extract(message, '$._todo_snapshot') = 1
+                    UNION ALL
+                    SELECT n.id, 0, json_extract(n.payload, '$.data.phases')
+                    FROM ancestry a JOIN session_nodes n ON n.id = a.id
+                    WHERE n.kind = 'foreign' AND json_extract(n.payload, '$.type') = 'custom'
+                      AND json_extract(n.payload, '$.customType') = 'user_todo_edit'
+                )
+                SELECT phases FROM snapshots WHERE phases IS NOT NULL ORDER BY node DESC, position DESC
+            """, (self.leaf, self.id, self.id))
+            for phases, in rows:
+                if isinstance(phases, str):
+                    try:
+                        yield json.loads(phases)
+                    except ValueError:
+                        continue
 
     def last_thinking_change(self):
         with database(self.path) as db:
@@ -463,6 +509,7 @@ class Session:
         with database(self.path) as db:
             return graph.last_route(db, self.id, self.leaf, primary)
 
+    @session_write
     def record_route(self, primary, active, reason):
         with database(self.path) as db:
             db.execute(
@@ -531,7 +578,7 @@ class Session:
                 if message.get("_branch_summary") else (
                     message["content"] if any(message.get(key) for key in (
                         "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
-                        "_thinking_loop_redirect", "_session_transfer", "_goal_message"))
+                        "_thinking_loop_redirect", "_session_transfer", "_goal_message", "_todo_message"))
                     else "[Agent recovery]\n" + message["content"]
                 )
             )}
@@ -541,6 +588,7 @@ class Session:
             if include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak"))
         ]
 
+    @session_write
     def compact(self, cut, summary, native=None):
         if native and "items" in native:
             previous = self.native_summary or {}

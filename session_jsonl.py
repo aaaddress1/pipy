@@ -162,6 +162,8 @@ def import_message(entry):
         return {"role": "developer", "content": str(entry.get("summary") or ""), "_branch_summary": True}
     if kind == "custom_message":
         message = {"role": "developer", "content": plain_text(text_and_images(entry.get("content")))}
+        if entry.get("customType") in ("eager-todo-prelude", "mid-run-todo-nudge", "todo-reminder", "todo-error-reminder"):
+            message["_todo_message"] = entry["customType"]
         if entry.get("customType") in ("goal-mode-context", "goal-continuation", "goal-budget-limit", "guided-goal-interview"):
             role = "developer" if entry["customType"] == "guided-goal-interview" else "user"
             return {**message, "role": role, "_goal_message": entry["customType"]}
@@ -196,6 +198,10 @@ def import_message(entry):
     role = message.get("role")
     expected = "tool" if role == "toolResult" else role
     if isinstance(local, dict) and local.get("role") == expected:
+        if role == "toolResult" and message.get("toolName") == "todo" and not message.get("isError"):
+            details = local.get("_tool_details")
+            if isinstance(details, dict) and details.get("op") != "view" and isinstance(details.get("phases"), list):
+                return {**local, "_todo_snapshot": True}
         return local
     if role == "user":
         result = {"role": "user", "content": text_and_images(message.get("content"))}
@@ -211,6 +217,9 @@ def import_message(entry):
         }
         if isinstance(message.get("details"), dict):
             result["_tool_details"] = message["details"]
+            if (message.get("toolName") == "todo" and not message.get("isError")
+                    and message["details"].get("op") != "view" and isinstance(message["details"].get("phases"), list)):
+                result["_todo_snapshot"] = True
         if type(message.get("isError")) is bool:
             result["_tool_error"] = message["isError"]
         if type(message.get("prunedAt")) in (int, float):
@@ -471,7 +480,7 @@ def export_parts(content):
 
 def export_message(message, call_names):
     role = message["role"]
-    if kind := message.get("_goal_message"):
+    if kind := message.get("_goal_message") or message.get("_todo_message"):
         return {"type": "custom_message", "customType": kind, "content": message["content"],
                 "display": False, "attribution": "agent"}
     if role == "developer":
@@ -508,7 +517,8 @@ def export_message(message, call_names):
     if role == "tool":
         text = plain_text(content)
         result = {"role": "toolResult", "toolCallId": message["tool_call_id"],
-                  "toolName": call_names.get(message["tool_call_id"], "unknown"), "content": content,
+                  "toolName": call_names.get(message["tool_call_id"], "todo" if message.get("_todo_snapshot") else "unknown"),
+                  "content": content,
                   "isError": message.get("_tool_error", is_failed(text) or text.startswith("Skipped after a new user steering message.")),
                   "timestamp": now}
         if details := message.get("_tool_details"):

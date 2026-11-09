@@ -76,8 +76,9 @@ import subagents
 import task_isolation
 from cache_warmer import CacheWarmer
 from cancellable_http import CancellableTransport, TransportLoop, active_turn, turn_scope
-from compaction_policy import CompactionPolicy
+from compaction_policy import CompactionPolicy, setting as layered_setting
 from goals import Goals, SCHEMA as GOAL_SCHEMA, describe as describe_goal
+from todos import Todos
 from cost_gate import CostCapError, CostGate, entry_usage, total_cost
 from maintenance_retry import MaintenanceRetry
 from memory import MemoryOptions, bounded, clear_memory, consolidate, guidance, injection, memory_status, redact_memory
@@ -132,7 +133,7 @@ MAX_PAUSED_TURN_CONTINUATIONS = 8
 def run_agent(task, query, tools, max_steps, session, compaction, system_prompt, make_recovery, turn=None,
               take_updates=None, background=False, stop_guard=None, on_input=None, jobs=None, admit=None, child=None,
               rules=None, on_admitted=None, *, tool_workers, speculation=None, on_tools=None, initial_metadata=None,
-              initial_note=None, goal=None):
+              initial_note=None, goal=None, todo=None, todo_stop=True):
     """Ask the model, run its tools in order, and feed their results back."""
     cancellation = turn or active_turn()
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
@@ -175,10 +176,17 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             print("[TTSR: " + ", ".join(hit.rule.name for hit in hits) + "]", file=sys.stderr)
         append_input(rules.message(hits, kind), notification=True)
 
+    force_todo = False
+    if todo and task is not None and todo.eager != "default" and (prelude := todo.prelude(task, session.batches, "todo" in tools())):
+        append_input(prelude)
+        force_todo = todo.eager == "always" and not (isinstance(task, dict) and task.get("_goal_message"))
     if goal and not (isinstance(task, dict) and task.get("_goal_message")) and (context := goal.context()):
         if task is not None or session.can_continue():
             append_input(context)
     if task is not None:
+        if todo:
+            for warning in todo.take_errors():
+                append_input(warning)
         append_input(task, background, admitted=on_admitted, metadata=initial_metadata, note=initial_note)
     elif not session.can_continue():
         raise RuntimeError("This session has no unfinished turn to continue.")
@@ -200,6 +208,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             append_input(warning, notification=True)
         if take_updates and (update := take_updates()):
             append_input(update, notification=True)
+        if todo and (nudge := todo.mid_run("todo" in active_tools if phase == "mid" else False)):
+            append_input(nudge)
         recovery = make_recovery()
         while True:
             if cancellation:
@@ -215,6 +225,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 active_tools = tools()
                 credit = recovery.consume_credit()
                 options = {"credit": credit} if credit else {}
+                if force_todo:
+                    options["force_todo"] = True
                 if child:
                     child.force_yield = yield_retries == 3 or child.budget_stopped()
                     if child.force_yield:
@@ -242,6 +254,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 if action != "retry":
                     raise
         compaction.observe(messages, usage)
+        force_todo = False
         matched = rules.response if rules else None
         calls = assistant.get("tool_calls", [])
         skipped = assistant.get("_tool_stop") == "length"
@@ -319,6 +332,11 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 session.append([{"role": "developer", "content": reminder}])
                 continue
             recovery.maintain(system, "post")
+            if (todo and todo_stop and not (jobs and jobs.pending())
+                    and not (goal and goal.budget_limited())
+                    and (reminder := todo.stop(assistant["content"], "todo" in active_tools))):
+                append_input(reminder)
+                continue
             return assistant["content"]
         if skipped:
             tool_results, completed = [], set()
@@ -333,6 +351,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             tool_results, completed = execute_tool_batch(
                 session, seq, batch, active_tools, tool_workers, partial(run_tool, active_tools, turn=turn, speculation=speculation),
                 turn=turn, cancellation=cancellation, child=child, jobs=jobs,
+                on_result=todo.tool_finished if todo else None,
             )
         if on_tools:
             on_tools(len(completed))
@@ -692,7 +711,7 @@ def run_eval_call(tool, tools, nested_name, nested_args, cancellation, *, turn=N
                     raise CancelledError("Eval cell timed out.")
                 cancellation.check()
             if value is None:
-                value = run_tool(tools, nested, turn=turn)
+                value = run_tool(tools, nested, turn=turn, nested=True)
             if isinstance(value, ExternalToolResult):
                 result.update(content=value.content, _tool_details=value.details, _tool_error=value.is_error)
             else:
@@ -717,7 +736,7 @@ def run_eval_call(tool, tools, nested_name, nested_args, cancellation, *, turn=N
             "hasError": result.get("_tool_error", False), **({"images": images} if images else {})}
 
 
-def run_tool(tools, call, turn=None, *, speculation=None):
+def run_tool(tools, call, turn=None, *, speculation=None, nested=False):
     function = call["function"]
     name = function["name"]
     print(f"[{name}]", file=sys.stderr)
@@ -730,6 +749,8 @@ def run_tool(tools, call, turn=None, *, speculation=None):
             return clipped(cached)
         args = json.loads(function["arguments"])
         tool = tools[name]
+        if isinstance(tool, Todos):
+            return tool.execute(args, nested=nested)
         if isinstance(tool, EvalTool):
             def invoke(nested_name, nested_args, cancellation, claim=None):
                 return run_eval_call(tool, tools, nested_name, nested_args, cancellation, turn=turn, claim=claim,
@@ -1069,7 +1090,7 @@ def workspace_tools(workspace, session, turn=None, mcp=None, *, jobs=None, auto_
 def tool_schemas(tools):
     schemas = []
     for name, tool in tools.items():
-        if isinstance(tool, (McpTool, subagents.Tool, EvalTool)):
+        if isinstance(tool, (McpTool, subagents.Tool, EvalTool, Todos)):
             description, parameters = tool.description, tool.parameters
         else:
             description, fields, _ = tool
@@ -1267,6 +1288,21 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                              if isinstance(value := dotted(layer, "goal.enabled"), bool)), True)
         goal_footer = next((value for layer in reversed(maintenance_layers)
                             if isinstance(value := dotted(layer, "goal.statusInFooter"), bool)), True)
+        todo_enabled = layered_setting(maintenance_layers, "todo.enabled", True) is not False
+        reminder_max = layered_setting(maintenance_layers, "todo.remindersMax", 3)
+        if type(reminder_max) is not int or reminder_max < 0:
+            reminder_max = 3
+        todo_reminders = layered_setting(maintenance_layers, "todo.reminders", True) is not False
+        if not todo_reminders:
+            reminder_max = 0
+
+        def todo_event(kind, **data):
+            if rpc and rpc.ready:
+                rpc.event(kind, **data)
+
+        todo = Todos(session, enabled=todo_enabled, reminders=reminder_max,
+                     eager=layered_setting(maintenance_layers, "todo.eager", "default"), emit=todo_event,
+                     mid_reminders=todo_reminders)
 
         def goal_event(**data):
             if rpc and rpc.ready:
@@ -1274,13 +1310,15 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             if not rpc and (changed := data.get("goal")) and changed["status"] in ("complete", "budget-limited"):
                 print(describe_goal(changed), file=sys.stderr)
 
-        goal = Goals(session, goal_modes, goal_event) if goal_enabled and not child else None
+        goal = Goals(session, goal_modes, goal_event, todo_context=todo.goal_context) if goal_enabled and not child else None
         if goal:
             goal.restore(preserve=bool(rpc and rpc.ready or getattr(args, "internal_session_switch", False)))
             cost_gate.goal_usage = goal.observe
 
         def next_goal():
-            return goal.continuation(args.mode) if goal and args.task is None and not args.continue_session else None
+            if goal and args.task is None and not args.continue_session and not todo.blocked_only():
+                return goal.continuation(args.mode)
+            return None
 
         def goal_operation(op, objective=None, token_budget=None):
             if not goal:
@@ -1430,6 +1468,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
 
         def build_tools(turn=None, manager=None):
             tools = builtin_tools(turn, manager)
+            if todo.enabled and not (child and child.task.structured):
+                tools["todo"] = todo
             if eval_tool:
                 tools["eval"] = eval_tool
             if tasks:
@@ -2028,7 +2068,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         def disable_inline():
             return bool(last_inline and inline.disable())
 
-        def query(messages, active_tools, turn=None, *, credit=None, show=True, force_yield=False, speculation=None):
+        def query(messages, active_tools, turn=None, *, credit=None, show=True, force_yield=False, force_todo=False,
+                  speculation=None):
             nonlocal last_inline
             cancellation = turn or active_turn()
             warmer.invalidate()
@@ -2073,6 +2114,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                           if force_yield and "yield" in active_tools and compat.get("supportsForcedToolChoice") is not False else None)
                 if force_yield and child and not child.task.structured:
                     choice = "none"
+                if force_todo and not choice and "todo" in active_tools and compat.get("supportsForcedToolChoice") is not False:
+                    choice = {"type": "function", "function": {"name": "todo"}}
                 read_tool = active_tools.get("read")
                 stream_spec = speculation.configure(
                     read=isinstance(read_tool, tuple) and getattr(read_tool[2], "speculative_local", False),
@@ -3149,9 +3192,12 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         text = next((block["text"] for block in task if block["type"] == "text"), None)
                     if isinstance(text, str) and not child and expand_prompt:
                         command, _, arguments = text.partition(" ")
-                        if command in ("/mcp", "/memory"):
-                            result = (memory_command(arguments) if command == "/memory" else
-                                      mcp_command(arguments, cancellation))
+                        if command in ("/mcp", "/memory", "/todo"):
+                            if command == "/todo":
+                                result = todo.command(arguments, workspace)
+                            else:
+                                result = (memory_command(arguments) if command == "/memory" else
+                                          mcp_command(arguments, cancellation))
                             if turn:
                                 turn.publish({"role": "assistant", "content": result})
                             else:
@@ -3187,6 +3233,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     if goal:
                         goal.begin(task)
                         goal_started = True
+                    todo.begin()
                     answer = run_agent(
                         task, partial(query, turn=turn, show=show, speculation=speculation), partial(configured_tools, active_tools),
                         args.max_steps, session, compaction,
@@ -3200,6 +3247,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         initial_note=initial_note,
                         on_tools=count_tools if capture_queue and foreground else None,
                         goal=goal,
+                        todo=todo, todo_stop=args.task is None and not args.continue_session,
                     )
                     goal_succeeded = True
                     if foreground and not (cancellation and cancellation.is_cancelled()):
@@ -3252,7 +3300,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if transcript:
                     request, window = side_request_for_active_route()
                     summary = request(instructions, bounded(transcript, (window or 32_768) * 2))
-            session.navigate(leaf, summary)
+            with todo.lock:
+                session.navigate(leaf, summary)
+                todo.sync()
             if goal:
                 goal.restore(preserve=True)
             rules.close_judgments()
@@ -3382,10 +3432,17 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     return rpc_mode.AfterResponse(data, partial(rpc.start_goal, next_goal))
                 return data
 
+            def set_todos(command):
+                todo.edit(command.get("phases"))
+                return {"todoPhases": todo.snapshot()}
+
+            def rpc_state(command):
+                return binding.state(command) | {"goal": goal_operation("get")["goal"], "todoPhases": todo.snapshot()}
+
             return {
                 **binding.handlers(), "navigate_tree": (navigate, True), "fork": (fork, True),
                 "goal": (goal_rpc, lambda command: command.get("op") != "get"),
-                "get_state": (lambda command: binding.state(command) | {"goal": goal_operation("get")["goal"]}, False),
+                "get_state": (rpc_state, False), "set_todos": (set_todos, True),
                 "new_session": (new_session, True), "switch_session": (switch_session, True),
                 "compact": (compact, True), "handoff": (handoff_command, True),
                 "reset_context": (lambda _: {"droppedCount": clear_context()}, True),
@@ -3397,6 +3454,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 "get_available_commands": (
                     lambda _: {"commands": [{"name": "mcp", "description": "Manage MCP servers", "source": "builtin"},
                                             {"name": "goal", "description": "Manage a durable session goal", "source": "builtin"},
+                                            {"name": "todo", "description": "Manage phased session todos", "source": "builtin"},
                                             {"name": "clear", "description": "Clear conversation context in place", "source": "builtin"},
                                             {"name": "fresh", "description": "Reset provider stream state", "source": "builtin"},
                                             *(local_mcp.prompt_commands() if local_mcp else [])]}, False,
@@ -3628,6 +3686,27 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if task == "/exit":
                     break
                 command = task.split(maxsplit=1)
+                if command[:1] == ["/todo"]:
+                    try:
+                        arguments = command[1] if len(command) > 1 else ""
+                        if lane and arguments.strip().lower() not in ("", "view", "copy", "help", "?"):
+                            with lane.lock:
+                                if lane.busy():
+                                    raise RuntimeError("Wait for the current response or abort it before changing todos.")
+                                lane.cancel_goal()
+
+                        def edit_todos(markdown):
+                            from prompt_toolkit import prompt
+
+                            try:
+                                return prompt("Edit todos (Esc Enter saves, Ctrl+C cancels)> ", default=markdown, multiline=True)
+                            except (EOFError, KeyboardInterrupt):
+                                return None
+
+                        print(todo.command(arguments, workspace, editor=edit_todos if editor else None))
+                    except (RuntimeError, OSError, ValueError) as error:
+                        print(f"mini-pi: {error}", file=sys.stderr)
+                    continue
                 if command[:1] == ["/guided-goal"]:
                     try:
                         if not goal:

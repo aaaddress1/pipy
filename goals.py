@@ -63,8 +63,9 @@ def valid_goal(value):
 
 
 class Goals:
-    def __init__(self, session, modes, emit):
+    def __init__(self, session, modes, emit, *, todo_context=None):
         self.session, self.modes, self.emit = session, modes, emit
+        self.todo_context = todo_context
         self.lock = RLock()
         self.goal = None
         self.running = False
@@ -209,6 +210,11 @@ class Goals:
                 self.previous, self.stalled = None, False
             self.activity = None
 
+    def budget_limited(self):
+        with self.lock:
+            self.flush()
+            return bool(self.goal and self.goal["status"] == "budget-limited")
+
     def create(self, objective, token_budget=None, *, replace=False):
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("Goal objective is required.")
@@ -337,7 +343,7 @@ class Goals:
     def context(self):
         with self.lock:
             if self.active:
-                return goal_message("goal-mode-context", self.prompt("Goal mode is active."))
+                return self.with_todos("goal-mode-context", "Goal mode is active.")
         return None
 
     @staticmethod
@@ -353,5 +359,11 @@ class Goals:
     def continuation(self, mode):
         with self.lock:
             if mode in self.modes and self.active and not self.stalled:
-                return goal_message("goal-continuation", self.prompt("Continue advancing the active goal."))
+                return self.with_todos("goal-continuation", "Continue advancing the active goal.")
         return None
+
+    def with_todos(self, kind, heading):
+        text = self.prompt(heading)
+        if self.todo_context and (plan := self.todo_context()):
+            text += "\n\n" + plan
+        return goal_message(kind, text)
