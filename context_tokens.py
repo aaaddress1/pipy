@@ -3,75 +3,43 @@
 import base64
 import binascii
 import json
-from functools import cache, lru_cache
+from functools import lru_cache
 from io import BytesIO
-from pathlib import Path
 
 from PIL import Image
 
 import model_catalog
+from claude_tokenizer import CLAUDE, content_count
 from snapcompact import catalog_image_rule, image_token_cost
+from text_tokenizer import BPE, encoding
 
 
-TABLES = Path(__file__).with_name("catalog")
 UNKNOWN_IMAGE = (65535, 65535)
 OPENAI_IMAGE_RULE = {"regime": "openai-patch", "auto": "original", "multiplier": 1.2,
                      "low": {"maxEdge": 512}, "high": {"maxEdge": 2048, "patchBudget": 2500},
                      "original": {"maxEdge": 6000, "patchBudget": 10000}}
 ANTHROPIC_IMAGE_RULE = {"regime": "anthropic-patch", "maxEdge": 2576, "maxTokens": 4784}
-CL100K_PATTERN = (
-    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
-    r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-)
-O200K_PATTERN = (
-    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
-    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
-    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-)
+FAMILIES = BPE.keys() | CLAUDE
 
 
 def compact_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-@cache
-def encoding(family):
-    from tiktoken import Encoding
-    from zstandard import ZstdDecompressor
-
-    pattern = CL100K_PATTERN if family == "cl100k" else O200K_PATTERN
-    table = TABLES / f"{family}_base.bin.zst"
-    with table.open("rb") as file, ZstdDecompressor().stream_reader(file) as reader:
-        raw = reader.read()
-    if not raw.startswith(b"UTOK1\n"):
-        raise ValueError(f"Invalid token table {table.name}.")
-    count, offset = int.from_bytes(raw[6:10], "little"), 10
-    ranks = {}
-    for rank in range(count):
-        length, shift = 0, 0
-        while True:
-            part = raw[offset]
-            offset += 1
-            length |= (part & 127) << shift
-            if part < 128:
-                break
-            shift += 7
-        if length:
-            ranks[raw[offset:offset + length]] = rank
-        offset += length
-    if offset != len(raw):
-        raise ValueError(f"Invalid token table size for {table.name}.")
-    return Encoding(f"pipy-{family}", pat_str=pattern, mergeable_ranks=ranks, special_tokens={})
+def measure_text(family, text):
+    if family in CLAUDE:
+        return content_count(family, text)
+    return len(encoding(family).encode_ordinary(text)) if family else (len(text.encode("utf-8", "replace")) + 3) // 4
 
 
 @lru_cache(maxsize=512)
 def count_text(family, text):
-    return len(encoding(family).encode_ordinary(text)) if family else (len(text.encode("utf-8", "replace")) + 3) // 4
+    return measure_text(family, text)
 
 
 @lru_cache(maxsize=64)
 def count_large_text(family, text):
-    return len(encoding(family).encode_ordinary(text))
+    return measure_text(family, text)
 
 
 @lru_cache(maxsize=128)
@@ -97,7 +65,7 @@ class ContextCounter:
     def __init__(self, route):
         model = route.catalog_model or {} if route else {}
         family = model.get("tokenizer")
-        self.family = ("cl100k" if family == "cl100k" else "o200k") if route else None
+        self.family = (family if isinstance(family, str) and family in FAMILIES else "o200k") if route else None
         self.identity = route.identity() if route else None
         self.vision = route is None or route.vision
         self.default_detail = route.image_detail if route else None
@@ -123,11 +91,9 @@ class ContextCounter:
     def text(self, text):
         if len(text) <= 16384:
             return count_text(self.family, text)
-        if self.family is None:
-            return (len(text.encode("utf-8", "replace")) + 3) // 4
         if len(text) <= 262144:
             return count_large_text(self.family, text)
-        return len(encoding(self.family).encode_ordinary(text))
+        return measure_text(self.family, text)
 
     def image(self, url, detail=None):
         if self.fixed_image is not None:
