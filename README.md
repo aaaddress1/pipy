@@ -281,7 +281,7 @@ Muse Code 可設定 `providers.museCode.storeResponses: true`，或用 `PI_MUSE_
 
 `/tree` 列出目前 session 的節點與分支。用 `/tree <節點編號>` 原地切換，或用 `/tree <節點編號> --summary [重點]` 摘要離開的分支後切換。選取使用者節點會回到它的父節點並填入原提示。可用 `/label <節點編號> [名稱]` 標記節點。`/fork` 複製整個 session 並切換到新 UUID，`/fork <節點編號>` 只複製該節點的祖先路徑。也可以在啟動時用 `--fork <來源 UUID>` 複製本地 session。[上游 session tree](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/tree.md)
 
-用 `--import-jsonl <檔案>` 或 `--fork <JSONL 路徑>` 建立新 session，可加 `--continue` 續接未完的回合。用 `--session <UUID> --export-jsonl <新檔案>` 匯出 v3 日誌，副檔名 `.gz` 會壓縮。匯入保留分支、工具結果、標籤與重置邊界。原版的供應商專用壓縮資料會在需要時退回可攜文字歷史。JSONL 不包含外部 artifact／blob 檔案。[上游 session 格式](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/session.md#session-file-format)
+用 `--import-jsonl <檔案>` 或 `--fork <JSONL 路徑>` 建立新 session，可加 `--continue` 續接未完的回合。用 `--session <UUID> --export-jsonl <新檔案>` 匯出 v3 日誌，副檔名 `.gz` 會壓縮日誌。有 artifact 時會另寫同名目錄，例如 `work.jsonl.gz` 搭配 `work/`。搬移時請一起保留兩者，匯入後 `read` 會沿用原本的 `artifact://` ID，包含 Oh My Pi 的數字 ID。舊版 pipy 日誌中的 Shake 引用也可從完整原文按雜湊復原。匯入保留分支、工具結果、標籤與重置邊界。外部 blob 仍由原來的儲存位置管理。 [上游 session 格式](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/session.md#session-file-format) · [上游 fork 行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/session-operations-export-share-fork-resume.md)
 
 `/fresh` 會關閉已快取的模型 HTTP 連線、清除帳號釘選並換一個暫時的供應商識別碼，同一份工作階段逐字稿會繼續用於模型請求。JSONL RPC 可用 `fresh_session` 取得本次刷新資訊。 [上游供應商工作階段刷新](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/session-operations-export-share-fork-resume.md)
 

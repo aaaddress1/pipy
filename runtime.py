@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from sqlite3 import Error as SQLiteError, connect
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from cancellable_http import active_turn, turn_scope
 from model_catalog import RESPONSES_APIS
 from recovery import StreamInterrupted, TRANSPORT_ERRORS
 from shake import AUTO, RESCUE, artifact_id, plan
+from session_artifacts import read_numbered
 
 
 def pack(value):
@@ -341,10 +343,13 @@ class Session:
                 "SELECT content FROM artifacts WHERE session = ? AND id = ?",
                 (self.id, identifier),
             ).fetchone()
-        if row is None:
-            raise ValueError("Artifact not found in this session.")
-        content = row[0]
-        return content[offset:offset + limit], len(content)
+        if row is not None:
+            content = row[0]
+            return content[offset:offset + limit], len(content)
+        directory = Path(self.path).parent / "artifacts" / self.id
+        if (numbered := read_numbered(directory, identifier, offset, limit)) is not None:
+            return numbered
+        raise ValueError("Artifact not found in this session.")
 
     def append(self, messages, *, before=None):
         attempts = [message["_usage_attempt"] for message in messages if "_usage_attempt" in message]

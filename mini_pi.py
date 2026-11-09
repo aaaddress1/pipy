@@ -96,6 +96,7 @@ from recovery import (
 )
 from routing import Router, load_routes
 from runtime import Compaction, Session, database, initialize, pack, paused_turn, responses_replay_scope
+from session_artifacts import ARTIFACT_URL
 import dsml
 from session_graph import SUMMARY_PROMPT, stored_batches
 from shake import MANUAL
@@ -121,7 +122,6 @@ SUMMARY_INSTRUCTIONS = (
 OUTPUT_LIMIT = 16_000
 ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 ARTIFACT_HEAD_BYTES = 3 * 1024 * 1024
-ARTIFACT_URL = re.compile(r"artifact://([a-f0-9]{64})(?:\?offset=([0-9]{1,12}))?")
 MAX_PAUSED_TURN_CONTINUATIONS = 8
 
 

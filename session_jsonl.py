@@ -4,6 +4,7 @@ import gzip
 import heapq
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -13,12 +14,15 @@ from uuid import uuid4
 
 import session_graph as graph
 from runtime import database, initialize, pack
+from session_artifacts import PIPY_ARTIFACT, copy_sidecar, sidecar, stored_artifacts
+from shake import artifact_id, block_ranges, tool_text
 from snapcompact_inline import is_failed
 
 
 MISSING_RESULT = "Interrupted before result was recorded. Check workspace state before repeating this action."
 VERSION = 3
 TITLE_BYTES = 256
+SHAKE_REFERENCE = re.compile(r"\[shaken ~[0-9]+ tokens — recover: artifact://([a-f0-9]{64})\]")
 
 
 def timestamp():
@@ -309,14 +313,46 @@ def import_compaction(db, session, parent, entry, batches):
     return graph.append(db, session, parent, "compact", payload=[cut, summary, native])
 
 
+def restore_shake_artifacts(db, session, parent, edits):
+    missing = {}
+    for seq, index, edit in edits:
+        if isinstance(edit, dict):
+            continue
+        for identifier in SHAKE_REFERENCE.findall(tool_text(edit)):
+            if not db.execute("SELECT 1 FROM artifacts WHERE session = ? AND id = ?", (session, identifier)).fetchone():
+                missing.setdefault((seq, index), set()).add(identifier)
+    if not missing:
+        return
+    original = dict(graph.stored_batches(db, session, parent, min(missing)[0], max(missing)[0] + 1,
+                                         apply_elisions=False))
+    for (seq, index), identifiers in missing.items():
+        batch = original.get(seq, ())
+        if not 0 <= index < len(batch):
+            continue
+        message = batch[index]
+        content = message.get("content")
+        if not isinstance(content, (str, list)) or not valid_elision(content):
+            continue
+        text = tool_text(content)
+        regions = (text,) if message["role"] == "tool" else (text[start:end] for start, end in block_ranges(text))
+        for region in regions:
+            if (identifier := artifact_id(region)) in identifiers:
+                db.execute("INSERT OR IGNORE INTO artifacts VALUES (?, ?, ?)", (session, identifier, region))
+
+
 def import_journal(db_path, workspace, source):
+    source = source.resolve(strict=True)
     header, rows, skipped = read_journal(source)
     order, missing = ordered_rows(rows)
     session = str(uuid4())
     initialize(db_path)
     mapped, batches, pending = {None: None}, {None: 0}, {None: {}}
-    with database(db_path) as db:
+    artifacts = sidecar(source)
+    target = Path(db_path).parent / "artifacts" / session
+    with copy_sidecar(artifacts, target, skip=PIPY_ARTIFACT.fullmatch), database(db_path) as db:
         db.execute("INSERT INTO sessions(id,workspace,updated) VALUES (?,?,?)", (session, workspace, time.time()))
+        db.executemany("INSERT INTO artifacts(session,id,content) VALUES (?,?,?)",
+                       ((session, identifier, text) for identifier, text in stored_artifacts(artifacts)))
         db.execute("INSERT INTO session_imports VALUES (?,?)", (session, pack({
             key: header[key] for key in ("id", "version", "title", "titleSource", "timestamp") if key in header
         })))
@@ -356,12 +392,13 @@ def import_journal(db_path, workspace, source):
                 calls = {}
             elif kind == "custom" and entry.get("customType") == "mini-pi.elision":
                 edits = []
-                for item in entry.get("data") or ():
+                for item in entry["data"] if isinstance(entry.get("data"), list) else ():
                     if (
                         isinstance(item, list) and len(item) == 3 and isinstance(item[0], str) and item[0] in batches
                         and type(item[1]) is int and valid_elision(item[2])
                     ):
                         edits.append((batches[item[0]], item[1], item[2]))
+                restore_shake_artifacts(db, session, parent, edits)
                 node = graph.append(db, session, parent, "elision", payload=edits)
             elif kind == "custom" and entry.get("customType") == "mini-pi.route":
                 node = graph.append(db, session, parent, "route", payload=entry["data"])
@@ -641,10 +678,23 @@ def export_journal(db_path, session, workspace, leaf, output):
         with NamedTemporaryFile(dir=output.parent, delete=False) as file:
             temporary = Path(file.name)
         opener = gzip.open if output.suffix.lower() == ".gz" else open
-        with opener(temporary, "wt", encoding="utf-8", newline="\n") as file, database(db_path) as db:
-            for record in journal_entries(db, session, workspace, leaf):
-                file.write(pack(record) + "\n")
-        os.link(temporary, output)
+        with database(db_path) as db:
+            db.execute("BEGIN")
+            with opener(temporary, "wt", encoding="utf-8", newline="\n") as file:
+                for record in journal_entries(db, session, workspace, leaf):
+                    file.write(pack(record) + "\n")
+            target = sidecar(output)
+            if os.path.lexists(target):
+                raise FileExistsError(f"Export artifact directory already exists: {target}")
+            has_artifacts, = db.execute("SELECT EXISTS(SELECT 1 FROM artifacts WHERE session = ?)", (session,)).fetchone()
+            with copy_sidecar(Path(db_path).parent / "artifacts" / session, target, create=bool(has_artifacts)):
+                for identifier, content in db.execute("SELECT id,content FROM artifacts WHERE session = ?", (session,)):
+                    name = f"{identifier}.pipy.log"
+                    if not PIPY_ARTIFACT.fullmatch(name):
+                        raise ValueError("Invalid stored artifact identifier.")
+                    with (target / name).open("xb") as destination:
+                        destination.write(content.encode("utf-8"))
+                os.link(temporary, output)
     finally:
         if temporary:
             temporary.unlink(missing_ok=True)
