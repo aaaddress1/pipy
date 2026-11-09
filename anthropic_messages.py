@@ -20,11 +20,12 @@ from rate_limits import classify_rate_limit, retry_after
 from recovery import (
     ClassifierRefusal, ContextWindowExceeded, EmptyTurn, IncompleteTurn, StreamInterrupted, TRANSPORT_ERRORS, retry_backoff,
 )
-from runtime import CompactionSummary
+from runtime import CompactionSummary, native_provider
 from snapcompact import anthropic_content
 
 
 COMPACTION_BETA = {"anthropic-beta": "compact-2026-09-04"}
+LEGACY_COMPACTION_BETA = "compact-2026-01-12"
 BINDING_BETA = "thinking-binding-controls-2026-08-01"
 CREDIT_BETA = "fallback-credit-2026-06-01"
 CREDIT_TTL = 300
@@ -270,15 +271,15 @@ class WireHistory:
         self.messages = []
         self.digest = sha256(encode([system, tools, effort]).encode("utf-8"))
 
-    def add(self, role, content):
+    def add(self, role, content, *, merge=True):
         if not content:
             return
-        if self.messages and self.messages[-1]["role"] == role:
+        if merge and self.messages and self.messages[-1]["role"] == role:
             self.messages[-1]["content"].extend(content)
             return
         if self.messages:
             self.update(self.digest, self.messages[-1])
-        self.messages.append({"role": role, "content": list(content)})
+        self.messages.append({"role": role, "content": content if isinstance(content, str) else list(content)})
 
     @staticmethod
     def update(digest, message):
@@ -291,6 +292,16 @@ class WireHistory:
         return copy.hexdigest()
 
 
+def tool_use_block(call):
+    function = call["function"]
+    try:
+        arguments = json.loads(function["arguments"])
+    except (ValueError, TypeError):
+        arguments = {}
+    return {"type": "tool_use", "id": call["id"], "name": function["name"],
+            "input": arguments if isinstance(arguments, dict) else {}}
+
+
 def assistant_content(message, identity, fingerprint):
     text = message.get("content")
     calls = message.get("tool_calls", [])
@@ -298,16 +309,56 @@ def assistant_content(message, identity, fingerprint):
     if saved and saved["route"] == identity and saved["prefix"] == fingerprint and text == saved["text"]:
         return saved["blocks"]
     blocks = [text_block(text)] if text else []
-    for call in calls:
-        function = call["function"]
-        try:
-            arguments = json.loads(function["arguments"])
-        except (ValueError, TypeError):
-            arguments = {}
-        blocks.append({
-            "type": "tool_use", "id": call["id"], "name": function["name"],
-            "input": arguments if isinstance(arguments, dict) else {},
-        })
+    blocks.extend(tool_use_block(call) for call in calls)
+    return blocks
+
+
+def imported_assistant_content(message, provider, *, keep_thinking):
+    saved = message.get("_anthropic_import")
+    if not saved or saved["provider"] != provider:
+        return None
+    blocks = []
+    calls = {call["id"]: call for call in message.get("tool_calls", ())}
+    keep_thinking = keep_thinking and saved.get("stopReason") not in ("aborted", "error")
+    for item in saved["content"]:
+        kind = item.get("type")
+        if kind == "text" and isinstance(text := item.get("text"), str) and text.strip():
+            blocks.append(text_block(text))
+        elif kind == "toolCall" and isinstance(identifier := item.get("id"), str) and identifier in calls:
+            blocks.append(tool_use_block(calls[identifier]))
+        elif kind == "thinking" and keep_thinking and isinstance(item.get("thinking"), str):
+            blocks.append({"type": "thinking", "thinking": item["thinking"], "signature": item.get("thinkingSignature", "")})
+        elif kind == "redactedThinking" and keep_thinking and isinstance(item.get("data"), str):
+            blocks.append({"type": "redacted_thinking", "data": item["data"]})
+        elif kind == "fallback":
+            blocks.append(item)
+        elif kind == "anthropicServerTool" and isinstance(block := item.get("block"), dict):
+            if isinstance(block.get("type"), str) and server_tool_block(block):
+                blocks.append(block)
+    return blocks
+
+
+def compaction_files(summary):
+    metadata = summary.get("anthropic_metadata", {})
+    files = metadata.get("filesText")
+    if not metadata.get("exactTail"):
+        return [], files
+    retained = list(metadata.get("retainedFiles", ()))
+    if files and (after := summary.get("anthropic_committed_at")) is not None:
+        retained.append({"text": files, "after": after})
+    return sorted(retained, key=lambda entry: entry["after"]), None
+
+
+def preserved_content(message, vision):
+    content = message["content"]
+    parts = message.get("_history_text_parts")
+    if vision and parts is not None and "\n".join(parts) == content:
+        return [text_block(part) for part in parts if part.strip()]
+    if isinstance(content, str):
+        return content if content.strip() else ""
+    blocks = anthropic_content(content)
+    if blocks and all(block["type"] == "image" for block in blocks):
+        blocks.insert(0, text_block("(see attached image)"))
     return blocks
 
 
@@ -390,7 +441,8 @@ def apply_thinking(body, catalog, effort):
         body["output_config"] = {"effort": wire_effort}
 
 
-def request_body(route, model, messages, schemas, effort, *, stream=True, max_tokens=None, repair=None, metadata=None):
+def request_body(route, model, messages, schemas, effort, *, stream=True, max_tokens=None, repair=None, metadata=None,
+                 compacting=False, files_due_before=float("inf")):
     identity = route.identity() if model == route.model else None
     repair = repair or ThinkingRepair()
     fallbacks = route.server_side_fallbacks if stream and identity else ()
@@ -406,26 +458,91 @@ def request_body(route, model, messages, schemas, effort, *, stream=True, max_to
         for schema in schemas
     ]
     history = WireHistory(system, tools, effort)
-    for message in messages:
+    pending_files, legacy_files, tool_images = [], None, []
+    preserved = False
+    rewrite_at = float("-inf")
+    legacy_replay = False
+    provider = native_provider(route) if identity and route.native_compaction else None
+
+    def flush_files(before):
+        for entry in pending_files:
+            if entry["after"] < before and entry["text"].strip():
+                history.add("user", entry["text"], merge=False)
+        pending_files[:] = [entry for entry in pending_files if entry["after"] >= before]
+
+    for index, message in enumerate(messages):
         role = message["role"]
+        if role == "system":
+            continue
         summary = message.get("_anthropic_compaction")
-        if route.native_compaction and summary and summary["route"] == identity and not history.messages:
-            history.add("assistant", [summary["block"]])
-        elif role == "assistant":
-            blocks = assistant_content(message, identity, history.fingerprint())
+        if provider and summary and not history.messages and (
+            summary.get("route") == identity or summary.get("anthropic_provider") == provider
+        ):
+            block = summary["block"]
+            legacy = not block.get("signature") and bool(block.get("encrypted_content"))
+            if not (compacting and legacy):
+                history.add("assistant", [block])
+                legacy_replay = legacy
+                preserved = "anthropic_provider" in summary
+                pending_files, legacy_files = compaction_files(summary)
+                if preserved and not summary.get("anthropic_metadata", {}).get("exactTail") and index + 1 < len(messages):
+                    first = messages[index + 1]
+                    rewrite_at = first.get("_journal_at", first.get("_history_at", float("-inf"))) - 1
+                continue
+        when = message.get("_history_at", float("inf"))
+        if role != "tool":
+            flush_files(when)
+        if role == "user" and legacy_files is not None:
+            if legacy_files.strip():
+                history.add("user", legacy_files, merge=False)
+            legacy_files = None
+        if role == "assistant":
+            blocks = imported_assistant_content(message, provider, keep_thinking=when > rewrite_at) if preserved else None
+            if blocks is None:
+                blocks = assistant_content(message, identity, history.fingerprint())
             if not replay_handoff:
                 blocks = fallback.collapse_segments(blocks)
-            wire = list(replay_content(blocks, repair, unsigned, model))
-            history.add(role, fallback.tool_calls_last(wire))
+            wire = fallback.tool_calls_last(list(replay_content(blocks, repair, unsigned, model)))
+            if preserved and wire and (last := history.messages[-1])["role"] == "assistant":
+                if len(last["content"]) != 1 or last["content"][0]["type"] != "compaction":
+                    history.add("user", "Continue.", merge=False)
+            history.add(role, wire)
         elif role == "tool":
-            history.add("user", [{
+            content = preserved_content(message, route.vision) if preserved else (
+                anthropic_content(message["content"]) if isinstance(message.get("content"), list) else message.get("content")
+            )
+            previous_tool = index > 0 and messages[index - 1]["role"] == "tool"
+            error = message.get("_tool_error")
+            if preserved and error and isinstance(content, list):
+                tool_images.extend(block for block in content if block["type"] == "image")
+                content = [block for block in content if block["type"] != "image"]
+            if preserved and error and not content:
+                content = "Tool failed with no output."
+            result = {
                 "type": "tool_result", "tool_use_id": message["tool_call_id"],
-                "content": anthropic_content(message["content"])
-                if isinstance(message.get("content"), list) else message.get("content") or "",
-                **({"is_error": True} if message.get("_tool_error") else {}),
-            }])
+                "content": content or "",
+            }
+            if error or preserved and error is False:
+                result["is_error"] = error
+            history.add("user", [result], merge=not preserved or previous_tool)
         elif role == "user" and message.get("content"):
-            history.add("user", anthropic_content(message["content"]))
+            history.add("user", preserved_content(message, route.vision) if preserved else anthropic_content(message["content"]),
+                        merge=not preserved)
+        tools_complete = role == "tool" and (index + 1 == len(messages) or messages[index + 1]["role"] != "tool")
+        if tools_complete and tool_images:
+            history.add("user", [text_block("Attached image(s) from the tool result(s) above:"), *tool_images])
+            tool_images.clear()
+        if legacy_files is not None and (tools_complete or role == "assistant" and not any(
+            block["type"] == "tool_use" for block in wire
+        )):
+            if legacy_files.strip():
+                history.add("user", legacy_files, merge=False)
+            legacy_files = None
+    flush_files(files_due_before)
+    if not compacting and legacy_files and legacy_files.strip():
+        history.add("user", legacy_files, merge=False)
+    if preserved and not compacting and history.messages[-1]["role"] == "assistant":
+        history.add("user", "Continue.", merge=False)
     body = {
         "model": route.wire_model(effort) if identity else model,
         "max_tokens": max_tokens or route.max_output_tokens,
@@ -437,6 +554,11 @@ def request_body(route, model, messages, schemas, effort, *, stream=True, max_to
         body["tools"] = tools
     if metadata:
         body["metadata"] = metadata
+    if legacy_replay:
+        window = (route.catalog_model or {}).get("contextWindow") or route.window or 0
+        body["context_management"] = {"edits": [{"type": "compact_20260112", "trigger": {
+            "type": "input_tokens", "value": max(50_000, window),
+        }}]}
     apply_thinking(body, route.catalog_model if identity else None, effort)
     if route.thinking_prefix_mismatch and not repair.prefix_retry and effort not in ("off", "none"):
         body.setdefault("thinking", {"type": "adaptive"})["block_binding"] = {
@@ -467,10 +589,12 @@ def require_success(response):
         raise status_error(response, error)
 
 
-def compact(client, route, messages, schemas, effort, instructions, *, replay=None, meter=None, metadata=None):
+def compact(client, route, messages, schemas, effort, instructions, *, replay=None, meter=None, metadata=None,
+            files_due_before=float("inf")):
     repair = ThinkingRepair(replay)
     while True:
-        body, _ = request_body(route, route.model, messages, schemas, effort, stream=False, repair=repair, metadata=metadata)
+        body, _ = request_body(route, route.model, messages, schemas, effort, stream=False, repair=repair,
+                               metadata=metadata, compacting=True, files_due_before=files_due_before)
         body["compaction"] = {"type": "summarize", "instructions": instructions}
         if meter:
             meter.admit()
@@ -493,7 +617,14 @@ def compact(client, route, messages, schemas, effort, instructions, *, replay=No
         isinstance(block.get(field), str) and block[field].strip() for field in ("content", "signature")
     ):
         raise RuntimeError("Anthropic native compaction block is unsigned or empty.")
-    return CompactionSummary(block["content"], {"route": route.identity(), "block": block})
+    native = {"route": route.identity(), "block": block}
+    prior = next((message["_anthropic_compaction"] for message in messages if "_anthropic_compaction" in message), {})
+    if prior.get("anthropic_provider") == native_provider(route) and prior.get("block", {}).get("signature"):
+        files, _ = compaction_files(prior)
+        retained = [entry for entry in files if entry["after"] >= files_due_before]
+        native.update(anthropic_provider=prior["anthropic_provider"],
+                      anthropic_metadata={"exactTail": True, "retainedFiles": retained, "model": route.model})
+    return CompactionSummary(block["content"], native)
 
 
 def event_data(lines):
@@ -816,8 +947,11 @@ class MessageStream:
 def replay_headers(body, route=None):
     content = body["messages"][0]["content"] if body["messages"] else None
     betas = []
-    if body.get("compaction") or content and content[0].get("type") == "compaction":
+    signed = isinstance(content, list) and content and content[0].get("type") == "compaction" and content[0].get("signature")
+    if body.get("compaction") or signed:
         betas.append(COMPACTION_BETA["anthropic-beta"])
+    if body.get("context_management"):
+        betas.append(LEGACY_COMPACTION_BETA)
     if "block_binding" in body.get("thinking", {}):
         betas.append(BINDING_BETA)
     betas.extend(fallback.chain_betas(body.get("fallbacks")))

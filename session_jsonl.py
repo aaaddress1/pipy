@@ -3,6 +3,7 @@
 import gzip
 import heapq
 import json
+import math
 import os
 import re
 import time
@@ -32,6 +33,18 @@ def timestamp():
 
 def mapping(value):
     return value if isinstance(value, dict) else {}
+
+
+def journal_time(value):
+    if type(value) is int or type(value) is float and math.isfinite(value):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return int((parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp() * 1000)
+        except (ValueError, OverflowError, OSError):
+            pass
+    return None
 
 
 def title_slot(header):
@@ -254,6 +267,12 @@ def import_message(entry):
             result["tool_calls"] = calls
         if reasoning:
             result["_thinking"] = "\n".join(reasoning)
+        if message.get("api") == "anthropic-messages" and isinstance(content, list) and all(
+            isinstance(item, dict) for item in content
+        ) and all(isinstance(message.get(field), str) for field in ("provider", "model")):
+            result["_anthropic_import"] = {key: message[key] for key in ("provider", "model", "content")}
+            if isinstance(stop := message.get("stopReason"), str):
+                result["_anthropic_import"]["stopReason"] = stop
         if not calls and message.get("stopReason") == "stop" and mapping(message.get("stopDetails")).get("type") == "pause_turn":
             result["_stop_details"] = {"type": "pause_turn"}
         if isinstance(message.get("inputTransformations"), list):
@@ -301,6 +320,7 @@ def source_metadata(entry):
 
 
 RESPONSES_PRESERVE_KEYS = ("openaiRemoteCompaction", "openaiCompactionV2")
+ANTHROPIC_PRESERVE_KEY = "anthropicCompaction"
 
 
 def compaction_diagnostics(entry):
@@ -326,6 +346,54 @@ def covered_batch(db, session, parent, replay_node):
            for node, _, kind, _, raw in path):
         return None
     return covered
+
+
+def upstream_anthropic_compaction(db, session, parent, entry, mapped):
+    saved = mapping(mapping(entry.get("preserveData")).get(ANTHROPIC_PRESERVE_KEY))
+    if not all(isinstance(saved.get(key), str) and saved[key] for key in ("provider", "content")):
+        return None
+    wire_names = {"signature": "signature", "encryptedContent": "encrypted_content"}
+    state = {wire: saved[key] for key, wire in wire_names.items() if isinstance(saved.get(key), str) and saved[key]}
+    if not state:
+        return None
+    if "toolChanges" in saved:
+        changes = saved["toolChanges"]
+        if not isinstance(changes, list) or not all(isinstance(change, dict) for change in changes):
+            return None
+        state["tool_changes"] = changes
+    native = {"block": {"type": "compaction", "content": saved["content"], **state},
+              "anthropic_provider": saved["provider"], **compaction_diagnostics(entry)}
+    metadata = {key: saved[key] for key in ("filesText", "model") if isinstance(saved.get(key), str)}
+    if type(used := saved.get("usedTokens")) is int or type(used) is float and math.isfinite(used):
+        metadata["usedTokens"] = used
+    if saved.get("exactTail") is True:
+        metadata["exactTail"] = True
+    if isinstance(files := saved.get("retainedFiles"), list):
+        metadata["retainedFiles"] = [{"text": row["text"], "after": row["after"]} for row in files
+                                     if isinstance(row, dict) and isinstance(row.get("text"), str)
+                                     and (type(row.get("after")) is int
+                                          or type(row.get("after")) is float and math.isfinite(row["after"]))]
+    if (committed := journal_time(entry.get("timestamp"))) is not None:
+        native["anthropic_committed_at"] = committed
+    native["anthropic_metadata"] = metadata
+    first = entry.get("firstKeptEntryId")
+    if first == "":
+        anchor = entry.get("providerReplayThroughEntryId")
+        replay_node = mapped.get(anchor) if isinstance(anchor, str) else parent if anchor is None else None
+        if not (covered := covered_batch(db, session, parent, replay_node)):
+            return None
+        cut = covered + 1
+        native["replay_through"] = covered
+    elif isinstance(first, str) and (first_node := mapped.get(first)):
+        path = graph.nodes(db, session, parent)
+        start = graph.transcript_boundary(db, session, parent)[1]
+        cut = next((seq for node, _, kind, seq, _ in path if node == first_node and kind == "batch"), None)
+        if cut is None or cut < start or any(node > first_node and kind == "tool_update" and json.loads(raw)[0] < cut
+                                              for node, _, kind, _, raw in path):
+            return None
+    else:
+        return None
+    return [cut, str(entry.get("summary") or saved["content"]), native]
 
 
 def upstream_responses_compaction(db, session, parent, entry, mapped):
@@ -388,6 +456,9 @@ def import_compaction(db, session, parent, entry, batches, mapped):
     metadata = mapping(entry.get("miniPi"))
     source = mapping(entry.get("preserveData"))
     native = mapping(metadata.get("native")) or None
+    if ANTHROPIC_PRESERVE_KEY in source:
+        if payload := upstream_anthropic_compaction(db, session, parent, entry, mapped):
+            return graph.append(db, session, parent, "compact", payload=payload)
     if not metadata and any(key in source for key in RESPONSES_PRESERVE_KEYS):
         payload = upstream_responses_compaction(db, session, parent, entry, mapped)
         return graph.append(db, session, parent, "compact" if payload else "foreign", payload=payload or entry)
@@ -521,6 +592,21 @@ def import_journal(db_path, workspace, source, *, session_id=None, replace=False
             node = parent
             hydrate_images(entry, blob_dirs, blob_cache)
             message = import_message(entry)
+            if message and "_history_at" not in message:
+                wire = mapping(entry.get("message"))
+                recorded = journal_time(entry.get("timestamp"))
+                when = journal_time(wire.get("timestamp"))
+                if when is None:
+                    when = recorded
+                if when is not None:
+                    message["_history_at"] = when
+                if recorded is not None and recorded != when:
+                    message["_journal_at"] = recorded
+                if message["role"] in ("user", "tool") and isinstance(parts := wire.get("content"), list) and all(
+                    isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                    for part in parts
+                ):
+                    message["_history_text_parts"] = [part["text"] for part in parts]
             if message and message["role"] == "tool" and message["tool_call_id"] in calls:
                 seq, index = calls[message["tool_call_id"]]
                 node = graph.append(db, session, parent, "tool_update", payload=[seq, index, message])
@@ -641,7 +727,13 @@ def export_message(message, call_names):
                     "display": False, "attribution": "agent", "details": {"rules": rules, "kind": message.get("_ttsr_kind")}}
         return {"type": "custom_message", "customType": "mini-pi.recovery", "content": custom_content, "display": True}
     content = custom_content if isinstance(source, list) else export_parts(source)
-    now = int(time.time() * 1000)
+    if role in ("user", "tool") and isinstance(source, str):
+        parts = message.get("_history_text_parts")
+        if parts is not None and "\n".join(parts) == source:
+            content = [{"type": "text", "text": part} for part in parts]
+        elif role == "user" and parts is None and "_history_at" in message:
+            content = source
+    now = message.get("_history_at", int(time.time() * 1000))
     if role == "tool":
         text = plain_text(content)
         result = {"role": "toolResult", "toolCallId": message["tool_call_id"],
@@ -694,6 +786,8 @@ def export_message(message, call_names):
             "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
                       "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
         }
+        if imported := message.get("_anthropic_import"):
+            result.update(api="anthropic-messages", **imported)
     else:
         result = {"role": role, "content": content, "timestamp": now}
         if role == "user" and message.get("liveSteered") is True:
@@ -815,6 +909,7 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                 cut, summary, native = payload
                 portable_cut, portable_summary = cut, summary
                 preserve = None
+                anthropic = None
                 if native and "portable_first_kept" in native:
                     portable_cut, portable_summary = native["portable_first_kept"], native["portable_summary"]
                     native = {**native, "portable_first_kept": anchor(portable_cut, parent)}
@@ -825,6 +920,14 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                                 "replacementHistory": native.pop("items")}
                     if "display_first_kept" in native:
                         native["display_first_kept"] = anchor(native["display_first_kept"], parent)
+                if native and (provider := native.get("anthropic_provider")) and "block" in native:
+                    native = dict(native)
+                    block = native.pop("block")
+                    anthropic = {**native.pop("anthropic_metadata", {}), "provider": provider, "content": block["content"]}
+                    for wire, field in (("signature", "signature"), ("encrypted_content", "encryptedContent"),
+                                        ("tool_changes", "toolChanges")):
+                        if wire in block:
+                            anthropic[field] = block[wire]
                 if native and "snapcompact" in native:
                     portable_summary += "\n\n" + native["snapcompact"]["text"].replace("█", "\n").replace("\x0e", "").replace("\x0f", "")
                 elif native and "portable_archive" in native:
@@ -836,6 +939,12 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                     record.update(summary=summary, firstKeptEntryId=native.get("display_first_kept") or "",
                                   providerReplayThroughEntryId=native["replay_through"],
                                   preserveData={RESPONSES_PRESERVE_KEYS[0]: preserve})
+                if anthropic is not None:
+                    record["preserveData"] = {ANTHROPIC_PRESERVE_KEY: anthropic}
+                    if native.get("replay_through"):
+                        record.update(firstKeptEntryId="", providerReplayThroughEntryId=native["replay_through"])
+                    if (committed := native.get("anthropic_committed_at")) is not None:
+                        record["timestamp"] = datetime.fromtimestamp(committed / 1000, timezone.utc).isoformat(timespec="milliseconds")
                 if native:
                     record.update({key: native[key] for key in ("tokensBefore", "tokensAfter", "warning") if key in native})
                 if native and native.get("method") == "handoff":

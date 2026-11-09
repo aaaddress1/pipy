@@ -2617,7 +2617,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             budget = dotted(args.rule_config, "compaction.v2RetainedMessageBudget")
             budget = int(min(64_000, max(1, budget))) if number(budget) else 64_000
 
-            def compact(messages, *, prefix=None, session_id=None, speculative=False):
+            def compact(messages, *, prefix=None, session_id=None, speculative=False, files_due_before=float("inf")):
                 cancellation = active_turn() or handoff.Cancellation()
                 schemas = tool_schemas(configured_tools())
                 instructions = SUMMARY_INSTRUCTIONS
@@ -2655,7 +2655,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                     model=remote.get("model"),
                                 )
                     else:
-                        options = {"replay": anthropic_replay(route), "metadata": provider_metadata()}
+                        options = {"replay": anthropic_replay(route), "metadata": provider_metadata(),
+                                   "files_due_before": files_due_before}
                     with router.new_client(route, credential) as client:
                         return adapter.compact(client, route, payload, schemas, efforts[route.identity()],
                                                instructions, meter=cost_gate.meter(route, "native-compaction"), **options)

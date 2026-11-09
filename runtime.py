@@ -45,6 +45,13 @@ def responses_replacement_tokens(items):
     return tokens([{key: value for key, value in item.items() if key != "encrypted_content"} for item in items])
 
 
+def native_provider(route):
+    return route.broker_provider or (route.catalog_model or {}).get("provider") or {
+        "https://api.openai.com/v1": "openai", "https://chatgpt.com/backend-api": "openai-codex",
+        "https://api.anthropic.com": "anthropic", "https://api.anthropic.com/v1": "anthropic",
+    }.get(route.endpoint(), route.provider())
+
+
 def responses_replay_matches(native, route):
     if isinstance(route, str):
         return native.get("route") == route
@@ -52,14 +59,7 @@ def responses_replay_matches(native, route):
         return False
     if native.get("route") == route.identity() or native.get("scope") == responses_replay_scope(route):
         return True
-    if not (provider := native.get("provider")):
-        return False
-    named_provider = route.broker_provider or (route.catalog_model or {}).get("provider")
-    if not named_provider:
-        named_provider = {"https://api.openai.com/v1": "openai", "https://chatgpt.com/backend-api": "openai-codex"}.get(
-            route.endpoint(), route.provider(),
-        )
-    return provider == named_provider
+    return native.get("provider") == native_provider(route)
 
 
 def paused_turn(message):
@@ -68,7 +68,8 @@ def paused_turn(message):
 
 
 def portable_message(message, thinking_route=None):
-    private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
+    private = ("_anthropic", "_anthropic_import", "_history_at", "_journal_at", "_history_text_parts", "_responses",
+               "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
@@ -335,13 +336,18 @@ class Session:
         # Route selection changes the model's view of the checkpoint, not the journal.
         with database(self.path) as db:
             cut, summary, native = graph.checkpoint(db, self.id, self.leaf)
-            if not native or "items" not in native:
+            if not native:
                 return
-            split_tool = native.get("provider") and graph.has_late_tool_results(db, self.id, self.leaf, cut - 1)
-            if split_tool or not responses_replay_matches(native, route):
-                cut, summary = native["portable_first_kept"], native["portable_summary"]
-                archive = native.get("portable_archive")
-                native = {"snapcompact": archive} if archive else native.get("portable_handoff")
+            if "items" in native:
+                split_tool = native.get("provider") and graph.has_late_tool_results(db, self.id, self.leaf, cut - 1)
+                if split_tool or not responses_replay_matches(native, route):
+                    cut, summary = native["portable_first_kept"], native["portable_summary"]
+                    archive = native.get("portable_archive")
+                    native = {"snapcompact": archive} if archive else native.get("portable_handoff")
+            elif native.get("anthropic_provider") and graph.has_late_tool_results(db, self.id, self.leaf, cut - 1):
+                cut, summary, native = self.transcript_start, "", None
+            else:
+                return
             if (cut, summary, native) == (self.first_kept, self.summary, self.native_summary):
                 return
             self.batches = self.read_batches(db, cut)
@@ -822,7 +828,8 @@ class Session:
         if provenance and len(head) > 1:
             head[-1].update(provenance)
         messages = head + [
-            {**provenance, "role": "user", "content": developer_content(message)}
+            {**provenance, "role": "user", "content": developer_content(message),
+             **({"_history_at": message["_history_at"]} if include_native and "_history_at" in message else {})}
             if message["role"] == "developer" else (message if include_native else portable_message(message, thinking_route))
             for seq, batch in self.batches if seq >= cut and (before is None or seq < before)
             for message in batch
@@ -1508,13 +1515,20 @@ class Compaction:
         route = self.session.archive_route
         batches = self.session.batches
         cut = snapshot.first_kept
-        if route and route.api == "anthropic-messages":
+        anthropic = route and route.api == "anthropic-messages"
+        files_due_before = float("inf")
+        if anthropic:
             # Anthropic merges adjacent messages on the same side of a turn.
             # Move past that run so the retained signed assistant sees the same wire boundary.
             cut = next((right_seq for (_, left), (right_seq, right) in zip(batches, batches[1:])
                         if right_seq >= cut and right[0]["role"] not in ("developer", "system")
                         and (left[-1]["role"] == "assistant") != (right[0]["role"] == "assistant")),
                        batches[-1][0] + 1)
+            if first := next((batch[0] for seq, batch in batches if seq >= cut), None):
+                last = next((message for seq, batch in reversed(batches) if seq < cut
+                             for message in reversed(batch) if message["role"] != "tool"), None)
+                boundary = first if first["role"] == "assistant" else last
+                files_due_before = boundary.get("_history_at", float("inf")) if boundary else float("-inf")
         responses = route and route.api in RESPONSES_APIS
         prefix = self.session.messages(system, include_native=True, include_archive=True, before=cut,
                                        for_compaction=responses)
@@ -1532,7 +1546,7 @@ class Compaction:
             if whole is not None:
                 result = compact(whole, prefix=(covered, prefix), session_id=session_id, speculative=speculative)
                 return result if "replay_through" in result.native else result.through(last)
-            result = compact(prefix)
+            result = compact(prefix, files_due_before=files_due_before) if anthropic else compact(prefix)
             return result.through(covered) if isinstance(result, CompactionSummary) and result.native else result
 
         return run
