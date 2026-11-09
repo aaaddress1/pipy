@@ -233,6 +233,32 @@ class AcpTurn(RpcTurn):
             if work in self.claimed:
                 self.claimed.remove(work)
 
+    @property
+    def usage_confirmer(self):
+        elicitation = self.record.server.capabilities.get("elicitation")
+        return self.confirm_usage if isinstance(elicitation, dict) and isinstance(elicitation.get("form"), dict) else None
+
+    def confirm_usage(self, source, target, remaining):
+        reserve = "inside the configured reserve margin" if remaining is None else f"{100 * remaining:.1f}% remaining"
+        peer = self.record.handle.peer
+        try:
+            with peer.user_approval() if peer else nullcontext():
+                response = self.record.server.client_request(
+                    "elicitation/create",
+                    {"mode": "form", "sessionId": self.record.id,
+                     "message": f"Coding-plan reserve reached\n\n{source} has {reserve}. Switch to {target}? "
+                                "Choose No to keep using the current plan.",
+                     "requestedSchema": {"type": "object", "properties": {"value": {"type": "boolean"}},
+                                         "required": ["value"]}},
+                    self, timeout=None,
+                )
+        except OSError:
+            if self.record.server.disconnected.is_set() or self.record.server.output.failure:
+                raise CancelledError("The ACP client disconnected.") from None
+            return False
+        content = response.get("content")
+        return response.get("action") == "accept" and isinstance(content, dict) and content.get("value") is True
+
     def allow_tool(self, call):
         self.check()
         function = call["function"]
@@ -703,15 +729,17 @@ class AcpServer:
     def client_request(self, method, params, turn, timeout, interrupt_on_steer=False):
         if turn:
             turn.check()
-        if self.disconnected.is_set():
+        if self.disconnected.is_set() or self.output.failure:
             raise OSError("The ACP client disconnected.")
         future = Future()
         with self.calls_lock:
             identifier = f"mini-pi-client-{next(self.call_ids)}"
             self.client_calls[identifier] = future
-        self.output.write({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params})
-        deadline = monotonic() + timeout
+        deadline = monotonic() + timeout if timeout is not None else None
+        sent = False
         try:
+            self.output.write({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params})
+            sent = True
             while True:
                 if turn:
                     turn.check()
@@ -719,9 +747,9 @@ class AcpServer:
                         with turn.record.lock:
                             if turn.has_steering():
                                 raise PermissionInterrupted()
-                if self.disconnected.is_set():
+                if self.disconnected.is_set() or self.output.failure:
                     raise OSError("The ACP client disconnected.")
-                remaining = deadline - monotonic()
+                remaining = deadline - monotonic() if deadline is not None else 0.1
                 if remaining <= 0:
                     raise OSError(f"The ACP client timed out in {method}.")
                 try:
@@ -740,7 +768,7 @@ class AcpServer:
         finally:
             with self.calls_lock:
                 self.client_calls.pop(identifier, None)
-            if not future.done() and not self.disconnected.is_set():
+            if sent and not future.done() and not self.disconnected.is_set() and not self.output.failure:
                 self.notify("$/cancel_request", {"id": identifier})
 
     def read(self):

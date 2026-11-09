@@ -3494,6 +3494,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 quota = f" ({100 * remaining:.1f}% remaining)" if remaining is not None else ""
                 return terminal_lane.confirm_usage(f"Usage reserve reached for {source}{quota}. Switch to {target}?", turn)
 
+            usage_confirmer = confirm_usage if terminal_lane and turn and getattr(turn, "steering_at_boundary", False) else (
+                getattr(turn, "usage_confirmer", None)
+            )
+
             def usage_switch(source, reason):
                 bind_context()
                 if rpc and rpc.ready:
@@ -3512,7 +3516,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 usage_credential = usage_preflight(
                     router, args.usage_reserve_pct, args.usage_reserve_policy,
                     lambda: compaction.estimate(compaction.messages(system_prompt()), floor_stored=True),
-                    confirm=confirm_usage if terminal_lane and turn and getattr(turn, "steering_at_boundary", False) else None,
+                    confirm=usage_confirmer, commit_lock=turn.server.lock if turn else None,
                     check=cancellation.check if cancellation else None, switched=usage_switch,
                 )
                 bind_context()

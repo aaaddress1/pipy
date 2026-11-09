@@ -5,6 +5,7 @@ import random
 import re
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 
 from httpx import NetworkError, RemoteProtocolError, TimeoutException
@@ -105,7 +106,7 @@ def media_rejection(error):
     ))
 
 
-def usage_preflight(router, reserve, policy, context_tokens, *, confirm=None, check=None, switched=None):
+def usage_preflight(router, reserve, policy, context_tokens, *, confirm=None, check=None, switched=None, commit_lock=None):
     source, credential = router.route, router.credential
     health = router.usage_health(source, credential, reserve)
     if check:
@@ -155,12 +156,13 @@ def usage_preflight(router, reserve, policy, context_tokens, *, confirm=None, ch
             if remaining is None:
                 remaining = min((item.remaining for item in health.accounts if item.remaining is not None), default=None)
             declined = not confirm(selector, candidate.name, remaining)
+        with commit_lock if commit_lock is not None else nullcontext():
             if check:
                 check()
             if declined:
                 router.usage_reserve_approval = source.identity()
                 return False
-        return router.switch(candidate, "usage preflight fallback", credential=selected)
+            return router.switch(candidate, "usage preflight fallback", credential=selected)
 
     if router.fallback(set(), True, context_tokens=context_tokens(), pinned=True, preflight=choose):
         router.usage_reserve_approval = None
