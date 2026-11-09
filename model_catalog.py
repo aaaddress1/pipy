@@ -26,6 +26,8 @@ OPS = {"=": operator.eq, ">": operator.gt, "<": operator.lt, ">=": operator.ge, 
 UNDEFINED = object()
 UPSTREAM_SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*", re.I | re.ASCII)
 GATEWAY_ROUTING = ("openRouterRouting", "vercelGatewayRouting")
+FIREWORKS_WIRE_PREFIX = {"firepass": "accounts/fireworks/routers/", "fireworks": "accounts/fireworks/models/"}
+VERSION_DOT = re.compile(r"(?<=\d)\.(?=\d)", re.ASCII)
 
 
 def load_snapshot(file):
@@ -373,7 +375,10 @@ def thinking_effort(model, requested):
 
 def wire_model(model, effort):
     routing = (model.get("thinking") or {}).get("effortRouting") or {}
-    return routing.get("off" if effort in (None, "none") else effort) or model.get("requestModelId") or model["id"]
+    identifier = routing.get("off" if effort in (None, "none") else effort) or model.get("requestModelId") or model["id"]
+    if prefix := FIREWORKS_WIRE_PREFIX.get((model.get("compat") or {}).get("wireModelIdMode")):
+        return prefix + VERSION_DOT.sub("p", identifier.removeprefix(prefix))
+    return identifier
 
 
 def chat_options(model, options, max_tokens, cache_retention="none"):

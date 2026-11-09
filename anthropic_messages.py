@@ -722,6 +722,7 @@ class MessageStream:
         error = StreamInterrupted(
             message, text="".join(self.text), transport=transport,
             tool_draft=any(block["type"] == "tool_use" for block in blocks),
+            thinking=any(block["type"] in ("thinking", "redacted_thinking") for block in blocks),
             usage=Usage.from_wire(self.usage),
         )
         error.replay_unsafe = any(map(server_tool_block, blocks))
@@ -1044,12 +1045,15 @@ def stream_attempt(
         except APIStatusError as error:
             if redemption and credit.server_tools:
                 error.replay_unsafe = True
+            if error.status_code == 400 and IMMUTABLE_THINKING.search(str(error)):
+                error.replay_unsafe = True
             if redemption and credit.token in error.message:
                 error.message = error.message.replace(credit.token, "[redacted]")
                 error.args = (error.message,)
             if message.blocks:
                 if (message.show or message.turn) and "".join(message.text).strip() or any(
-                    map(server_tool_block, fallback.retained(message.blocks).values())
+                    block["type"] == "tool_use" or server_tool_block(block)
+                    for block in fallback.retained(message.blocks).values()
                 ):
                     error.replay_unsafe = True
                     error.text = "".join(message.text)
@@ -1124,7 +1128,7 @@ def stream_once(client, route, model, body, fingerprint, message, cache_observer
             interrupted.unexecuted_turn = message.replayable_tool_turn(route, model, fingerprint, allow_text=True)
         raise interrupted from error
     except StreamInterrupted as error:
-        if error.transport and tool_choice is None:
+        if (error.transport or error.reasonless_abort) and tool_choice is None:
             error.unexecuted_turn = message.replayable_tool_turn(route, model, fingerprint, allow_text=True)
         raise
     except (ValueError, KeyError, TypeError) as error:

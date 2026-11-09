@@ -136,6 +136,12 @@ class Route:
             return model_catalog.wire_model(self.catalog_model, effort)
         return self.model
 
+    def fireworks_base(self):
+        model = self.catalog_model or {}
+        if model.get("provider") == "fireworks" and model.get("id") == self.model and self.model.endswith("-fast"):
+            return self.model.removesuffix("-fast")
+        return None
+
     def prices(self, prompt=0, timestamp=None):
         return self.cache_prices or model_catalog.token_prices(self.catalog_model, prompt, timestamp)
 
@@ -595,7 +601,12 @@ class Router:
         if not self.fixed_primary:
             for primary in primaries:
                 restored = self.session.last_route(primary.identity())
+                if restored is None:
+                    continue
                 selected = next((route for route in self.routes.values() if route.identity() == restored), None)
+                if selected is None:
+                    selected = next((standard for route in tuple(self.routes.values())
+                                     if (standard := self.fireworks_standard(route)) and standard.identity() == restored), None)
                 if selected and (credential := self.available(selected)) is not None:
                     self.primary, self.route, self.credential = primary, self.fit_context(selected), credential
                     return
@@ -889,6 +900,27 @@ class Router:
         self.session.record_route(self.primary.identity(), target.identity(), reason)
         self.route, self.credential = target, credential
         print(f"[{reason}: {previous.name} → {target.name}]", file=sys.stderr)
+        return True
+
+    def fireworks_standard(self, route):
+        if self.fixed_primary or not (identifier := route.fireworks_base()):
+            return None
+        candidate = next((target for target in self.routes.values()
+                          if target.model == identifier and target.api == route.api
+                          and (target.catalog_model or {}).get("provider") == "fireworks"
+                          and target.endpoint() == route.endpoint()), None)
+        if candidate is None and self.profile and route.endpoint() == (route.catalog_model.get("baseUrl") or "").rstrip("/"):
+            candidate = self.profile.exact(f"fireworks/{identifier}")
+        if candidate and candidate.model == identifier and (candidate.catalog_model or {}).get("provider") == "fireworks":
+            return candidate
+        return None
+
+    def degrade_fireworks(self, candidate):
+        if not self.switch(candidate, "Fireworks Fast fallback"):
+            return False
+        # The Standard route is sticky, including when Fast was reached through a retry chain.
+        self.pinned_chain = self.fallback_origin = None
+        self.refusal_pinned = False
         return True
 
     def update_runtime_metadata(self, metadata):

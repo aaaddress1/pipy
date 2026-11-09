@@ -656,8 +656,8 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
 
     def stream_failure(message, *, transport=False, malformed=False, retryable=True, tool_draft=False):
         error = StreamInterrupted(message, text="".join(text), tool_draft=bool(calls) or tool_draft, usage=usage,
-                                  transport=transport, malformed=malformed, retryable=retryable)
-        if retryable and not malformed and calls and tool_choice not in ("none", "auto"):
+                                  transport=transport, malformed=malformed, retryable=retryable, thinking=bool(thinking))
+        if (retryable or error.reasonless_abort) and not malformed and calls and tool_choice not in ("none", "auto"):
             ordered = [calls[index] for index in sorted(calls)]
             identifiers = {call["id"] for call in ordered}
             if "" not in identifiers and len(identifiers) == len(ordered) and all(
@@ -3019,6 +3019,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 retry_enabled=getattr(args, "maintenance_retry_enabled", True),
                 loop_redirect=loop_level_setting != "off" and os.getenv("PI_NO_THINKING_LOOP_GUARD") != "1",
                 check=cancellation.check if cancellation else None,
+                fallback_event=partial(rpc.event, "retry_fallback_applied") if rpc and rpc.ready else None,
             )
 
         sharpshooter = None

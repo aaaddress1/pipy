@@ -406,7 +406,8 @@ def stream_attempt(client, route, model, messages, schemas, effort, guard, show,
             raise message.refusal(route, model, body, "bedrock", None)
         return message.result(route, model, "bedrock", text_only=tool_choice in ("none", "auto"))
     except APIStatusError as error:
-        if (show or turn) and (text := "".join(message.text)).strip():
+        text = "".join(message.text)
+        if (show or turn) and text.strip() or any(block["type"] == "tool_use" for block in message.blocks.values()):
             error.replay_unsafe = True
             error.text = text
         raise

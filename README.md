@@ -247,6 +247,8 @@ uv run mini_pi.py --route-config routes.json --model primary --max-steps 0
 
 上下文晉升先於壓縮，且只會選擇明確設定、視窗更大的 `promote_to`。供應商故障依 `fallbacks` 順序處理。遇到用量限制時，會先嘗試輪換憑證，並優先等待可在時限內解封的備用憑證。`--fallback-on` 可限制備援觸發類別或將其關閉。切換事件會記入 session，重開時若原本的路由設定仍可用，會恢復切換後的模型。[上游上下文晉升](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/models.md#context-promotion) · [上游重試策略](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/non-compaction-retry-policy.md)
 
+Fireworks Fast 在可安全重送的路由故障後，會先檢查適用的備援鏈，再嘗試切到同模型的 Standard 路由。即使關閉自動重試，仍可執行這次切換。使用自訂路由端點時，請在同一端點設定 Standard 路由。一般供應商的硬錯誤可依設定切換備援模型。供應商回報無理由中止時，符合重播條件的回合會留在同一模型重試。 [上游錯誤分流](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/non-compaction-retry-policy.md)
+
 將路由的 `api` 設為 `anthropic-messages` 可使用原生 Messages 串流。省略 `base_url` 時沿用 `ANTHROPIC_BASE_URL` 或 Anthropic 官方端點。預設讀取 `ANTHROPIC_API_KEY`，也可用 `auth: bearer` 搭配 `ANTHROPIC_AUTH_TOKEN`。可設定 `max_output_tokens` 及 `cache_retention`（`none`、`5m`、`1h`）。Thinking 簽章會保留在 SQLite，且只會在同一路由與相同請求前綴重播。[Anthropic 串流協定](https://platform.claude.com/docs/en/build-with-claude/streaming) · [Anthropic 快取設定](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 
 若最新的 Anthropic 回合含簽章或遮蔽推理，而且簽發模型仍可重試，備援會略過同供應商的其他模型，跨供應商候選仍可接手。設定 `retry.rateLimitWalksChain: true` 或 `--rate-limit-walks-chain`，可在 HTTP 429 時取消這項暫緩。串流中斷時，已完整收到但尚未執行的工具呼叫會和標示未執行的工具結果一起保留。[上游簽章備援規則](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/non-compaction-retry-policy.md#operational-caveats)

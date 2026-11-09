@@ -2,6 +2,7 @@
 
 import math
 import random
+import re
 import sys
 import time
 from dataclasses import replace
@@ -10,11 +11,21 @@ from httpx import NetworkError, RemoteProtocolError, TimeoutException
 from openai import APIConnectionError, APIStatusError
 
 from auth_broker import ModelCredentialError, ModelQuotaError
-from rate_limits import QUOTA_GUESS, TRANSIENT_DELAYS, UsageBlock, classify_rate_limit, quota_wait, retry_after
+from model_catalog import model_identity
+from rate_limits import (
+    BILLING, QUOTA_GUESS, TRANSIENT_DELAYS, UsageBlock, classify_rate_limit, error_text, quota_wait, retry_after,
+)
 from thinking_loop import REDIRECT, ThinkingLoop
 
 TRANSPORT_ERRORS = (APIConnectionError, NetworkError, RemoteProtocolError, TimeoutException)
 MAX_RECOVERIES = 3
+REASONLESS_ABORTS = frozenset(("Request was aborted", "Request was aborted.",
+                               "The operation was aborted", "The operation was aborted."))
+FAST_SHARED_FAILURE = re.compile(
+    r"\b(?:unauthorized|forbidden|authentication|invalid[ _-]+api[ _-]+key|no[ _-]+auth[ _-]+available)\b"
+    r"|\b(?:insufficient[ _-]+quota|quota[ _-]+exceeded|usage[ _-]+limit[ _-]+reached)\b"
+    r"|context[ _-]+(?:length|window)|payload too large|request_too_large", re.I,
+)
 
 
 class StepLimitReached(RuntimeError):
@@ -32,12 +43,14 @@ class IncompleteTurn(RuntimeError):
 class StreamInterrupted(IncompleteTurn):
     unexecuted_turn = None
 
-    def __init__(self, message, *, transport=False, malformed=False, retryable=True, **details):
+    def __init__(self, message, *, transport=False, malformed=False, retryable=True, thinking=False, **details):
         super().__init__(message, **details)
         self.transport = transport
         self.malformed = malformed
         self.retryable = retryable
         self.committed = False
+        self.thinking = thinking
+        self.reasonless_abort = message in REASONLESS_ABORTS
 
 
 class ClassifierRefusal(IncompleteTurn):
@@ -83,18 +96,18 @@ def media_rejection(error):
         return True
     if error.status_code not in (400, 422):
         return False
-    if error.code in ("image_too_large", "too_many_images", "invalid_image", "unsupported_image"):
+    if error.code in ("image_too_large", "too_many_images", "invalid_image", "unsupported_image", "request_too_large"):
         return True
     return any(phrase in error.message.lower() for phrase in (
         "too many images", "image exceeds", "image is too large", "images are not supported", "does not support images",
-        "image byte limit", "request body too large", "unsupported image",
+        "image byte limit", "request body too large", "payload too large", "request entity too large", "unsupported image",
     ))
 
 
 class TurnRecovery:
     def __init__(self, session, compaction, router, rate_limit_walks_chain, bind_context, max_retries, max_delay,
                  wait=time.sleep, auto_reset=None, wait_for_usage_reset=False, base_delay=.5, retry_enabled=True,
-                 loop_redirect=True, check=None):
+                 loop_redirect=True, check=None, fallback_event=None):
         self.session = session
         self.compaction = compaction
         self.router = router
@@ -109,6 +122,7 @@ class TurnRecovery:
         self.retry_enabled = retry_enabled
         self.loop_redirect = loop_redirect
         self.check = check
+        self.fallback_event = fallback_event
         self.same_model_retry = False
         self.body_timeout_seen = False
         self.body_timeout_retry = False
@@ -138,8 +152,8 @@ class TurnRecovery:
 
         return self.compaction.maintain(system, phase=phase, promote=promote_context)
 
-    def fallback(self, usage_limit=False, *, signer_can_retry=False, credit_targets=(), pinned=False):
-        if not self.retry_enabled:
+    def fallback(self, usage_limit=False, *, signer_can_retry=False, credit_targets=(), pinned=False, intrinsic=False):
+        if not (self.retry_enabled or intrinsic):
             return None
         deferred = None
         route = self.router.route
@@ -162,10 +176,51 @@ class TurnRecovery:
                 options["context_tokens"] = self.compaction.estimate(self.compaction.messages(self.request_system))
         if not self.router.fallback(self.visited_routes, usage_limit, deferred, **options):
             return None
+        self.notify_fallback(route)
+        return self.after_fallback()
+
+    def notify_fallback(self, source, role=None, **details):
+        if self.fallback_event:
+            target = self.router.route
+            names = [model_identity(route.catalog_model) if route.catalog_model else route.name for route in (source, target)]
+            role = role or self.router.pinned_chain or self.router.role_hint or "default"
+            self.fallback_event(**{"from": names[0], "to": names[1], "role": role, **details})
+
+    def after_fallback(self):
         self.attempts.clear()
         self.retry_attempts = 0
         self.attempted_credentials.clear()
         return "retry"
+
+    def fireworks_fallback(self, error):
+        source = self.router.route
+        if self.router.fixed_primary or not source.fireworks_base():
+            return None
+        if isinstance(error, StreamInterrupted) and (error.tool_draft or error.committed and error.text.strip()):
+            return None
+        hint = None
+        if isinstance(error, APIStatusError):
+            status = error.status_code
+            if status in (401, 402, 403) or media_rejection(error):
+                return None
+            hint = retry_after(error.response, error, provider=source.broker_provider)
+            if classify_rate_limit(error, hint) in ("quota", "billing"):
+                return None
+            text = error_text(error)
+        else:
+            text = str(error)
+        if FAST_SHARED_FAILURE.search(text) or BILLING.search(text):
+            return None
+        if not (candidate := self.router.fireworks_standard(source)):
+            return None
+        self.fallback_cooldown = hint or None
+        if switched := self.fallback(intrinsic=True):
+            return switched
+        if candidate.name not in self.visited_routes and self.router.degrade_fireworks(candidate):
+            self.visited_routes.update((source.name, candidate.name))
+            self.notify_fallback(source, "fireworks-fast", reason="Fast tier rejected the request. Retrying on the Standard tier.")
+            return self.after_fallback()
+        return None
 
     def consume_credit(self):
         pending, self.pending_credit = self.pending_credit, None
@@ -330,6 +385,16 @@ class TurnRecovery:
             if self.promote() or self.take("overflow") and self.compaction.maintain(system, reason="overflow"):
                 return "retry"
             return None
+        if isinstance(error, StreamInterrupted) and error.reasonless_abort:
+            if not self.retry_enabled or not error.unexecuted_turn and (error.text or error.thinking or error.tool_draft):
+                return None
+            if resumed := self.retry_or_fallback("provider aborted", allow_fallback=False):
+                if error.unexecuted_turn:
+                    self.remember_unexecuted(error)
+                return resumed
+            return None
+        if isinstance(error, (APIStatusError, StreamInterrupted)) and (switched := self.fireworks_fallback(error)):
+            return switched
         if isinstance(error, APIStatusError):
             if media_rejection(error):
                 if self.take("media rejection", 1) and self.compaction.recover_media(system):
@@ -364,9 +429,7 @@ class TurnRecovery:
                     "transient provider error", hint,
                     retry_allowed=should_retry != "false",
                 )
-            if status == 404:
-                return self.fallback()
-            return None
+            return self.fallback()
 
         if isinstance(error, StreamInterrupted):
             committed = error.committed and bool(error.text.strip())
@@ -401,6 +464,8 @@ class TurnRecovery:
                 )
                 print(f"[stream interrupted after visible text; continuing {attempt}/{MAX_RECOVERIES}]", file=sys.stderr)
                 return "retry"
+            if not error.retryable and not committed and not error.tool_draft:
+                return self.fallback()
             return None
 
         if isinstance(error, EmptyTurn):
@@ -443,16 +508,18 @@ class TurnRecovery:
         self.attempted_credentials.clear()
         return True
 
-    def retry_or_fallback(self, reason, provider_delay=None, *, retry_allowed=True, rate_limited=False, retry_first=False):
+    def retry_or_fallback(self, reason, provider_delay=None, *, retry_allowed=True, rate_limited=False, retry_first=False,
+                          allow_fallback=True):
         attempt = self.take_retry() if retry_allowed else None
         delay = max(provider_delay or 0, retry_backoff(attempt, self.base_delay)) if attempt is not None else None
         if self.fallback_cooldown is None and provider_delay:
             self.fallback_cooldown = provider_delay
         can_wait = delay is not None and (not self.max_delay or delay <= self.max_delay)
-        if not (retry_first and attempt == 1 and can_wait):
-            switched = self.fallback(signer_can_retry=can_wait and not (rate_limited and self.rate_limit_walks_chain))
-            if switched or not can_wait:
+        if allow_fallback and not (retry_first and attempt == 1 and can_wait):
+            if switched := self.fallback(signer_can_retry=can_wait and not (rate_limited and self.rate_limit_walks_chain)):
                 return switched
+        if not can_wait:
+            return None
         print(f"[{reason}; retrying {attempt}/{self.max_retries} in {delay:g}s]", file=sys.stderr)
         self.wait(delay)
         return "retry"

@@ -824,7 +824,8 @@ def stream_attempt(
 
     def interrupted(message, *, transport=False):
         text = "".join(visible)
-        error = StreamInterrupted(message, text=text, tool_draft=tool_draft, usage=usage, transport=transport)
+        error = StreamInterrupted(message, text=text, tool_draft=tool_draft, usage=usage, transport=transport,
+                                  thinking=bool(thinking or completed_reasoning))
         error.replay_unsafe = hosted_tool or stream_tools.unsafe
         if transport and not error.replay_unsafe and stream_tools.calls and tool_choice not in ("none", "auto"):
             drafts = sorted(stream_tools.calls.values(), key=lambda item: (item.index is None, item.index or 0))
@@ -959,7 +960,7 @@ def stream_attempt(
     except APIStatusError as error:
         if error.code in ("stream_incomplete", "network_error"):
             raise interrupted(str(error), transport=True) from error
-        if hosted_tool or stream_tools.unsafe or (show or turn) and "".join(visible).strip():
+        if hosted_tool or tool_draft or stream_tools.unsafe or (show or turn) and "".join(visible).strip():
             error.replay_unsafe = True
             error.text = "".join(visible)
         raise
