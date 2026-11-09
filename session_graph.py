@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS subagent_links (
 );
 CREATE INDEX IF NOT EXISTS subagent_links_child ON subagent_links(child);
 CREATE TABLE IF NOT EXISTS subagent_specs (child TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS subagent_tombstones (child TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS speculative_task_roots (session TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS peer_messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, root TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
@@ -79,6 +80,7 @@ def delete_task_subtree(db, children):
         db.executemany(f"DELETE FROM {table} WHERE session = ?", ((sid,) for sid in children))
     db.executemany("DELETE FROM peer_messages WHERE sender = ? OR recipient = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM subagent_specs WHERE child = ?", ((sid,) for sid in children))
+    db.executemany("DELETE FROM subagent_tombstones WHERE child = ?", ((sid,) for sid in children))
     db.executemany("DELETE FROM subagent_links WHERE owner = ? OR child = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM sessions WHERE id = ?", ((sid,) for sid in children))
 
@@ -462,6 +464,7 @@ def fork(db, source, target, leaf, workspace, timestamp, *, whole):
             result["sessionId"] = copied
             data = encode(result)
         db.execute("INSERT INTO subagent_links(owner,name,child,result) VALUES (?,?,?,?)", (target, name, copied, data))
+        db.execute("INSERT INTO subagent_tombstones SELECT ? FROM subagent_tombstones WHERE child=?", (copied, child))
         if spec := db.execute("SELECT data FROM subagent_specs WHERE child=?", (child,)).fetchone():
             saved = json.loads(spec[0])
             saved["sid"] = copied

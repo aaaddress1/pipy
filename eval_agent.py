@@ -219,7 +219,7 @@ class AgentBridge:
             )
         return {"id": task.name, "agent": task.agent.name}
 
-    def run(self, task, cancellation, *, revived=False, job_id=None, owner=None):
+    def run(self, task, cancellation, *, revived=False, job_id=None, owner=None, restore_plan=None):
         tasks = self.tasks
 
         def progress(runtime):
@@ -229,7 +229,7 @@ class AgentBridge:
                 details["model"] = runtime.model
             tasks.jobs.progress(job_id or task.name, {"progress": details}, f"Running agent {task.name}...")
 
-        result, value = tasks.run_task(task, cancellation, revived, progress=progress)
+        result, value = tasks.run_task(task, cancellation, revived, progress=progress, restore_plan=restore_plan)
         return self.finish(task, result, value, owner)
 
     def finish(self, task, result, value, owner=None):

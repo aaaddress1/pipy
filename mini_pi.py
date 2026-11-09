@@ -1311,6 +1311,8 @@ class OpenSession:
     account: object
     peer: object
     bind_child: object
+    restore_pending: bool
+    restore_children: object
 
 
 @contextmanager
@@ -1536,7 +1538,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         primary_candidates=getattr(args, "primary_candidates", ()),
                         role_hint=getattr(args, "model_role_hint", None), secrets=getattr(args, "config_secrets", None),
                         fixed_primary=bool(getattr(args, "per_call_guard", None)))
-        assume_exit = bool(getattr(args, "restore", None) and not child and not getattr(args, "internal_session_switch", False))
+        assume_exit = (child.restore_plan is not None if child else bool(
+            getattr(args, "restore", None) and not getattr(args, "internal_session_switch", False)
+        ))
         seq, tail_batch, _ = session.conversation_tail()
         if not child and (pending := session.pending_tools(seq, tail_batch)):
             tools_pending = ", ".join(f"{item['toolName']} ({item['toolCallId']})" for item in pending)
@@ -1751,10 +1755,13 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             nonlocal reasoning_effort, auto_level
             saved = session.last_thinking_change()
             reasoning_effort = args.reasoning_effort
-            if reasoning_effort is None and saved.get("configured") in ("auto", "off", *model_catalog.EFFORTS):
-                reasoning_effort = saved["configured"]
+            configured = saved.get("configured")
+            if child and assume_exit and ("configured" in saved or "thinkingLevel" in saved):
+                configured = saved.get("configured", saved.get("thinkingLevel")) or "off"
+            if (reasoning_effort is None or child and assume_exit) and configured in ("auto", "off", *model_catalog.EFFORTS):
+                reasoning_effort = configured
             level = saved.get("thinkingLevel")
-            auto_level = level if saved.get("configured") == "auto" and level in model_catalog.EFFORTS else None
+            auto_level = level if configured == "auto" and level in model_catalog.EFFORTS else None
 
         restore_effort()
 
@@ -2091,6 +2098,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             with turn_scope(cancel), ExitStack() as one_shot:
                 handle = peer_bus.open_child(task.sid, create) if peer_bus else one_shot.enter_context(create())
                 handle.bind_child(runtime, cancel, lineage)
+                restoring = runtime.restore_plan is not None
+                if restoring and not handle.restore_pending:
+                    raise ValueError("The saved subagent no longer has an interrupted turn.")
+                if restoring and handle.restore_children:
+                    handle.restore_children(runtime.restore_plan)
                 if pooled:
                     runtime.pool_reusable = peer_bus is not None
                 answer = None
@@ -2101,7 +2113,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         raise ValueError("No peer message is queued for this revival.")
                     assignment = ("Complete assignment thoroughly:\n\n" + task.assignment
                                   if task.eval_schema_source is not None and not runtime.pool_followup else task.assignment)
-                    answer = handle.run_task(incoming if revived else assignment, background=revived, show=False)
+                    if restoring:
+                        answer = handle.run_task(None, background=True, show=False)
+                    else:
+                        answer = handle.run_task(incoming if revived else assignment, background=revived, show=False)
                     can_settle = (runtime.yield_errors < subagents.MAX_YIELD_ERRORS
                                   and (runtime.submitted is not None or not runtime.budget_stopped()))
                     if handle.jobs and not pooled and can_settle:
@@ -2170,6 +2185,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                         peer, background=args.async_enabled, depth=args.task_depth)
         if peer and not child and tasks:
             peer_bus.revive = tasks.revive
+        recovery_tasks = tasks
+        if not recovery_tasks and child and assume_exit and child.restore_plan.get(session_id) and args.async_enabled:
+            recovery_tasks = subagents.Tasks(session, workspace, args.task_options, {}, ("*",), resolve_task, run_child,
+                                             jobs, peer, depth=args.task_depth)
         if eval_tool:
             def kernel_tool_call(name, arguments, cancellation, claim=None):
                 with turn_scope(cancellation):
@@ -3839,8 +3858,16 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     apply_saved_rule,
                 )
                 try:
-                    if restore_pending:
-                        terminal_lane.submit(TerminalWork(None, expand_prompt=False))
+                    if assume_exit:
+                        plan = tasks.restoration_plan() if tasks and args.async_enabled else {}
+                        if plan:
+                            if peer:
+                                peer_bus.reserve_restoration(task.sid for batch in plan.values() for task in batch)
+                            tasks.restore_children(plan)
+                        if peer:
+                            peer_bus.recover()
+                        if restore_pending:
+                            terminal_lane.submit(TerminalWork(None, expand_prompt=False))
                     elif loop := getattr(args, "pending_loop", None):
                         del args.pending_loop
                         if loop.expired():
@@ -4281,12 +4308,13 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 jobs.services.attach(existing_only=bool(child))
             if peer:
                 peer.attach()
-                if not child:
+                if not child and not assume_exit:
                     peer_bus.recover()
             yield OpenSession(
                 session, run_task, interactive, rpc_commands() if rpc else {}, lambda: router.route,
                 lambda: "auto" if selected_effort(router.route) == "auto" else effective_effort() or "off",
-                local_mcp, jobs, cost_gate.account, peer, bind_child,
+                local_mcp, jobs, cost_gate.account, peer, bind_child, restore_pending,
+                recovery_tasks.restore_children if recovery_tasks and args.async_enabled else None,
             )
         finally:
             try:

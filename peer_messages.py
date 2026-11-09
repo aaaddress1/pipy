@@ -43,6 +43,7 @@ class PeerBus:
         self.timers = {}
         self.closing = False
         self.scheduled = set()
+        self.restoring = set()
         self.waiting = {}
         self.deferred = set()
         self.revive = None
@@ -65,7 +66,7 @@ class PeerBus:
 
     def active(self, sid):
         endpoint = self.endpoints.get(sid)
-        return sid in self.scheduled or bool(endpoint and endpoint.running)
+        return sid in self.scheduled or sid in self.restoring or bool(endpoint and endpoint.running)
 
     def status(self, sid):
         if self.active(sid):
@@ -136,7 +137,19 @@ class PeerBus:
 
     def mark(self, *sids):
         with self.lock:
+            self.restoring.difference_update(sids)
             self.scheduled.update(sids)
+
+    def reserve_restoration(self, sids):
+        with self.lock:
+            self.restoring.update(sids)
+
+    def release_restoration(self, sid):
+        with self.lock:
+            if sid not in self.restoring:
+                return False
+            self.restoring.remove(sid)
+            return True
 
     def discard_speculation(self, children):
         with self.condition:
@@ -232,6 +245,10 @@ class PeerBus:
             db.execute("INSERT INTO peer_messages(root,sender,recipient,sender_name,body,flags,consumed) VALUES (?,?,?,'','',?,1)",
                        (self.root, sender, recipient, JOB_REPLY))
 
+    def tombstone(self, sid):
+        with database(self.path) as db:
+            db.execute("INSERT OR IGNORE INTO subagent_tombstones SELECT child FROM subagent_links WHERE child=?", (sid,))
+
     def blocks_on(self, sid, target, sent):
         def reaches(peer, path):
             if peer == target:
@@ -250,8 +267,10 @@ class PeerBus:
     def recover(self):
         if not self.revive:
             return
+        with database(self.path) as db:
+            killed = {sid for sid, in db.execute("SELECT child FROM subagent_tombstones")}
         for peer in self.roster().values():
-            if peer.owner and self.pending(peer.sid):
+            if peer.owner and peer.sid not in killed and self.pending(peer.sid):
                 try:
                     self.schedule(peer)
                 except (ValueError, OSError):

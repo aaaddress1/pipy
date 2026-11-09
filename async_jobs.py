@@ -134,12 +134,12 @@ class AsyncJobs:
              **({"timeoutSeconds": timeout} if timeout else {"timeoutDisabled": True})},
         )
 
-    def spawn(self, items, reserve, *, kind="task", queued=False, suppress_delivery=False):
+    def spawn(self, items, reserve, *, kind="task", queued=False, suppress_delivery=False, resuming=False):
         """Register a batch before any member starts executing."""
         with self.condition:
             self.prune()
             running = sum(job.status == "running" and not job.queued for job in self.jobs.values())
-            if self.closed or not queued and running + len(items) > self.limit:
+            if self.closed or not resuming and not queued and running + len(items) > self.limit:
                 raise ValueError("Too many background jobs are running.")
             identifiers = {item[0] for item in items}
             if len(identifiers) != len(items) or identifiers & self.jobs.keys():
@@ -470,6 +470,8 @@ class AsyncJobs:
                 raise ValueError(f"Unknown job {identifier!r}.")
             if job.status != "running":
                 return f"Job {identifier} has already settled."
+            if self.peer and job.kind == "task" and job.agent_id:
+                self.peer.bus.tombstone(job.agent_id)
             job.cancel.cancel()
             self.condition.notify_all()
             return f"Cancelled job {identifier}."

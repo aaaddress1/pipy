@@ -238,7 +238,7 @@ class WorkPool:
                     task = self.bridge.prepare(values)
                 if self.custom:
                     task = replace(task, eval_tools=self.custom, eval_tool_owner=self.tasks.eval_tools.id)
-                task = replace(task, context=self.context)
+                task = replace(task, context=self.context, workpool=True)
                 worker = Worker(task)
                 with self.condition:
                     if self.closed or signal.is_cancelled() or self.jobs.closed:

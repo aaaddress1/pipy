@@ -554,11 +554,10 @@ class Session:
             data["pendingToolCalls"] = pending
         self.record_metadata(exit_log.custom(exit_log.SESSION_EXIT, data))
 
-    @session_write
-    def recover_interrupted(self, *, assume_exit=False, model=None):
+    def interrupted_state(self, assume_exit):
         seq, batch, tail = self.conversation_tail()
         if tail is None:
-            return False
+            return None
         with database(self.path) as db:
             row = db.execute(graph.ANCESTORS + """
                 SELECT json_extract(n.payload,'$.data') FROM ancestry a JOIN session_nodes n ON n.id=a.id
@@ -573,22 +572,37 @@ class Session:
         if not isinstance(recorded, dict) or recorded.get("kind") not in ("normal", "signal", "fatal", "process_exit"):
             recorded = None
         if recorded and recorded["kind"] == "normal" and not recorded.get("pendingToolCalls"):
-            return False
+            return None
         if exit_log.interrupted(tail):
-            return assume_exit
+            return (seq, batch, tail, recorded, None) if assume_exit else None
         if not recorded and not assume_exit or tail["role"] == "assistant" and not tail.get("tool_calls"):
-            return False
+            return None
         previous = next((item for _, items in reversed(self.batches) for item in reversed(items)
                          if item["role"] == "assistant"), None)
         if tail["role"] == "tool" and previous and exit_log.stop_reason(previous) in ("error", "aborted"):
+            return None
+        return seq, batch, tail, recorded, previous
+
+    @session_write
+    def has_restorable_turn(self):
+        candidate = self.interrupted_state(True)
+        return bool(candidate and (not candidate[3] or candidate[3]["kind"] != "normal"))
+
+    @session_write
+    def recover_interrupted(self, *, assume_exit=False, model=None):
+        if not (candidate := self.interrupted_state(assume_exit)):
             return False
+        seq, batch, tail, recorded, previous = candidate
+        resumable = not assume_exit or not recorded or recorded["kind"] != "normal"
+        if exit_log.interrupted(tail):
+            return resumable
         for index, item in enumerate(batch):
             if exit_log.pending_result(item):
                 self.update_tool_result(seq, index, {"role": "tool", "tool_call_id": item["tool_call_id"],
                     "content": exit_log.UNKNOWN_RESULT, "_tool_error": True})
         self.append([exit_log.abort_message(recorded.get("recordedAt") if recorded else exit_log.timestamp(),
                                            previous if previous and previous.get("_rpc") else model)])
-        return not assume_exit or not recorded or recorded["kind"] != "normal"
+        return resumable
 
     @session_write
     def retry_target(self):

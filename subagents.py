@@ -14,6 +14,7 @@ from time import monotonic
 from uuid import uuid4
 
 import yaml
+from filelock import Timeout
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
@@ -21,9 +22,11 @@ from async_jobs import tool_result
 from auth_broker import dotted
 from cancellable_http import active_turn
 from handoff import Cancellation, deadline
-from runtime import database, pack
+from runtime import Session, database, pack
 from session_graph import delete_task_subtree, task_subtree
 from session_jsonl import journal_entries, plain_text, text_and_images
+from session_leases import upstream_lease
+from session_transfer import archive_session_id, lease
 import task_isolation
 from task_yield import YieldState, yield_error
 
@@ -282,6 +285,7 @@ class Task:
     parent_model: str | None = None
     eval_tool_owner: str | None = None
     eval_tools: tuple = ()
+    workpool: bool = False
 
     def spec(self):
         data = asdict(self)
@@ -301,9 +305,10 @@ class TaskLimitReached(RuntimeError):
 
 
 class TaskRun:
-    def __init__(self, task, options, *, provisional=False, progress=None, pool_items=(), pool_followup=False):
+    def __init__(self, task, options, *, provisional=False, progress=None, pool_items=(), pool_followup=False, restore_plan=None):
         self.task = task
         self.provisional = provisional
+        self.restore_plan = restore_plan
         self.count = 0
         override = options.request_overrides.get(task.agent.name)
         self.limit = override if type(override) is int and override >= 0 else options.requests
@@ -685,6 +690,72 @@ class Tasks:
             except (OSError, SQLiteError):
                 logger.exception("Unable to update the task display for %s", task.name)
 
+    def restoration_plan(self):
+        plan = {}
+        owners = [self.session.id]
+        visited = {self.session.id}
+        path = self.session.path
+        for owner in owners:
+            with database(path) as db:
+                candidates = [(sid, name, scope, data, archive_session_id(db, sid)) for sid, name, scope, data in db.execute("""
+                    SELECT l.child,l.name,s.workspace,spec.data FROM subagent_links l
+                    JOIN subagent_specs spec ON spec.child=l.child JOIN sessions s ON s.id=l.child
+                    LEFT JOIN subagent_tombstones dead ON dead.child=l.child
+                    WHERE l.owner=? AND dead.child IS NULL
+                    AND coalesce(json_extract(l.result,'$.status'),'')<>'cancelled' ORDER BY l.rowid
+                """, (owner,))]
+            for sid, name, scope, data, upstream_id in candidates:
+                if sid in visited:
+                    continue
+                visited.add(sid)
+                try:
+                    task = Task.restore(json.loads(data))
+                    if task.sid != sid or task.name != name or task.repo_root or task.workpool or not Path(scope).is_dir():
+                        continue
+                    with lease(path.parent, sid), upstream_lease(upstream_id):
+                        child = Session(path, sid, scope)
+                        if not child.has_restorable_turn():
+                            continue
+                    plan.setdefault(owner, []).append(replace(task, workspace=scope))
+                    owners.append(sid)
+                except Timeout:
+                    continue
+                except (KeyError, OSError, SQLiteError, TypeError, ValueError):
+                    logger.warning("Unable to read the interrupted task %s", name, exc_info=True)
+        return plan
+
+    def restore_children(self, plan):
+        tasks = plan.get(self.session.id)
+        if not tasks or not self.jobs:
+            return
+
+        def reserve():
+            if self.peer:
+                self.peer.bus.mark(*(task.sid for task in tasks))
+            for task in tasks:
+                self.observe(task, "running")
+
+        def release_unclaimed(owner):
+            if self.peer:
+                for child in plan.get(owner, ()):
+                    if self.peer.bus.release_restoration(child.sid):
+                        release_unclaimed(child.sid)
+
+        def resume(task, cancel):
+            try:
+                if task.eval_schema_source is not None and self.resume_eval:
+                    return self.resume_eval(task, cancel, restore_plan=plan)
+                return self.execute(task, cancel, restore_plan=plan)
+            finally:
+                release_unclaimed(task.sid)
+
+        try:
+            self.jobs.spawn([(task.name, task.eval_label or task.assignment, task.sid, lambda cancel, task=task: resume(task, cancel))
+                             for task in tasks], reserve, resuming=True)
+        except ValueError:
+            release_unclaimed(self.session.id)
+            raise
+
     def revive(self, target):
         if not self.jobs or self.jobs.closed:
             raise ValueError("The parent session is closing.")
@@ -764,11 +835,11 @@ class Tasks:
             db.execute("INSERT OR IGNORE INTO subagent_specs(child,data) VALUES (?,?)", (task.sid, pack(task.spec())))
         return task
 
-    def execute(self, task, cancel, *, revived=False):
+    def execute(self, task, cancel, *, revived=False, restore_plan=None):
         if revived:
             self.observe(task, "running")
         try:
-            result, data = self.run_task(task, cancel, revived)
+            result, data = self.run_task(task, cancel, revived, restore_plan=restore_plan)
         except BaseException:
             self.observe(task, "failed")
             raise
@@ -787,9 +858,9 @@ class Tasks:
                 self.peer.bus.finish(task.sid, retry=completed)
                 self.peer.bus.recover_deferred()
 
-    def run_task(self, task, cancel, revived, staged=None, *, progress=None, pool_items=(), pool_followup=False):
+    def run_task(self, task, cancel, revived, staged=None, *, progress=None, pool_items=(), pool_followup=False, restore_plan=None):
         runtime = TaskRun(task, self.options, provisional=staged is not None, progress=progress,
-                          pool_items=pool_items, pool_followup=pool_followup)
+                          pool_items=pool_items, pool_followup=pool_followup, restore_plan=restore_plan)
         acquired = False
         start = monotonic()
         sandbox, isolation, opened = None, None, False
