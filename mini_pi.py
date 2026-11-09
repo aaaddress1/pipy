@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import copy_context
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -3529,9 +3529,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             from prompt_toolkit import PromptSession
 
             from btw_panel import BtwPanel
-            from loop_mode import TIME_REACHED
+            from loop_mode import TIME_REACHED, ConditionShell
             from omfg_panel import OmfgPanel
-            from service_shell import shell_environment, shell_plan, windows_arguments
             from terminal_turn import TerminalLane, TerminalWork
             from todo_hud import TodoHUD
 
@@ -3551,15 +3550,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 else:
                     refresh_rules()
 
-            def loop_shell(command, output, cancellation, timeout):
-                environment = os.environ if shell_env is None else shell_env
-                argv = shell_plan(command, args.launch_shell, environment)
-                env = shell_environment(argv, environment)
-                if os.name == "nt":
-                    argv = subprocess.list2cmdline(argv[:1]) + " " + windows_arguments(argv)
-                return run_shell(argv, workspace, output, cancellation, timeout, env=env, shell=False)
-
+            environment = os.environ if shell_env is None else shell_env
             with (
+                closing(ConditionShell(workspace, args.launch_shell, environment, run_shell)) as loop_shell,
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="mini-pi-terminal") as main_worker,
                 ThreadPoolExecutor(max_workers=2, thread_name_prefix="mini-pi-omfg") as side_workers,
             ):
