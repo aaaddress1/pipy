@@ -94,6 +94,7 @@ from recovery import (
 )
 from routing import Router, load_routes
 from runtime import Compaction, Session, database, initialize, pack, paused_turn, responses_replay_scope
+import dsml
 from session_graph import SUMMARY_PROMPT, stored_batches
 from shake import MANUAL
 from snapcompact_inline import InlineImages, chat_tool_images
@@ -175,6 +176,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     steps = range(max_steps) if max_steps else count()
     yield_retries = 0
     pause_continuations = 0
+    dsml_nudges = 0
 
     if turn:
         for extra in turn.works[1:]:
@@ -236,6 +238,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         continue_paused = False
         if calls:
             pause_continuations = 0
+            dsml_nudges = 0
         elif paused_turn(assistant):
             continue_paused = pause_continuations < MAX_PAUSED_TURN_CONTINUATIONS
             if continue_paused:
@@ -286,6 +289,10 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             if rules:
                 rules.age += 1
             if continue_paused:
+                continue
+            if assistant.get("_dsml_leak") and dsml_nudges < dsml.MAX_NUDGES:
+                dsml_nudges += 1
+                session.append([{"role": "developer", "content": dsml.NUDGE}])
                 continue
             if jobs and jobs.ready():
                 continue
@@ -347,6 +354,7 @@ def stream_reply(
     tool_choice=None, cancel=None, turn=None, usage_observer=None, anthropic_replay=None, credit=None, meter=None, rules=None,
     on_text=None, speculation=None, websocket=None,
 ):
+    heal_dsml = dsml.targeted(model, native_route)
     if native_route and (native_route.catalog_model or {}).get("supportsTools") is False:
         schemas, tool_choice = (), None
     if native_route and native_route.api == "chat-completions" and native_route.catalog_model and model == native_route.model:
@@ -404,8 +412,18 @@ def stream_reply(
                         http_chain=options.get("http_chain"),
                     )
                 else:
-                    result = stream_attempt(client, model, messages, schemas, options, guard, show, tool_choice, cancel, turn,
-                                            usage_observer=observer, tracker=tracker, on_text=on_text, speculation=speculation)
+                    chat_options = {key: value for key, value in options.items()
+                                    if key not in ("codex_turn", "live_source", "effort_control", "http_chain")}
+                    result = stream_attempt(client, model, messages, schemas, chat_options, guard, show, tool_choice, cancel, turn,
+                                            usage_observer=observer, tracker=tracker, on_text=on_text, speculation=speculation,
+                                            heal_dsml=heal_dsml)
+            if heal_dsml and dsml.clean_message(result[0]):
+                if not result[0].get("tool_calls") and not result[0].get("_stop_details") and tool_choice not in ("none", "auto"):
+                    result[0]["_dsml_leak"] = True
+                if websocket is not None:
+                    websocket.baseline = None
+                if http_chain := options.get("http_chain"):
+                    http_chain.reset()
             if tracker:
                 rules.response = tracker.finish(result[0])
             skipped = result[0].get("_tool_stop") == "length"
@@ -446,12 +464,47 @@ def stream_reply(
 
 
 def stream_attempt(client, model, messages, schemas, options, guard, show, tool_choice=None, cancel=None, turn=None,
-                   *, usage_observer=None, tracker=None, on_text=None, speculation=None):
+                   *, usage_observer=None, tracker=None, on_text=None, speculation=None, heal_dsml=False):
     text, thinking, calls, finish, usage = [], [], {}, None, None
     cached_tokens_header = upstream_provider = None
+    buffer = dsml.TextBuffer() if heal_dsml else None
+    visible, leaked = None, False
     tool_options = {"tools": schemas} if schemas else {}
     if tool_choice and schemas:
         tool_options["tool_choice"] = tool_choice
+
+    def emit_text(piece):
+        if not piece:
+            return
+        if turn:
+            turn.delta("text", piece)
+        if on_text:
+            on_text(piece)
+        if show:
+            print(piece, end="", flush=True)
+        text.append(piece)
+        if tracker:
+            tracker.text("text", piece)
+
+    def finish_markup():
+        nonlocal visible, finish, leaked
+        if not buffer:
+            return
+        visible, tail, recovered, leaked = buffer.finish()
+        if finish in ("stop", "tool_calls") and not calls and schemas and tool_choice not in ("none", "auto") and recovered:
+            for index, (name, arguments) in enumerate(recovered):
+                calls[index] = call = dsml.make_call(name, arguments)
+                raw = call["function"]["arguments"]
+                if tracker and tracker.rules.stream_tools:
+                    tracker.tool(index, name, raw, call["id"], final=True)
+                if speculation:
+                    speculation.observe(index, name, call["id"], raw, final=True)
+        if finish == "stop" and calls:
+            finish = "tool_calls"
+        if tail:
+            guard.push(None, tail, bool(calls))
+            emit_text(tail)
+
     try:
         with client.chat.completions.create(
             model=model, messages=chat_tool_images(messages), stream=True,
@@ -472,21 +525,16 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                     delta = choice.delta
                     reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                     piece = delta.content or delta.refusal
+                    if buffer and piece:
+                        piece = buffer.feed(piece)
                     guard.push(reasoning if isinstance(reasoning, str) else None, piece, bool(delta.tool_calls))
                     if turn:
                         turn.delta("thinking", reasoning if isinstance(reasoning, str) else None)
-                        turn.delta("text", piece)
                     if isinstance(reasoning, str) and reasoning:
                         thinking.append(reasoning)
-                    if piece:
-                        if on_text:
-                            on_text(piece)
-                        if show:
-                            print(piece, end="", flush=True)
-                        text.append(piece)
                     if tracker:
                         tracker.text("thinking", reasoning if isinstance(reasoning, str) else None)
-                        tracker.text("text", piece)
+                    emit_text(piece)
                     for part in delta.tool_calls or []:
                         call = calls.setdefault(part.index, {
                             "id": "", "type": "function", "function": {"name": "", "arguments": ""},
@@ -507,6 +555,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                             for index, call in sorted(calls.items()):
                                 func = call["function"]
                                 speculation.observe(index, func["name"], call["id"], func["arguments"], final=True)
+            finish_markup()
             if finish:
                 guard.finish()
     except TRANSPORT_ERRORS as error:
@@ -515,13 +564,14 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                 f"Provider stream interrupted ({type(error).__name__}).",
                 text="".join(text), tool_draft=bool(calls), usage=usage,
             ) from error
+        finish_markup()
         guard.finish()
     finally:
         if usage_observer and usage is not None:
             usage_observer(usage, cached_tokens_header)
         if show and text:
             print()
-    visible = "".join(text)
+    visible = "".join(text) if visible is None else visible
     if finish == "length":
         raise IncompleteTurn(
             "Model reached its generation limit.", text=visible, tool_draft=bool(calls), usage=usage,
@@ -538,10 +588,14 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
         message["_served_upstream"] = upstream_provider
     if tool_choice in ("none", "auto"):
         return message, usage
-    if not calls and not visible.strip():
-        raise EmptyTurn("Model stopped without actionable output.")
     if thinking:
         message["_thinking"] = "".join(thinking)
+    if buffer:
+        leaked = dsml.clean_message(message) or leaked
+    if leaked and not calls:
+        message["_dsml_leak"] = True
+    if not calls and not visible.strip() and not leaked:
+        raise EmptyTurn("Model stopped without actionable output.")
     if calls:
         ordered = [calls[index] for index in sorted(calls)]
         ids = {call["id"] for call in ordered}

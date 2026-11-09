@@ -51,7 +51,7 @@ def paused_turn(message):
 def portable_message(message, thinking_route=None):
     private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
-               "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted")
+               "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -513,7 +513,7 @@ class Session:
             if message["role"] == "developer" else (message if include_native else portable_message(message, thinking_route))
             for seq, batch in self.batches if seq >= cut and (before is None or seq < before)
             for message in batch
-            if include_native or message.get("content") or not paused_turn(message)
+            if include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak"))
         ]
 
     def compact(self, cut, summary, native=None):
