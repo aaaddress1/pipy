@@ -116,6 +116,8 @@ class TurnRecovery:
 
     def maintain(self, system, phase="pre"):
         self.bind_context()
+        if phase == "post":
+            self.compaction.prune_tool_results()
         if self.body_timeout_retry or self.output_cap_retry:
             self.body_timeout_retry = self.output_cap_retry = False
             return

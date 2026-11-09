@@ -146,6 +146,8 @@ def text_and_images(content):
 
 def valid_elision(edit):
     if isinstance(edit, dict):
+        if set(edit) == {"pruned_content", "pruned_at"}:
+            return isinstance(edit["pruned_content"], str) and type(edit["pruned_at"]) is int and edit["pruned_at"] >= 0
         return set(edit) == {"responses_prefix"} and isinstance(edit["responses_prefix"], str)
     return isinstance(edit, str) or isinstance(edit, list) and all(
         isinstance(part, dict) and (

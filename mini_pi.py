@@ -57,6 +57,7 @@ import project_context
 from ttsr import Attempt as RuleAttempt, RuleInterrupt, Rules, assistant_outputs, judge_question
 from ttsr_rules import read_rule, settings_for as rule_settings_for
 from tool_batch import execute as execute_tool_batch
+from tool_pruning import ReadText, selected_lines, split_read
 from read_speculation import ReadSpeculation, configured_limit as speculative_read_limit
 from task_speculation import StreamSpeculation, TaskSpeculation, enabled as speculative_task_enabled
 from eval_tool import EvalTool, settings as eval_settings
@@ -138,6 +139,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     """Ask the model, run its tools in order, and feed their results back."""
     cancellation = turn or active_turn()
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
+    compaction.prune_tool_results(cold_check=True)
 
     def append_input(content, notification=False, *, queued=False, admitted=None, metadata=None, note=None):
         work = content if queued and (terminal_turn or isinstance(content, rpc_mode.Work)) else None
@@ -780,7 +782,7 @@ def run_tool(tools, call, turn=None, *, speculation=None, nested=False):
         if speculation and name == "read" and (cached := speculation.take(call)) is not None:
             if cancellation := active_turn():
                 cancellation.check()
-            return clipped(cached)
+            return ReadText(clipped(cached), complete=len(cached) <= OUTPUT_LIMIT)
         args = json.loads(function["arguments"])
         tool = tools[name]
         if isinstance(tool, Todos):
@@ -834,6 +836,8 @@ def run_tool(tools, call, turn=None, *, speculation=None, nested=False):
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         if name == "yield":
             return tool_result(f"Error: {error}", {}, True)
+        if name == "read":
+            return ReadText(f"Error: {error}", failed=True)
         return f"Error: {error}"
 
 
@@ -988,11 +992,22 @@ def workspace_tools(workspace, session, turn=None, mcp=None, *, jobs=None, auto_
                 return clipped(text)
         if path[:6].lower() == "mcp://":
             raise ValueError("No MCP servers configured.")
-        target = resolve(path)
+        source, selector = split_read(path)
+        if selector and selector.lower() == "conflicts":
+            raise ValueError("The conflicts selector requires a merge-aware reader.")
+        target = resolve(source)
         if bridge and bridge.read_enabled:
+            if selector:
+                from io import StringIO
+
+                return clipped(selected_lines(StringIO(bridge.read(target)), selector, OUTPUT_LIMIT))
             return clipped(bridge.read(target))
-        with target.open(encoding="utf-8") as file:
-            return clipped(file.read(OUTPUT_LIMIT + 1))
+        raw = selector and "raw" in selector.lower().split(":")
+        cancellation = active_turn() or turn
+        with target.open(encoding="utf-8", newline="" if raw else None) as file:
+            text = (selected_lines(file, selector, OUTPUT_LIMIT, cancellation.check if cancellation else None)
+                    if selector else file.read(OUTPUT_LIMIT + 1))
+        return ReadText(clipped(text), complete=len(text) <= OUTPUT_LIMIT if not selector else None)
 
     def write_text(target, text):
         if bridge and bridge.write_enabled:
@@ -1122,7 +1137,8 @@ def workspace_tools(workspace, session, turn=None, mcp=None, *, jobs=None, auto_
                          lambda: jobs.wait(active_turn() or turn))
     if context_history:
         def grep(pattern, path, case=True, skip=None):
-            return clipped(search_history(path, pattern, case, skip, session, context_history))
+            result = search_history(path, pattern, case, skip, session, context_history)
+            return tool_result(clipped(result), {"useless": result == "No matches found."})
 
         tools["grep"] = (f"Search the current branch's raw history with a regular expression. Use {CONTEXT_HISTORY}.",
                          {"pattern": "Regular expression", "path": "Raw history URL, optionally with a line range",
@@ -2607,6 +2623,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 context_windows_enabled and (router.route.catalog_model or {}).get("supportsTools") is not False
                 and CONTEXT_TOOLS <= configured_tools().keys()
             ),
+            supersede_reads=layered_setting(maintenance_layers, "compaction.supersedeReads", True) is not False,
+            drop_useless=layered_setting(maintenance_layers, "compaction.dropUseless", True) is not False,
+            pruning_route=lambda: router.route,
         )
         bound = (router.route, router.credential)
 

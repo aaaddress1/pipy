@@ -205,6 +205,8 @@ def nodes(db, session, leaf, after=0):
 
 def apply_elision(message, edit):
     if isinstance(edit, dict):
+        if "pruned_at" in edit:
+            return {**message, "content": edit["pruned_content"], "_tool_pruned_at": edit["pruned_at"]}
         if saved := message.get("_responses"):
             return {**message, "_responses": {**saved, "prefix": edit["responses_prefix"]}}
         return message

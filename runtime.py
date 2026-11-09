@@ -26,6 +26,7 @@ from model_catalog import RESPONSES_APIS
 from recovery import StreamInterrupted, TRANSPORT_ERRORS
 from shake import AUTO, RESCUE, artifact_id, plan
 from session_artifacts import read_numbered
+from tool_pruning import IDLE_FLUSH_SECONDS, WARM_SUFFIX, prune_plan, without_useless
 
 
 def pack(value):
@@ -678,6 +679,11 @@ class Session:
     def touch(self, db):
         db.execute("UPDATE sessions SET updated = ? WHERE id = ?", (time.time(), self.id))
 
+    def cache_idle(self):
+        with database(self.path) as db:
+            updated, = db.execute("SELECT updated FROM sessions WHERE id=?", (self.id,)).fetchone()
+        return time.time() - updated >= IDLE_FLUSH_SECONDS
+
     def last_route(self, primary):
         with database(self.path) as db:
             return graph.last_route(db, self.id, self.leaf, primary)
@@ -851,7 +857,7 @@ class Compaction:
         self, session, window, percent, keep_recent, summarize, executor, methods=("native", "shake", "soft"),
         native_compact=None, on_context_change=None, prepare_handoff=None, context_discount=None, disable_inline=None,
         on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True, mid_turn_enabled=True,
-        budget=None, context_windows=None,
+        budget=None, context_windows=None, supersede_reads=True, drop_useless=True, pruning_route=None,
     ):
         self.session = session
         self.window = window
@@ -860,6 +866,8 @@ class Compaction:
         self.async_enabled = async_enabled
         self.mid_turn_enabled = mid_turn_enabled
         self.context_windows = context_windows or (lambda: False)
+        self.supersede_reads, self.drop_useless = supersede_reads, drop_useless
+        self.pruning_route = pruning_route or (lambda: None)
         self.context_reminder = None
         self.threshold = self.budget.trigger(window)
         self.summarize = summarize
@@ -972,13 +980,64 @@ class Compaction:
     def snapshot(self, estimated):
         if (cut := self.cut_index()) is None:
             return None
-        prefix = [portable_message(message) for _, batch in self.session.batches[:cut] for message in batch]
+        discarded = [message for _, batch in self.session.batches[:cut] for message in batch]
+        prefix = [portable_message(message) for message in without_useless(discarded)]
         payload = pack({"previous_summary": self.session.summary, "discarded_messages": prefix})
         return Snapshot(self.session.first_kept, self.session.batches[cut][0], estimated, payload,
                         self.session.navigation_epoch, self.session.leaf)
 
     def shake_for_body_read_timeout(self, check=None, replay_prefixes=None):
         return self.shake(AUTO, tool_results_only=True, check=check, replay_prefixes=replay_prefixes)
+
+    def prune_tool_results(self, *, cold_check=False):
+        if not self.session.batches or self.context_windows():
+            return
+        stale = self.supersede_reads or self.drop_useless
+        bulk = bool(not cold_check and self.auto_enabled and self.methods)
+        if not (stale or bulk) or cold_check and (self.session.can_continue() or not self.session.cache_idle()):
+            return
+        route = self.pruning_route()
+        model = (route.catalog_model or {}) if route else {}
+        anthropic = route and route.api == "anthropic-messages"
+        lookback = model.get("promptCacheLookback") or (20 if anthropic else None)
+        if type(lookback) is not int or lookback <= 0:
+            lookback = None
+        prefix_bound = (model.get("thinking") or {}).get("prefixBinding") is True
+        if anthropic and not prefix_bound:
+            prefix_bound = any(
+                part.get("type") in ("thinking", "redacted_thinking")
+                for _, batch in self.session.batches for message in batch
+                for part in (message.get("_anthropic") or {}).get("blocks", ())
+            )
+        warm_limit = 0 if prefix_bound else WARM_SUFFIX
+        cancellation = active_turn()
+
+        def apply(*, bulk=False, limit=warm_limit):
+            edits, savings = prune_plan(
+                self.session.batches, lambda message: tokens(portable_message(message)),
+                supersede=self.supersede_reads and not bulk, drop_useless=self.drop_useless,
+                bulk=bulk, warm_limit=limit, lookback=lookback,
+            )
+            if not edits:
+                return
+            timestamp = int(time.time() * 1000)
+            replacements = {position: {"pruned_content": notice, "pruned_at": timestamp} for position, notice in edits.items()}
+            self.session.archive_elisions(replacements, {}, check=cancellation.check if cancellation else None)
+            self.on_context_change()
+            self.discard_pending()
+            self.last_cuts.clear()
+            self.threshold_dead_end = None
+            self.native_speculation_failed = False
+            print(f"[pruning: {len(edits)} tool results, ~{savings} tokens reclaimed]", file=sys.stderr)
+
+        with self.session.writer:
+            try:
+                if stale:
+                    apply(limit=None if cold_check else warm_limit)
+                if bulk:
+                    apply(bulk=True)
+            except SQLiteError:
+                print("[pruning: could not persist tool result updates]", file=sys.stderr)
 
     def shake(self, preset, *, tool_results_only=False, check=None, replay_prefixes=None):
         if check:
@@ -1273,14 +1332,14 @@ class Compaction:
             room = int(self.threshold * 0.6) - fixed if self.threshold else None
             return (
                 partial(snap_summary, self.session.archive_route, self.session.archive_shape, self.threshold),
-                (prefix, prior, archive, room),
+                (without_useless(prefix), prior, archive, room),
             )
         summarize = partial(self.summarize, focus=focus) if focus else self.summarize
         if archive or "items" in native:
             payload = json.loads(snapshot.transcript)
             payload["previous_summary"] = snapcompact.plain(archive["text"]) if archive else prior
             payload["discarded_messages"][:0] = [
-                portable_message(message) for _, batch in archived for message in batch
+                portable_message(message) for message in without_useless([msg for _, batch in archived for msg in batch])
             ]
             return with_cancel(summarize, pack(payload))
         return with_cancel(summarize, snapshot.transcript)

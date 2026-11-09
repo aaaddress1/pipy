@@ -9,6 +9,7 @@ from cancellable_http import turn_scope
 from handoff import Cancellation
 from mcp_tools import ExternalToolResult
 from todos import Todos, committed_phases
+from tool_pruning import ReadText
 
 
 class BatchSignal(Cancellation):
@@ -100,10 +101,18 @@ def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cance
                     ran = True
                     if isinstance(output, ExternalToolResult):
                         result.update(content=output.content, _tool_details=output.details, _tool_error=output.is_error)
+                        if not output.is_error and output.details.get("useless") is True:
+                            result["_tool_useless"] = True
                         if output.details.get("op") == "wait" and (waited := output.details.get("waited")):
                             result["_irc_messages"] = waited
                     else:
                         result["content"] = output
+                        if isinstance(output, ReadText):
+                            if output.failed:
+                                result["_tool_error"] = True
+                            if output.complete is not None:
+                                result["_tool_details"] = ({"totalLines": len(output.splitlines())} if output.complete
+                                                           else {"truncation": {"truncated": True}})
             except CancelledError as error:
                 result.update(content=str(error) or "Tool execution was interrupted.", _tool_error=True)
             except Exception as error:
