@@ -3621,10 +3621,12 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     def admitted():
                         nonlocal agent_admitted
                         agent_admitted = True
-                        if initial_memory:
-                            backend.commit(initial_memory)
-                        if on_admitted:
-                            on_admitted()
+                        try:
+                            if initial_memory:
+                                backend.commit(initial_memory)
+                        finally:
+                            if on_admitted:
+                                on_admitted()
                     if goal:
                         goal.begin(task)
                         goal_started = True

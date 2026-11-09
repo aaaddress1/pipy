@@ -369,6 +369,8 @@ uv run mini_pi.py --mode acp --route-config routes.json --model primary
 
 把這組指令設為 ACP 編輯器啟動的 agent 程序。工作目錄由每個 `session/new` 或 `session/load` 請求指定。同一個程序可以同時處理多個 SQLite session。`session/load` 重播作用中歷史，`session/resume` 直接接續。也可列舉、fork 或關閉 session。編輯器可用 `session/cancel` 停止回合，或用 `_session/steering` 注入當前回合。`/compact`、`/handoff` 和 `/continue` 可從 ACP prompt 呼叫。[ACP v1 協定](https://agentclientprotocol.com/protocol/v1/overview)
 
+ACP 的轉向和追問會在寫入工作階段前留在該連線的佇列。配額預檢擋住續跑時，下一次可用的 `session/prompt` 會接手尚未寫入的項目，依序處理轉向和追問。已寫入的項目會保留在工作階段歷史。 [上游配額預檢與續跑](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/non-compaction-retry-policy.md)
+
 如果編輯器在 `initialize` 宣告了檔案或終端能力，對應工具會使用編輯器端的讀寫與終端。Shell 依 ACP 權限回覆執行，取消時會關閉等待中的權限對話。模型和推理設定以本機路由為準。ACP 目前支援預設模式與既有憑證，計畫審批和額外登入流程仍待移植。
 
 ## MCP 工具

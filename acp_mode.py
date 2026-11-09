@@ -7,9 +7,10 @@ import re
 import sys
 from collections import deque
 from concurrent.futures import CancelledError, Future, TimeoutError
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import partial
 from itertools import count
 from pathlib import Path
 from queue import Queue
@@ -20,6 +21,7 @@ from uuid import uuid4
 from filelock import Timeout
 from openai import APIStatusError
 
+from broker_usage import UsagePreflightBlocked
 from cancellable_http import turn_scope
 from cost_gate import CostCapError
 from mcp_oauth import OAuthVault
@@ -199,8 +201,6 @@ class AcpTurn(RpcTurn):
         super().__init__(record, Work({"type": "background" if background else "prompt"}, content), record.server.budget,
                          live_steering=False)
         self.record, self.request_id, self.content = record, request_id, content
-        self.steers = deque()
-        self.follow_ups = deque()
         self.bridge = AcpBridge(self, record.server.capabilities)
         self.active_tool = ContextVar("acp_active_tool", default=None)
         self.permission_lock = Lock()
@@ -211,10 +211,27 @@ class AcpTurn(RpcTurn):
     def steering(self):
         with self.record.lock:
             self.check()
-            return [self.steers.popleft()] if self.steers else []
+            return [self.claim(self.record.steers)] if self.has_steering() else []
 
     def has_steering(self):
-        return bool(self.steers)
+        return not self.background and bool(self.record.steers)
+
+    def claim(self, queue):
+        work = queue.popleft()
+        self.claimed.append(work)
+        return work
+
+    @contextmanager
+    def admission(self, work):
+        with self.record.lock:
+            self.check()
+            yield
+            self.claimed.remove(work)
+
+    def admit(self, work):
+        with self.record.lock:
+            if work in self.claimed:
+                self.claimed.remove(work)
 
     def allow_tool(self, call):
         self.check()
@@ -271,12 +288,14 @@ class AcpSession:
         self.lock = RLock()
         self.turn = self.worker = None
         self.prompts = deque()
+        self.steers, self.follow_ups = deque(), deque()
         self.permissions = {}
         self.closing = False
         self.mcp = None
         self.mcp_notifications = server.mcp_notifications
         self.reconfiguring = False
         self.background_suppressed = False
+        self.usage_paused = False
         self.context = server.open_session(identifier, cwd, self)
         self.handle = self.context.__enter__()
         if not keep_protocol_id:
@@ -343,7 +362,7 @@ class AcpSession:
         self.update("available_commands_update", availableCommands=commands)
 
     def next_background(self):
-        if self.closing or self.reconfiguring or (
+        if self.closing or self.reconfiguring or self.usage_paused or (
             self.server.budget and self.server.budget.is_cancelled()
         ):
             return None
@@ -505,6 +524,8 @@ class AcpSession:
                 self.start_turn(turn)
 
     def start_turn(self, turn):
+        if not turn.background:
+            self.usage_paused = False
         self.turn = turn
         self.worker = Thread(target=self.run, args=(turn,), name=f"mini-pi-acp-{self.id}")
         self.worker.start()
@@ -512,18 +533,23 @@ class AcpSession:
     def run(self, turn):
         while turn:
             stop, error = "end_turn", None
+            queued = None
             try:
                 content = turn.content
                 while True:
                     turn.check()
+                    admit = partial(turn.admit, queued) if queued is not None else None
                     with turn_scope(turn):
-                        self.execute(content, turn)
+                        self.execute(content, turn, on_admitted=admit)
                     with self.lock:
+                        if admit:
+                            admit()
                         turn.check()
-                        if turn.steers:
-                            content = turn.steers.popleft()
-                        elif turn.follow_ups:
-                            content = turn.follow_ups.popleft()
+                        queue = (self.steers or self.follow_ups) if not turn.background else None
+                        queued = None
+                        if queue:
+                            queued = turn.claim(queue)
+                            content = queued.content
                         elif (not self.prompts and turn.compaction_next
                               and (continuation := turn.compaction_next())):
                             content = continuation
@@ -552,12 +578,19 @@ class AcpSession:
             with self.lock:
                 if turn.is_cancelled():
                     stop, error = "cancelled", None
+                elif isinstance(error, UsagePreflightBlocked):
+                    self.usage_paused = True
+                    if turn.message_id or turn.background:
+                        self.notice(str(error))
+                        error = None
+                    else:
+                        error = AcpError(str(error), -32000)
                 elif error and turn.message_id:
                     self.chunk("agent_message_chunk", text_block(str(error)), turn.message_id)
                     error = None
                 turn = self.finish(turn, stop, error)
 
-    def execute(self, content, turn):
+    def execute(self, content, turn, *, on_admitted=None):
         if isinstance(content, str):
             command, _, focus = content.partition(" ")
             if command in ("/compact", "/handoff"):
@@ -567,11 +600,17 @@ class AcpSession:
                 return
             if content == "/continue":
                 content = None
-        self.handle.run_task(content, turn)
+        self.handle.run_task(content, turn, on_admitted=on_admitted)
 
     def finish(self, turn, stop, error=None):
+        for work in reversed(turn.claimed):
+            queue = self.follow_ups if work.command["type"] == "followUp" else self.steers
+            queue.appendleft(work)
+        turn.claimed.clear()
         self.reply_to_prompt(turn, stop, error)
         self.turn = self.prompts.popleft() if self.prompts else self.next_background()
+        if self.turn and not self.turn.background:
+            self.usage_paused = False
         return self.turn
 
     def reply_to_prompt(self, turn, stop, error=None):
@@ -603,12 +642,12 @@ class AcpSession:
                     return {"outcome": "failed", "reason": f"{words[0]} requires an idle session."}
             if self.mcp and self.mcp.is_prompt_command(content):
                 return {"outcome": "failed", "reason": "MCP prompt commands require a new turn."}
-            (turn.follow_ups if queue == "followUp" else turn.steers).append(content)
+            (self.follow_ups if queue == "followUp" else self.steers).append(Work({"type": queue}, content))
             return {"outcome": "injected", "queue": queue}
 
     def cancel(self, *, user=True):
         with self.lock:
-            if self.turn or self.prompts:
+            if self.turn or self.prompts or self.steers or self.follow_ups:
                 self.background_suppressed = True
             if self.turn:
                 self.cancel_turn(self.turn, user=user)
@@ -678,7 +717,7 @@ class AcpServer:
                     turn.check()
                     if interrupt_on_steer:
                         with turn.record.lock:
-                            if turn.steers:
+                            if turn.has_steering():
                                 raise PermissionInterrupted()
                 if self.disconnected.is_set():
                     raise OSError("The ACP client disconnected.")
