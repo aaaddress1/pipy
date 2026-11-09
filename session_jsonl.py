@@ -17,11 +17,11 @@ import session_graph as graph
 from runtime import database, initialize, pack, responses_replacement_tokens
 from session_artifacts import PIPY_ARTIFACT, copy_sidecar, install_sidecar, sidecar, stored_artifacts
 from session_blobs import hydrate_images
+from session_exit import pending_result, placeholder
 from shake import artifact_id, block_ranges, tool_text
 from snapcompact_inline import is_failed
 
 
-MISSING_RESULT = "Interrupted before result was recorded. Check workspace state before repeating this action."
 VERSION = 3
 TITLE_BYTES = 256
 SHAKE_REFERENCE = re.compile(r"\[shaken ~[0-9]+ tokens — recover: artifact://([a-f0-9]{64})\]")
@@ -285,6 +285,11 @@ def import_message(entry):
             result["_thinking"] = "\n".join(reasoning)
         if native := source_anthropic_turn(message):
             result["_anthropic_import"] = native
+        if message.get("stopReason") in ("aborted", "error", "length"):
+            result["_rpc"] = {key: message[key] for key in ("api", "provider", "model", "stopReason", "errorMessage")
+                              if key in message}
+            if calls and message["stopReason"] == "length":
+                result["_tool_stop"] = "length"
         if not calls and message.get("stopReason") == "stop" and mapping(message.get("stopDetails")).get("type") == "pause_turn":
             result["_stop_details"] = {"type": "pause_turn"}
         if isinstance(message.get("inputTransformations"), list):
@@ -627,9 +632,7 @@ def import_journal(db_path, workspace, source, *, session_id=None, replace=False
                 if message["role"] == "tool":
                     message = {"role": "developer", "content": "Orphaned tool result:\n" + plain_text(message["content"])}
                 tool_calls = message.get("tool_calls", ())
-                batch = [message, *[
-                    {"role": "tool", "tool_call_id": call["id"], "content": MISSING_RESULT} for call in tool_calls
-                ]]
+                batch = [message, *map(placeholder, tool_calls)]
                 node, last = insert_batch(db, session, parent, batch)
                 if message["role"] in ("assistant", "user"):
                     calls = {call["id"]: (last, index) for index, call in enumerate(tool_calls, 1)}
@@ -841,12 +844,6 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
     }
     used_ids = {identifier for identifier, _ in sources.values()}
     index = 0
-    pending_imports = {
-        json.loads(data)[0] for data, in db.execute(
-            "SELECT payload FROM session_nodes WHERE session = ? AND kind = 'tool_update'", (session,),
-        )
-    }
-
     def make(record, parent, source=None, *, todo_entry=None):
         nonlocal index
         if source:
@@ -900,8 +897,7 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
         if kind == "batch":
             raw, = db.execute("SELECT messages FROM batches WHERE session = ? AND seq = ?", (session, seq)).fetchone()
             batch = json.loads(raw)
-            if seq in pending_imports or identifier in sources:
-                batch = [item for item in batch if item["role"] != "tool"]
+            batch = [item for item in batch if not pending_result(item)]
             for number, message in enumerate(batch):
                 record = export_message(message, call_names)
                 if payload and payload.get("timestamp"):

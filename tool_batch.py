@@ -97,6 +97,7 @@ def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cance
                 elif turn and not turn.allow_tool(call):
                     result["content"] = "Error: Tool execution was declined by the client."
                 else:
+                    session.record_tool_start(call)
                     output = call_tool(call)
                     ran = True
                     if isinstance(output, ExternalToolResult):

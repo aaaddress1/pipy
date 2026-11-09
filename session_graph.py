@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from memory_transcript import user_turns
+from session_exit import pending_result
 
 
 SCHEMA = """
@@ -276,12 +277,13 @@ def stored_batches(db, session, leaf, start=0, before=None, *, apply_elisions=Tr
     by_seq = dict(batches)
     for kind, data in db.execute(ANCESTORS + """
         SELECT n.kind,n.payload FROM ancestry a JOIN session_nodes n ON n.id = a.id
-        WHERE n.kind = 'tool_update' OR (? AND n.kind = 'elision') ORDER BY n.id
-    """, (leaf, session, session, apply_elisions)):
+        WHERE (n.kind = 'tool_update' AND json_extract(n.payload,'$[0]') >= ?
+            AND (? IS NULL OR json_extract(n.payload,'$[0]') < ?)) OR (? AND n.kind = 'elision') ORDER BY n.id
+    """, (leaf, session, session, start, before, before, apply_elisions)):
         if kind == "tool_update":
             seq, index, message = json.loads(data)
-            if seq in by_seq and 0 <= index < len(by_seq[seq]):
-                by_seq[seq][index] = message
+            if seq in by_seq and 0 <= index <= len(by_seq[seq]):
+                by_seq[seq][index:index + 1] = [message]
         else:
             for seq, index, edit in json.loads(data):
                 if seq in by_seq and 0 <= index < len(by_seq[seq]):
@@ -306,7 +308,7 @@ def repair_fork_tail(db, session, leaf):
     answered = set()
     for seq, batch in reversed(stored_batches(db, session, leaf, start, apply_elisions=False)):
         for message in reversed(batch):
-            if message["role"] == "tool":
+            if message["role"] == "tool" and not pending_result(message):
                 answered.add(message.get("tool_call_id"))
             if message["role"] != "assistant":
                 continue
@@ -316,15 +318,18 @@ def repair_fork_tail(db, session, leaf):
                 content = ("Tool call was not executed because the assistant reached its output limit. "
                            "Split the work into smaller tool calls." if limited else
                            "The parent session may still be running this tool; its outcome is unknown.")
-                raw, = db.execute("SELECT messages FROM batches WHERE session = ? AND seq = ?", (session, seq)).fetchone()
-                original = json.loads(raw)
+                positions = {item.get("tool_call_id"): index for index, item in enumerate(batch) if pending_result(item)}
+                next_index = len(batch)
                 for call_id in missing:
                     result = {"role": "tool", "tool_call_id": call_id, "content": content, "_tool_error": True}
                     if limited:
                         result["_tool_details"] = {"__synthetic": True, "source": "assistant_stop_length", "executed": False}
-                    original.append(result)
-                db.execute("UPDATE batches SET messages = ? WHERE session = ? AND seq = ?", (encode(original), session, seq))
-            return
+                    position = positions.get(call_id, next_index)
+                    if position == next_index:
+                        next_index += 1
+                    leaf = append(db, session, leaf, "tool_update", payload=[seq, position, result])
+            return leaf
+    return leaf
 
 
 def checkpoint(db, session, leaf):

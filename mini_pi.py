@@ -73,6 +73,7 @@ from eval_speculation import EvalSpeculation
 import rpc_mode
 from rpc_session import SessionRpc
 import session_jsonl
+import session_exit as exit_log
 import snapcompact
 import subagents
 import task_isolation
@@ -222,7 +223,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     ):
         append_input(prelude)
         force_todo = todo.eager == "always" and not (isinstance(task, dict) and task.get("_goal_message"))
-    if goal and not goal_steer and not (isinstance(task, dict) and task.get("_goal_message")):
+    replay = session.tool_replay if task is None else None
+    if goal and not replay and not goal_steer and not (isinstance(task, dict) and task.get("_goal_message")):
         with turn.server.lock if turn else nullcontext():
             if (task is not None or session.can_continue()) and (context := goal.context()):
                 append_input(context)
@@ -241,11 +243,51 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     phase = "pre"
     inline_compaction_continuation = False
 
+    def run_tool_step(seq, batch, active_tools, skipped, wire):
+        assistant, calls = batch[0], batch[0]["tool_calls"]
+        if skipped:
+            tool_results, completed = [], set()
+            if turn:
+                for call, result in zip(calls, batch[1:]):
+                    turn.tool_start(call)
+                    turn.tool_finished(call, result)
+                    tool_results.append(turn.publish(result))
+        else:
+            if child and child.yields and any(call["function"]["name"] == "yield" for call in calls):
+                child.yield_context(assistant, session, seq)
+            tool_results, completed = execute_tool_batch(
+                session, seq, batch, active_tools, tool_workers, partial(run_tool, active_tools, turn=turn, speculation=speculation),
+                turn=turn, cancellation=cancellation, child=child, jobs=jobs,
+                on_result=todo.tool_finished if todo else None,
+            )
+        if on_tools:
+            on_tools(len(completed))
+        if goal and (limit := goal.tools(batch)):
+            append_input(limit)
+        if speculation:
+            speculation.discard()
+        if turn:
+            turn.server.event("turn_end", message=wire, toolResults=tool_results)
+        if cancellation:
+            cancellation.check()
+        return completed
+
+    if replay:
+        seq, batch = replay
+        session.tool_replay = None
+        if cancellation:
+            cancellation.check()
+        active_tools = tools()
+        run_tool_step(seq, batch, active_tools, False, turn.response(batch[0]) if turn else None)
+        phase = "mid"
+        if goal and (context := goal.context()):
+            append_input(context)
     if turn:
         for extra in turn.works[1:]:
             admitted_input = append_input(extra if terminal_turn else extra.content, queued=True) or admitted_input
     if not admitted_input:
         return None
+
     for _ in steps:
         if cancellation:
             cancellation.check()
@@ -322,13 +364,11 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         batch = [assistant, *[
             {
                 "role": "tool", "tool_call_id": call["id"],
-                "content": ("Tool call was not executed because the assistant reached its output limit. "
-                            "Split the work into smaller tool calls." if skipped else
-                            "Interrupted before result was recorded. Check workspace state before repeating this action."),
+                "content": "Tool call was not executed because the assistant reached its output limit. "
+                           "Split the work into smaller tool calls.",
                 "_tool_error": True,
-                **({"_tool_details": {"__synthetic": True, "source": "assistant_stop_length", "executed": False}}
-                   if skipped else {}),
-            }
+                "_tool_details": {"__synthetic": True, "source": "assistant_stop_length", "executed": False},
+            } if skipped else exit_log.placeholder(call)
             for call in calls
         ]]
         seq = session.append(batch)
@@ -404,31 +444,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 append_input(reminder)
                 continue
             return assistant["content"]
-        if skipped:
-            tool_results, completed = [], set()
-            if turn:
-                for call, result in zip(calls, batch[1:]):
-                    turn.tool_start(call)
-                    turn.tool_finished(call, result)
-                    tool_results.append(turn.publish(result))
-        else:
-            if child and child.yields and any(call["function"]["name"] == "yield" for call in calls):
-                child.yield_context(assistant, session, seq)
-            tool_results, completed = execute_tool_batch(
-                session, seq, batch, active_tools, tool_workers, partial(run_tool, active_tools, turn=turn, speculation=speculation),
-                turn=turn, cancellation=cancellation, child=child, jobs=jobs,
-                on_result=todo.tool_finished if todo else None,
-            )
-        if on_tools:
-            on_tools(len(completed))
-        if goal and (limit := goal.tools(batch)):
-            append_input(limit)
-        if speculation:
-            speculation.discard()
-        if turn:
-            turn.server.event("turn_end", message=wire, toolResults=tool_results)
-        if cancellation:
-            cancellation.check()
+        completed = run_tool_step(seq, batch, active_tools, skipped, wire)
         reminders = [hit for index, call in enumerate(calls) if matched and index in completed
                      for hit in matched.tool_hits.get(call["id"], {}).values()]
         if reminders:
@@ -1299,7 +1315,22 @@ def locked_agent_session(state, session_id, workspace, *, child=False, protect_m
                 locks.close()
                 session = load(fork)
                 print(f"[resumed moved session {session_id} as fork {fork}]", file=sys.stderr)
-        yield session
+        exit_kind, exit_reason = "normal", "dispose"
+        try:
+            yield session
+        except (StepLimitReached, CancelledError):
+            raise
+        except KeyboardInterrupt:
+            exit_kind, exit_reason = "signal", "SIGINT"
+            raise
+        except BaseException:
+            exit_kind, exit_reason = "fatal", "exception"
+            raise
+        finally:
+            try:
+                session.record_exit(exit_kind, exit_reason)
+            except (OSError, SQLiteError):
+                pass
 
 
 @contextmanager
@@ -1484,6 +1515,15 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         primary_candidates=getattr(args, "primary_candidates", ()),
                         role_hint=getattr(args, "model_role_hint", None), secrets=getattr(args, "config_secrets", None),
                         fixed_primary=bool(getattr(args, "per_call_guard", None)))
+        assume_exit = bool(getattr(args, "restore", None) and not child and not getattr(args, "internal_session_switch", False))
+        seq, tail_batch, _ = session.conversation_tail()
+        if not child and (pending := session.pending_tools(seq, tail_batch)):
+            tools_pending = ", ".join(f"{item['toolName']} ({item['toolCallId']})" for item in pending)
+            print(f"[Previous session ended with pending tool calls: {tools_pending}. Outcomes may be unknown.]", file=sys.stderr)
+        model = {"_rpc": rpc_mode.model_metadata(router.route, None)}
+        restore_pending = session.recover_interrupted(assume_exit=assume_exit, model=model) and assume_exit
+        if restore_pending:
+            session.prepare_tool_replay()
         session.restore_portable(router.route)
         budget = context_policy.for_route(router.route)
         session.configure_archive(router.route, args.snapcompact_shape, budget.trigger(router.route.window))
@@ -3726,7 +3766,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     apply_saved_rule,
                 )
                 try:
-                    if loop := getattr(args, "pending_loop", None):
+                    if restore_pending:
+                        terminal_lane.submit(TerminalWork(None, expand_prompt=False))
+                    elif loop := getattr(args, "pending_loop", None):
                         del args.pending_loop
                         if loop.expired():
                             print(TIME_REACHED, file=sys.stderr)
@@ -4361,6 +4403,7 @@ def main():
     parser.add_argument("--max-cost", type=positive_usd, help="refuse new model requests after reaching this amount in USD")
     sessions = parser.add_mutually_exclusive_group()
     sessions.add_argument("--session", type=UUID, help="resume a session UUID")
+    sessions.add_argument("--restore", type=UUID, help="open an existing session and recover its interrupted turn")
     sessions.add_argument("--fork", help="fork a session UUID or an oh-my-pi journal before starting")
     sessions.add_argument("--import-jsonl", type=Path, help="import an oh-my-pi journal into a new session")
     parser.add_argument("--export-jsonl", type=Path, help="export the selected session and exit")
@@ -4411,6 +4454,9 @@ def main():
         parser.error("MCP notification debounce must be nonnegative")
     if args.mode != "interactive" and (args.task is not None or args.continue_session or args.export_jsonl):
         parser.error(f"--mode {args.mode} accepts prompts on stdin")
+    if args.restore and (args.mode != "interactive" or args.task is not None or args.continue_session
+                         or args.goal is not None or args.export_jsonl or not (sys.stdin.isatty() and sys.stdout.isatty())):
+        parser.error("--restore requires an interactive terminal, an existing session UUID and no prompt")
     if args.goal is not None:
         if not args.goal.strip():
             parser.error("--goal requires a non-empty objective")
@@ -4470,7 +4516,14 @@ def main():
         elif fork_id:
             session_id = fork_on_start(state, workspace, fork_id)
         else:
-            session_id = str(args.session or uuid4())
+            session_id = str(args.restore or args.session or uuid4())
+            if args.restore:
+                path = state / "sessions.sqlite3"
+                if not path.is_file():
+                    raise ValueError("Session to restore does not exist.")
+                with database(path) as db:
+                    if db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
+                        raise ValueError("Session to restore does not exist.")
         if output:
             export_on_exit(state, session_id, output)
             print(output)

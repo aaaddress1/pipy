@@ -16,6 +16,7 @@ from uuid import uuid4
 from openai import APIStatusError
 
 import handoff
+import session_exit as exit_log
 import session_graph as graph
 from context_tokens import ContextCounter
 from service_runtime import SCHEMA as SERVICE_SCHEMA
@@ -74,7 +75,8 @@ def portable_message(message, thinking_route=None):
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
-               "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment", "_compaction_continue")
+               "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment", "_compaction_continue",
+               "_tool_pending")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -181,6 +183,7 @@ class Session:
         self.archive_images_disabled = False
         self.navigation_epoch = 0
         self.fresh_provider_id = None
+        self.tool_replay = None
         self.timestamp_batches = False
         self._context_notes = self._rollover_request = UNREAD
         with database(path) as db:
@@ -238,11 +241,11 @@ class Session:
                 whole=target is None,
             )
             if repair_tail:
-                graph.repair_fork_tail(db, new_id, leaf)
+                leaf = graph.repair_fork_tail(db, new_id, leaf)
             for message in messages:
                 seq = db.execute("INSERT INTO batches(session,messages) VALUES (?,?)", (new_id, pack([message]))).lastrowid
                 leaf = graph.append(db, new_id, leaf, "batch", seq, graph.batch_payload([message]))
-            if messages:
+            if messages or repair_tail:
                 graph.set_head(db, new_id, leaf)
 
     def label(self, target, name):
@@ -295,6 +298,7 @@ class Session:
         self.native_summary, self.batches = native, batches
         self.reset_node, self.transcript_start, self.prompt_cache_key = reset_node, start, cache_key
         self.fresh_provider_id = None
+        self.tool_replay = None
         self._archive_view = None
         self.navigation_epoch += 1
         self._context_notes = self._rollover_request = UNREAD
@@ -317,6 +321,7 @@ class Session:
         self.first_kept = self.transcript_start = last + 1
         self.prompt_cache_key = cache_key
         self.fresh_provider_id = None
+        self.tool_replay = None
         self.summary, self.native_summary, self.batches = "", None, []
         self._archive_view = None
         self.archive_images_disabled = False
@@ -495,14 +500,109 @@ class Session:
                               AND json_extract(payload, '$.agentAttemptId') = ?""",
                            ((reason, owner.id, self.id, identifier) for owner in ancestors))
 
+    @session_write
     def update_tool_result(self, seq, index, message):
         with database(self.path) as db:
-            db.execute(
-                "UPDATE batches SET messages = json_set(messages, ?, json(?)) WHERE session = ? AND seq = ?",
-                (f"$[{index}]", pack(message), self.id, seq),
-            )
+            leaf = graph.append(db, self.id, self.leaf, "tool_update", payload=[seq, index, message])
+            graph.set_head(db, self.id, leaf)
             self.consume_notifications(db, [message])
             self.touch(db)
+        self.leaf = leaf
+        for batch_seq, batch in reversed(self.batches):
+            if batch_seq == seq:
+                batch[index] = message
+                break
+
+    def record_tool_start(self, call):
+        self.record_metadata(exit_log.custom(exit_log.TOOL_START, exit_log.tool_start(call)))
+
+    def conversation_tail(self):
+        return next(((seq, batch, message) for seq, batch in reversed(self.batches) for message in reversed(batch)
+                     if message["role"] in ("user", "assistant", "tool") and not any(
+                         key in message for key in ("_goal_message", "_async_jobs", "_mcp_notification", "_service_runs")
+                     )), (None, (), None))
+
+    def pending_tools(self, seq, batch):
+        pending = {item["tool_call_id"] for item in batch if exit_log.pending_result(item)}
+        if not pending:
+            return []
+        with database(self.path) as db:
+            rows = db.execute(graph.ANCESTORS + """
+                SELECT json_extract(n.payload,'$.data') FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                WHERE n.kind='foreign' AND json_extract(n.payload,'$.customType')=?
+                AND n.id > (SELECT id FROM session_nodes WHERE session=? AND kind='batch' AND batch=?) ORDER BY n.id
+            """, (self.leaf, self.id, self.id, exit_log.TOOL_START, self.id, seq))
+            starts = {item["toolCallId"]: item for raw, in rows if isinstance(item := json.loads(raw or "null"), dict)
+                      and isinstance(item.get("toolCallId"), str)}
+        return [starts.get(call["id"], {"toolCallId": call["id"], "toolName": call["function"]["name"]})
+                for call in batch[0].get("tool_calls", ()) if call["id"] in pending]
+
+    @session_write
+    def record_exit(self, kind, reason):
+        seq, batch, tail = self.conversation_tail()
+        pending = self.pending_tools(seq, batch)
+        if tail is None or kind == "normal" and not pending and not any(
+            message["role"] == "assistant" for _, items in self.batches for message in items
+        ):
+            return
+        data = {"reason": reason, "kind": kind, "recordedAt": exit_log.timestamp()}
+        if pending:
+            data["pendingToolCalls"] = pending
+        self.record_metadata(exit_log.custom(exit_log.SESSION_EXIT, data))
+
+    @session_write
+    def recover_interrupted(self, *, assume_exit=False, model=None):
+        seq, batch, tail = self.conversation_tail()
+        if tail is None:
+            return False
+        with database(self.path) as db:
+            row = db.execute(graph.ANCESTORS + """
+                SELECT json_extract(n.payload,'$.data') FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                WHERE n.kind='foreign' AND json_extract(n.payload,'$.customType')=?
+                AND n.id > (SELECT id FROM session_nodes WHERE session=? AND kind='batch' AND batch=?)
+                AND n.id > coalesce((SELECT max(update_node.id) FROM ancestry path
+                    JOIN session_nodes update_node ON update_node.id=path.id
+                    WHERE update_node.kind='tool_update' AND json_extract(update_node.payload,'$[0]')=?),0)
+                ORDER BY n.id DESC LIMIT 1
+            """, (self.leaf, self.id, self.id, exit_log.SESSION_EXIT, self.id, seq, seq)).fetchone()
+        recorded = json.loads(row[0] or "null") if row else None
+        if not isinstance(recorded, dict) or recorded.get("kind") not in ("normal", "signal", "fatal", "process_exit"):
+            recorded = None
+        if recorded and recorded["kind"] == "normal" and not recorded.get("pendingToolCalls"):
+            return False
+        if exit_log.interrupted(tail):
+            return assume_exit
+        if not recorded and not assume_exit or tail["role"] == "assistant" and not tail.get("tool_calls"):
+            return False
+        previous = next((item for _, items in reversed(self.batches) for item in reversed(items)
+                         if item["role"] == "assistant"), None)
+        if tail["role"] == "tool" and previous and exit_log.stop_reason(previous) in ("error", "aborted"):
+            return False
+        for index, item in enumerate(batch):
+            if exit_log.pending_result(item):
+                self.update_tool_result(seq, index, {"role": "tool", "tool_call_id": item["tool_call_id"],
+                    "content": exit_log.UNKNOWN_RESULT, "_tool_error": True})
+        self.append([exit_log.abort_message(recorded.get("recordedAt") if recorded else exit_log.timestamp(),
+                                           previous if previous and previous.get("_rpc") else model)])
+        return not assume_exit or not recorded or recorded["kind"] != "normal"
+
+    @session_write
+    def prepare_tool_replay(self):
+        if len(self.batches) < 2 or len(self.batches[-1][1]) != 1 or not exit_log.interrupted(self.batches[-1][1][0]):
+            return False
+        seq, batch = self.batches[-2]
+        calls = exit_log.runnable_calls(batch[0])
+        if not calls or len(batch) != len(calls) + 1 or {item.get("tool_call_id") for item in batch[1:]
+                if item.get("_tool_error") is True} != {call["id"] for call in calls}:
+            return False
+        with database(self.path) as db:
+            row = db.execute("""SELECT n.id,b.messages FROM session_nodes n JOIN batches b ON n.batch=b.seq
+                              WHERE n.session=? AND n.kind='batch' AND n.batch=?""", (self.id, seq)).fetchone()
+        if row is None or not all(exit_log.pending_result(item) for item in json.loads(row[1])[1:]):
+            return False
+        self.navigate(row[0])
+        self.tool_replay = self.batches[-1]
+        return True
 
     def consume_notifications(self, db, messages):
         ids = {row["id"] for message in messages for row in message.get("_irc_messages", ())}
@@ -632,13 +732,18 @@ class Session:
             _, start = graph.transcript_boundary(db, self.id, leaf)
             parents = {owner for owner, in db.execute("SELECT owner FROM subagent_links WHERE child=?", (self.id,))}
             rows = db.execute(graph.ANCESTORS + """
-                SELECT b.seq,j.key,j.value FROM ancestry a JOIN session_nodes n ON n.id=a.id
-                JOIN batches b ON b.session=n.session AND b.seq=n.batch JOIN json_each(b.messages) j
-                WHERE b.seq>=? AND (json_extract(j.value,'$.role')='user'
-                    OR json_type(j.value,'$._parent_assignment')='true'
-                    OR json_type(j.value,'$._irc_messages')='array')
-                ORDER BY b.seq DESC,j.key DESC
-            """, (leaf, self.id, self.id, start))
+                , candidates(seq, position, message) AS (
+                    SELECT b.seq,j.key,j.value FROM ancestry a JOIN session_nodes n ON n.id=a.id
+                    JOIN batches b ON b.session=n.session AND b.seq=n.batch JOIN json_each(b.messages) j
+                    WHERE b.seq>=? AND (json_extract(j.value,'$.role')='user'
+                        OR json_type(j.value,'$._parent_assignment')='true'
+                        OR json_type(j.value,'$._irc_messages')='array')
+                    UNION ALL
+                    SELECT json_extract(n.payload,'$[0]'),json_extract(n.payload,'$[1]'),json_extract(n.payload,'$[2]')
+                    FROM ancestry a JOIN session_nodes n ON n.id=a.id WHERE n.kind='tool_update'
+                    AND json_extract(n.payload,'$[0]')>=? AND json_type(n.payload,'$[2]._irc_messages')='array'
+                ) SELECT seq,position,message FROM candidates ORDER BY seq DESC,position DESC
+            """, (leaf, self.id, self.id, start, start))
             for seq, position, raw in rows:
                 message = json.loads(raw)
                 user = message["role"] == "user" and not any(message.get(key) for key in (
@@ -782,7 +887,7 @@ class Session:
 
     def can_continue(self):
         message = next((message for _, batch in reversed(self.batches) for message in reversed(batch)
-                        if "_session_transfer" not in message), None)
+                        if "_session_transfer" not in message and not exit_log.cutoff(message)), None)
         if message is None and (covered := (self.native_summary or {}).get("replay_through")):
             with database(self.path) as db:
                 batches = self.read_batches(db, covered, covered + 1)
@@ -834,7 +939,8 @@ class Session:
             if message["role"] == "developer" else (message if include_native else portable_message(message, thinking_route))
             for seq, batch in self.batches if seq >= cut and (before is None or seq < before)
             for message in batch
-            if include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak"))
+            if not exit_log.cutoff(message)
+            and (include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak")))
         ]
         if (notes := self.context_notes()) and notes["text"]:
             insert = 1
