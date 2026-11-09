@@ -114,7 +114,7 @@ uv run mini_pi.py ttsr scan src --json
 
 在互動終端輸入 `/loop 3 review the failing tests`，會先送出提示，再自動重送最多三次。可用 `10m` 或 `1h30m` 改設時間上限。省略提示時，迴圈會等下一次手動送出。按 `Esc` 暫停，手動送出新提示可接續並替換重送內容。再輸入 `/loop` 關閉。 [上游排程與暫停](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/interactive-mode.ts#L3303)
 
-`/loop 10 --until 'pytest -q' fix the failing tests` 在每次重送前執行條件。`--until` 在退出碼 `0` 時停止，`--while` 在退出碼 `1` 時停止。其他退出碼和逾時會報錯並停止。首輪直接執行。`loop.conditionTimeoutMs` 預設 `30000`，`0` 代表無限期等待。使用 Bash 或其他支援的 POSIX shell 時，同一會話會保留條件 shell 的變數和函式，每次檢查從會話工作目錄開始。取消、逾時或退出 shell 會重建條件 shell。PowerShell 和 `cmd.exe` 等其他 shell 每次檢查會各自啟動。 [上游條件判定](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/loop-condition.ts)
+`/loop 10 --until 'pytest -q' fix the failing tests` 在每次重送前執行條件。`--until` 在退出碼 `0` 時停止，`--while` 在退出碼 `1` 時停止。其他退出碼和逾時會報錯並停止。首輪直接執行。`loop.conditionTimeoutMs` 預設 `30000`，`0` 代表無限期等待。使用 Bash 或其他支援的 POSIX shell 時，同一會話會保留條件 shell 的變數和函式，每次檢查從會話工作目錄開始。Bash 的頂層 `exit` 或 `set -e` 結束檢查後，下次可恢復變數、函式與選項。函式內退出或自訂 `EXIT` trap 可能使 Bash 直接重建。取消、逾時或切換會話會清除條件 shell 的狀態。PowerShell 和 `cmd.exe` 等其他 shell 每次檢查會各自啟動。 [上游條件判定](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/loop-condition.ts)
 
 `loop.mode` 可設為 `prompt`、`compact` 或 `reset`，依序表示直接重送、手動壓縮後重送、開新會話後重送。`/loop` 開啟期間會暫停 `/goal` 的自動接續。 [上游重送模式](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/settings.ts#L992)
 

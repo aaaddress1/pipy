@@ -28,6 +28,12 @@ TIME_REACHED = "Loop time limit reached. Loop mode disabled."
 WORD = re.compile(r'''(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"\\]|\\$)+''', re.DOTALL)
 POSIX_SHELLS = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
 OUTPUT_PREVIEW_BYTES = 8192
+BASH_INTERNAL = set(b"""BASH BASHOPTS BASHPID BASH_ALIASES BASH_ARGC BASH_ARGV BASH_CMDS BASH_COMMAND
+BASH_EXECUTION_STRING BASH_LINENO BASH_REMATCH BASH_SOURCE BASH_SUBSHELL BASH_VERSINFO BASH_VERSION
+DIRSTACK EPOCHREALTIME EPOCHSECONDS EUID FUNCNAME GROUPS LINENO PIPESTATUS PPID PWD RANDOM SECONDS
+SHELLOPTS SHLVL SRANDOM UID _""".split())
+DECLARATION = re.compile(rb"declare -[A-Za-z-]+ ([A-Za-z_][A-Za-z_0-9]*)(?:=|$)")
+CHECKPOINT_END = b"# pipy checkpoint complete\n"
 
 
 def positive(value, message):
@@ -126,6 +132,7 @@ class ConditionShell:
         self.workspace, self.configured, self.environment = Path(workspace), configured, environment
         self.run_once = run_once
         self.process = None
+        self.resume = None
         self.lock = Lock()
 
     def __call__(self, command, output, cancel, timeout):
@@ -156,31 +163,73 @@ class ConditionShell:
         finally:
             self.lock.release()
 
-    def start(self, argv):
+    def start(self, argv, restore):
         if self.process and self.process.poll() is None:
             return self.process
-        self.close()
+        if self.process:
+            self.close()
         group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
                  if os.name == "nt" else {"start_new_session": True})
+        environment = shell_environment(argv, self.environment)
+        launch = argv[:-2]
+        if restore:
+            # A restored shell already has the profile's state. Don't execute startup commands twice.
+            environment = {name: value for name, value in environment.items()
+                           if name not in ("BASH_ENV", "BASHOPTS", "SHELLOPTS") and not name.startswith("BASH_FUNC_")}
+            launch = [argv[0], "--noprofile", "--norc"]
         self.process = subprocess.Popen(
-            [*argv[:-2], "-s"], cwd=self.workspace, env=shell_environment(argv, self.environment),
+            [*launch, "-s"], cwd=self.workspace, env=environment,
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0, **group,
         )
         return self.process
 
+    def checkpoint(self, variables, state):
+        if not state.is_file() or not (definitions := state.read_bytes()).endswith(CHECKPOINT_END):
+            return None
+        saved = {}
+        for line in variables.read_bytes().split(b"\n"):
+            if (match := DECLARATION.match(line)) and match[1] not in BASH_INTERNAL:
+                saved[match[1]] = line + b"\n"
+        # A condition can unset a variable it inherited from the parent environment.
+        inherited = (name.encode() for name in self.environment if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name))
+        unset = sorted(set(inherited) - BASH_INTERNAL - saved.keys())
+        clearing = b"builtin unset -v " + b" ".join(unset) + b"\n" if unset else b""
+        return clearing + b"".join(saved.values()) + definitions
+
     def evaluate(self, argv, output, remaining):
         with TemporaryDirectory(prefix="pipy-condition-", ignore_cleanup_errors=True) as directory:
             script, transcript, status = (Path(directory, name) for name in ("script", "output", "status"))
+            variables, state, restored = (Path(directory, name) for name in ("variables", "state", "restore"))
             script.write_text(argv[-1], encoding="utf-8", newline="\n")
             cwd, source, capture, result = (shlex.quote(path.as_posix()) for path in
                                             (self.workspace, script, transcript, status))
+            bash = Path(argv[0]).stem.lower() == "bash"
+            resume, self.resume = self.resume, None
+            restore = bool(bash and resume)
+            control = ""
+            if restore:
+                restored.write_bytes(resume)
+                control = f"\\builtin source {shlex.quote(restored.as_posix())}\n"
+            if bash:
+                dump_variables, dump_state = (shlex.quote(path.as_posix()) for path in (variables, state))
+                trap = (
+                    # Bash exposes live locals in an EXIT trap invoked inside a function.
+                    f'if [ -z "${{FUNCNAME[0]-}}" ]; then \\builtin declare -p >|{dump_variables}; '
+                    "\\builtin trap - EXIT; "
+                    "{ \\builtin declare -pf; \\builtin alias -p; \\builtin trap -p; "
+                    "\\builtin shopt -p || \\builtin true; \\builtin set +o; "
+                    f"\\builtin printf '%s\\n' {shlex.quote(CHECKPOINT_END.decode().strip())}; }} >|{dump_state}; fi"
+                )
+                control += f'if [ -z "$(\\builtin trap -p EXIT)" ]; then \\builtin trap {shlex.quote(trap)} EXIT; fi\n'
             # Separate files keep stdout, including binary output, out of the control channel.
-            control = (
+            control += (
                 f'{{ if ! command test . -ef {cwd}; then command cd -- {cwd} || exit 2; fi; '
                 f'command eval "\n$(command -p cat {source})\n"; }} </dev/null >{capture} 2>&1\n'
                 f'command printf "%s\\n" "$?" >{result}\n'
             )
-            process = self.start(argv)
+            if bash:
+                control += f'case "$(\\builtin trap -p EXIT)" in *{shlex.quote(state.as_posix())}*) \\builtin trap - EXIT;; esac\n'
+            process = self.start(argv, restore)
             try:
                 remaining()
                 try:
@@ -199,6 +248,10 @@ class ConditionShell:
                         break
                     if (code := process.poll()) is not None:
                         self.close()
+                        if bash:
+                            checkpoint = self.checkpoint(variables, state)
+                            remaining()
+                            self.resume = checkpoint
                         break
                     sleep(wait)
                 if code not in (0, 1) and transcript.is_file():
@@ -211,6 +264,7 @@ class ConditionShell:
 
     def close(self):
         process, self.process = self.process, None
+        self.resume = None
         if process:
             try:
                 if process.poll() is None:
