@@ -14,6 +14,7 @@ from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
 import session_graph as graph
+from interrupted_thinking import TYPE as INTERRUPTED_THINKING
 from runtime import database, initialize, pack, responses_replacement_tokens
 from session_artifacts import PIPY_ARTIFACT, copy_sidecar, install_sidecar, sidecar, stored_artifacts
 from session_blobs import hydrate_images
@@ -193,6 +194,8 @@ def import_message(entry):
         return {"role": "developer", "content": str(entry.get("summary") or ""), "_branch_summary": True}
     if kind == "custom_message":
         message = {"role": "developer", "content": text_and_images(entry.get("content"))}
+        if entry.get("customType") == INTERRUPTED_THINKING:
+            message["_interrupted_thinking"] = mapping(entry.get("details"))
         if entry.get("customType") == "eval-state-context":
             message["_eval_state_context"] = True
         if entry.get("customType") in ("eager-todo-prelude", "mid-run-todo-nudge", "todo-reminder", "todo-error-reminder"):
@@ -292,6 +295,9 @@ def import_message(entry):
                               if key in message}
             if calls and message["stopReason"] == "length":
                 result["_tool_stop"] = "length"
+            if message["stopReason"] == "aborted" and isinstance(content, list):
+                result["_interrupt_blocks"] = [block for block in content if isinstance(block, dict)
+                                               and isinstance(block.get("type"), str)]
         if not calls and message.get("stopReason") == "stop" and mapping(message.get("stopDetails")).get("type") == "pause_turn":
             result["_stop_details"] = {"type": "pause_turn"}
         if isinstance(message.get("inputTransformations"), list):
@@ -709,6 +715,9 @@ def export_message(message, call_names):
         return {"type": "custom_message", "customType": kind, "content": custom_content,
                 "display": False, "attribution": "agent"}
     if role == "developer":
+        if "_interrupted_thinking" in message:
+            return {"type": "custom_message", "customType": INTERRUPTED_THINKING, "content": custom_content,
+                    "display": False, "attribution": "agent", "details": message["_interrupted_thinking"]}
         if message.get("_eval_state_context"):
             return {"type": "custom_message", "customType": "eval-state-context", "content": custom_content,
                     "display": False, "attribution": "agent"}
@@ -798,6 +807,8 @@ def export_message(message, call_names):
                     content.append({"type": "redactedThinking", "data": block["data"]})
                 elif kind == "server_tool_use" or kind.endswith("_tool_result"):
                     content.append({"type": "anthropicServerTool", "block": block})
+        if "_interrupt_blocks" in message:
+            content = [block for block in message["_interrupt_blocks"] if block["type"] != "other"]
         result = {
             "role": "assistant", "content": content, "timestamp": now, "api": "openai-completions",
             "provider": "openai", "model": "unknown",

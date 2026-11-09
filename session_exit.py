@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timezone
 
+from interrupted_thinking import provider_assistant
 
 TOOL_START = "tool_execution_start"
 SESSION_EXIT = "session_exit"
@@ -72,13 +73,24 @@ def synthetic_result(message):
     return message["role"] == "tool" and (message.get("_tool_details") or {}).get("__synthetic") is True
 
 
-def provider_batch(batch):
+def provider_batch(batch, following=None):
     failed_calls = set()
-    for message in batch:
+    for index, message in enumerate(batch):
         if failed_turn(message):
             failed_calls.update(call["id"] for call in message.get("tool_calls", ()))
+            neighbor = batch[index + 1] if index + 1 < len(batch) else following
+            if not message.get("_retry_omit") and stop_reason(message) == "aborted" and (
+                message.get("_live_interruption") or neighbor and "_interrupted_thinking" in neighbor
+            ) and (projected := provider_assistant(message)):
+                yield projected
         elif not cutoff(message) and (message["role"] != "tool" or message.get("tool_call_id") not in failed_calls):
             yield message
+
+
+def provider_history(batches):
+    for index, (_, batch) in enumerate(batches):
+        following = batches[index + 1][1][0] if index + 1 < len(batches) and batches[index + 1][1] else None
+        yield from provider_batch(batch, following)
 
 
 def cutoff(message):

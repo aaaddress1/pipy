@@ -7,6 +7,7 @@ import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import partial
 from hashlib import sha256
 from urllib.parse import urlsplit
 
@@ -14,6 +15,7 @@ import httpx
 from openai import APIStatusError
 
 import anthropic_fallback as fallback
+from interrupted_thinking import assistant_draft
 from cancellable_http import active_turn
 from model_catalog import EFFORTS
 from rate_limits import classify_rate_limit, retry_after
@@ -722,6 +724,33 @@ class MessageStream:
             usage=Usage.from_wire(self.usage),
         )
 
+    def interruption_snapshot(self, route, fingerprint):
+        displayed, native = [], []
+        for index, block in sorted(fallback.retained(self.blocks).items()):
+            kind = block["type"]
+            if kind in ("text", "thinking"):
+                value = (block.get(kind) or "") + "".join(self.fragments.get((index, kind), ()))
+                display = {"type": kind, kind: value}
+                if kind == "thinking":
+                    signature = (block.get("signature") or "") + "".join(self.fragments.get((index, "signature"), ()))
+                    if signature:
+                        display["thinkingSignature"] = signature
+                        if index not in self.open_blocks:
+                            native.append({"type": "thinking", "thinking": value, "signature": signature})
+                else:
+                    native.append(display)
+                displayed.append(display)
+            elif kind == "redacted_thinking" and block.get("data"):
+                displayed.append({"type": "redactedThinking", "data": block["data"]})
+                native.append(block)
+            else:
+                displayed.append({"type": "other"})
+        draft = assistant_draft(displayed)
+        if draft and any(block["type"] != "text" for block in native):
+            draft["_anthropic"] = {"route": route.identity(), "prefix": fingerprint,
+                                   "text": draft["content"], "blocks": native}
+        return draft
+
     def visible(self, text):
         self.guard.push(None, text, False)
         self.text.append(text)
@@ -1001,6 +1030,8 @@ def stream_attempt(
             headers = credit.headers()
         message = MessageStream(guard, show, turn, fallback_enabled=bool(body.get("fallbacks")),
                                 tracker=tracker, on_text=on_text, speculation=speculation)
+        if turn:
+            turn.interrupt_snapshot = partial(message.interruption_snapshot, route, fingerprint)
         try:
             if admit:
                 admit()

@@ -418,6 +418,8 @@ class AcpSession:
     def replay(self):
         starts = set()
         for message in self.call("get_messages")["messages"]:
+            if message.get("customType") == "interrupted-thinking":
+                continue
             role, message_id = message["role"], self.next_message()
             if role == "assistant":
                 for block in message["content"]:
@@ -497,7 +499,7 @@ class AcpSession:
             self.background_suppressed = False
             turn = AcpTurn(self, identifier, content)
             if self.turn:
-                self.cancel_turn(self.turn)
+                self.cancel_turn(self.turn, user=True)
                 self.prompts.append(turn)
             else:
                 self.start_turn(turn)
@@ -584,7 +586,9 @@ class AcpSession:
                 result["usage"] = usage
             self.server.respond(turn.request_id, result=result)
 
-    def cancel_turn(self, turn):
+    def cancel_turn(self, turn, *, user=False):
+        if user:
+            turn.user_interrupt = True
         turn.cancel()
         self.reply_to_prompt(turn, "cancelled")
 
@@ -602,19 +606,19 @@ class AcpSession:
             (turn.follow_ups if queue == "followUp" else turn.steers).append(content)
             return {"outcome": "injected", "queue": queue}
 
-    def cancel(self):
+    def cancel(self, *, user=True):
         with self.lock:
             if self.turn or self.prompts:
                 self.background_suppressed = True
             if self.turn:
-                self.cancel_turn(self.turn)
+                self.cancel_turn(self.turn, user=user)
             for prompt in self.prompts:
                 prompt.cancel()
 
     def close(self):
         with self.lock:
             self.closing = True
-            self.cancel()
+            self.cancel(user=False)
         if self.worker:
             self.worker.join()
         try:

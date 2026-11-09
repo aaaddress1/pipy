@@ -324,6 +324,8 @@ Muse Code 可設定 `providers.museCode.storeResponses: true`，或用 `PI_MUSE_
 
 互動終端、RPC 和 ACP 可用 `/retry` 重試上一個失敗或中止的回合。失敗輸出保留在日誌中，下一次模型請求會略過它。若上一批工具的每個結果都失敗，且呼叫參數完整、之後沒有需要保留的背景通知，代理會直接重跑該批。舊版 pipy 日誌也支援這項重跑，原本的失敗結果仍保留在舊分支。 [上游手動重試](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/turn-recovery.ts#L3429)
 
+使用者主動中斷串流時，原始推理留在工作階段日誌。尾端未簽章的推理達到 60 字元時，下一個回合可以透過隱藏提示接續。已完成的原生推理區塊由各供應商的重播規則處理。Claude 等會拒絕引述推理的模型會略過這類提示，切換到這些模型後也會略過。 [上游中斷推理測試](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/test/agent-session-interrupted-thinking.test.ts)
+
 跨機器可用 `session pack <UUID 或 JSONL> <archive.tar>` 和 `session unpack <archive.tar> --cwd <工作目錄>`。tar 使用 Oh My Pi 的 v1 格式，包含日誌、artifact 目錄及日誌引用的 blob。打包原版日誌時可用 `--blobs-dir` 指定上游 blob 目錄。解包前會驗證成員路徑與 SHA-256。如果本機已有較早且相容的歷史，會沿用工作階段 ID 更新。若本機歷史已分歧，會建立分支並保留原工作階段。`unpack` 在 stdout 輸出可交給 `--session` 的 UUID。 [上游 session transfer](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/session-transfer.ts)
 
 用 `session moved <UUID 或 JSONL> --to <目的地名稱>` 標記留在原機的副本。再次開啟該副本時，pipy 會從新 UUID 續跑，保留原來的工作階段和工具結果，並在分支中補記缺失的工具結果。`session lease --json -- <ID>...` 可查詢 Oh My Pi 相容的所有權鎖。已有程序持鎖時，同 ID 的打包、標記和更新會回報工作階段忙碌。 [上游搬移標記與續跑防護](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/session-transfer.ts#L651)

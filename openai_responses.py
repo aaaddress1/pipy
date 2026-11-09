@@ -15,6 +15,7 @@ import httpx
 from openai import APIConnectionError, APIError, APIStatusError
 
 import model_catalog
+from interrupted_thinking import StreamDraft
 import codex_responses
 import responses_cache
 import responses_resume
@@ -799,6 +800,20 @@ def stream_attempt(
     else:
         body, breakpoint = responses_cache.prepare(body, route, messages, prompt_cache_key)
     visible, thinking, tool_draft = [], [], False
+    draft = StreamDraft() if turn else None
+    completed_reasoning = {}
+    if turn:
+        def snapshot():
+            partial = draft.snapshot()
+            native = [(index, item) for index, item in completed_reasoning.items() if item.get("encrypted_content")]
+            if partial and native:
+                native.extend((index, {"role": "assistant", "content": "".join(parts)})
+                              for kind, index, parts in draft.blocks if kind == "text")
+                partial["_responses"] = {"route": route.identity(), "prefix": fingerprint, "text": partial["content"],
+                                         "calls": [], "items": [item for _, item in sorted(native, key=lambda pair: pair[0])]}
+            return partial
+
+        turn.interrupt_snapshot = snapshot
     stream_tools = StreamedTools(codex=codex_route is not None)
     usage = reported_usage = None
     try:
@@ -819,6 +834,7 @@ def stream_attempt(
                     piece = event["delta"]
                     guard.push(None, piece, tool_draft)
                     if turn:
+                        draft.append("text", piece, event.get("output_index", 0))
                         turn.delta("text", piece)
                     if on_text and piece:
                         on_text(piece)
@@ -830,6 +846,7 @@ def stream_attempt(
                 elif kind in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
                     guard.push(event["delta"], None, tool_draft)
                     if turn:
+                        draft.append("thinking", event["delta"], event.get("output_index", 0))
                         turn.delta("thinking", event["delta"])
                     thinking.append(event["delta"])
                     if tracker:
@@ -839,17 +856,24 @@ def stream_attempt(
                 elif kind in ("response.reasoning_text.done", "response.reasoning_summary_text.done") and tracker:
                     tracker.end_text("thinking")
                 elif kind in TOOL_EVENTS or kind in ITEM_EVENTS:
-                    draft = stream_tools.observe(event)
-                    if kind in TOOL_EVENTS or (event.get("item") or {}).get("type") in TOOL_ITEMS:
+                    tool = stream_tools.observe(event)
+                    item = event.get("item") or {}
+                    if draft and kind == "response.output_item.done" and item.get("type") == "reasoning":
+                        index = event.get("output_index", 0)
+                        draft.signatures[index] = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                        completed_reasoning[index] = item
+                    if kind in TOOL_EVENTS or item.get("type") in TOOL_ITEMS:
+                        if draft:
+                            draft.append("other")
                         tool_draft = True
                         guard.push(None, None, True)
-                    if draft and (tracker or speculation):
-                        name, identifier = draft.item["name"], draft.item["call_id"]
-                        final = draft.arguments_done or draft.closed
+                    if tool and (tracker or speculation):
+                        name, identifier = tool.item["name"], tool.item["call_id"]
+                        final = tool.arguments_done or tool.closed
                         if tracker and tracker.rules.stream_tools:
-                            tracker.tool(draft.index, name, draft.raw, identifier, final=final)
+                            tracker.tool(tool.index, name, tool.raw, identifier, final=final)
                         if speculation:
-                            speculation.observe(draft.index, name, identifier, draft.raw, final=final)
+                            speculation.observe(tool.index, name, identifier, tool.raw, final=final)
                 elif kind in ("response.completed", "response.incomplete", "response.failed"):
                     response = event["response"]
                     reported_usage = response.get("usage")

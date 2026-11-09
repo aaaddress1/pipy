@@ -16,6 +16,7 @@ from uuid import uuid4
 from openai import APIStatusError
 
 import handoff
+from interrupted_thinking import note_role, reader_allows
 import session_exit as exit_log
 import session_graph as graph
 from context_tokens import ContextCounter
@@ -76,7 +77,7 @@ def portable_message(message, thinking_route=None):
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
                "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment", "_compaction_continue",
-               "_tool_pending")
+               "_tool_pending", "_interrupt_blocks", "_live_interruption", "_retry_omit", "_interrupted_replay")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -92,6 +93,7 @@ def developer_content(message):
     if any(message.get(key) for key in (
         "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
         "_thinking_loop_redirect", "_session_transfer", "_goal_message", "_todo_message", "_compaction_continue",
+        "_interrupted_thinking",
     )):
         return content
     if isinstance(content, list):
@@ -601,7 +603,12 @@ class Session:
     def prepare_retry(self):
         if (index := self.retry_target()) is None:
             return False
-        return self.prepare_tool_replay(index) or self.can_continue()
+        if self.prepare_tool_replay(index):
+            return True
+        for message in self.batches[index][1]:
+            if exit_log.failed_turn(message):
+                message["_retry_omit"] = True
+        return self.can_continue()
 
     @session_write
     def prepare_tool_replay(self, failed_index=None):
@@ -916,7 +923,8 @@ class Session:
 
     def can_continue(self):
         message = next((message for _, batch in reversed(self.batches) for message in reversed(list(exit_log.provider_batch(batch)))
-                        if "_session_transfer" not in message), None)
+                        if "_session_transfer" not in message
+                        and not (message.get("_interrupted_replay") and not message.get("content"))), None)
         if message is None and (covered := (self.native_summary or {}).get("replay_through")):
             with database(self.path) as db:
                 batches = self.read_batches(db, covered, covered + 1)
@@ -927,7 +935,7 @@ class Session:
 
     def messages(
         self, system, summary=None, cut=0, *, include_native=False, include_archive=False, before=None, method=None,
-        thinking_route=None, for_compaction=False,
+        thinking_route=None, for_compaction=False, reader=None,
     ):
         committed = summary is None
         archive = self.archive_view() if include_archive and committed else None
@@ -962,12 +970,19 @@ class Session:
         provenance = {"_compaction_context": True} if for_compaction else {}
         if provenance and len(head) > 1:
             head[-1].update(provenance)
+        allows_notes = reader is None or reader_allows(reader)
+        continuity_role = note_role(reader)
+        selected = [(seq, batch) for seq, batch in self.batches if seq >= cut and (before is None or seq < before)]
         messages = head + [
-            {**provenance, "role": "user", "content": developer_content(message),
+            {**provenance, "role": continuity_role if "_interrupted_thinking" in message else "user",
+             "content": developer_content(message),
+             **({"_interrupted_thinking": message["_interrupted_thinking"]}
+                if include_native and "_interrupted_thinking" in message else {}),
              **({"_history_at": message["_history_at"]} if include_native and "_history_at" in message else {})}
             if message["role"] == "developer" else (message if include_native else portable_message(message, thinking_route))
-            for seq, batch in self.batches if seq >= cut and (before is None or seq < before)
-            for message in exit_log.provider_batch(batch)
+            for message in exit_log.provider_history(selected)
+            if allows_notes or "_interrupted_thinking" not in message
+            if include_native or not message.get("_interrupted_replay") or message.get("content")
             if include_native or message.get("content") or not (paused_turn(message) or message.get("_dsml_leak"))
         ]
         if (notes := self.context_notes()) and notes["text"]:
@@ -1190,7 +1205,7 @@ class Compaction:
     def messages(self, system, *args, **kwargs):
         kwargs.setdefault("include_native", True)
         kwargs.setdefault("include_archive", True)
-        return self.session.messages(system, *args, thinking_route=self.thinking_route(), **kwargs)
+        return self.session.messages(system, *args, thinking_route=self.thinking_route(), reader=self.session.archive_route, **kwargs)
 
     def estimate(self, messages, native_tokens=None, *, floor_stored=False, schemas=None):
         estimated, stored = self.context_sizes(messages, native_tokens, schemas)
@@ -1235,7 +1250,7 @@ class Compaction:
     def snapshot(self, estimated, pending_from=None):
         if (cut := self.cut_index(pending_from)) is None:
             return None
-        discarded = [message for _, batch in self.session.batches[:cut] for message in batch]
+        discarded = list(exit_log.provider_history(self.session.batches[:cut]))
         prefix = [portable_message(message) for message in without_useless(discarded)]
         payload = pack({"previous_summary": self.session.summary, "discarded_messages": prefix})
         return Snapshot(self.session.first_kept, self.session.batches[cut][0], estimated, payload,
@@ -1644,8 +1659,8 @@ class Compaction:
         prior, _, archived = self.session.archived_responses_prefix()
         archive = native.get("snapcompact") or native.get("portable_archive")
         if method == "snapcompact":
-            prefix = [msg for _, batch in archived for msg in batch]
-            prefix.extend(msg for seq, batch in self.session.batches if seq < snapshot.first_kept for msg in batch)
+            batches = [*archived, *((seq, batch) for seq, batch in self.session.batches if seq < snapshot.first_kept)]
+            prefix = list(exit_log.provider_history(batches))
             fixed = self.context_cost(self.messages(system, "", snapshot.first_kept), 0)
             room = int(self.threshold * 0.6) - fixed if self.threshold else None
             return (

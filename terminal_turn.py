@@ -213,7 +213,7 @@ class TerminalLane:
         @self.keys.add("escape", filter=Condition(lambda: self.busy() or self.loop is not None or self.goal_timer is not None))
         @self.keys.add("c-c", filter=Condition(lambda: self.busy() or self.automatic_pending()), eager=True)
         def interrupt(event):
-            self.restore(event.current_buffer, self.abort())
+            self.restore(event.current_buffer, self.abort(user=True))
 
     @staticmethod
     def restore(buffer, texts):
@@ -483,7 +483,7 @@ class TerminalLane:
         with self.lock:
             return bool(self.priority or self.steers or self.followups)
 
-    def abort(self):
+    def abort(self, *, user=False):
         with self.lock:
             self.cancel_goal()
             self.cancel_loop_pending()
@@ -498,6 +498,8 @@ class TerminalLane:
                 waiting = [*turn.claimed, *turn.live.take_all(), *turn.works[1:], *waiting]
                 turn.claimed.clear()
                 turn.goal_internal_abort = False
+                if user:
+                    turn.user_interrupt = True
                 turn.cancel()
             self.background_paused = True
             restored = [text for work in waiting if (text := work.restore())]

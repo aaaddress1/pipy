@@ -10,6 +10,7 @@ from dataclasses import asdict, replace
 import regex
 
 import model_catalog
+from interrupted_thinking import reader_allows
 from snapcompact_render import (
     DIM_OFF, DIM_ON, NEWLINE, SHAPES, Shape, bitmap_font, is_wide, paginate, render, silver_coverage,
 )
@@ -89,7 +90,10 @@ def serialize(messages, include_thinking=True, previous_files=None):
     for message in messages:
         role = message["role"]
         content = text_of(message.get("content")).translate(DIM)
-        if role in ("user", "developer"):
+        if "_interrupted_thinking" in message:
+            if include_thinking:
+                add("think", content)
+        elif role in ("user", "developer"):
             add("user", content)
         elif role == "assistant":
             if include_thinking:
@@ -160,7 +164,7 @@ def normalize(text, shape):
 
 
 def includes_thinking(route):
-    return route is None or "claude" not in route.model.lower()
+    return route is None or reader_allows(route)
 
 
 def model_revision(model):

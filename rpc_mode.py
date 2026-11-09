@@ -474,7 +474,7 @@ class RpcServer:
                        + len(self.turn.live.deferred)
                        if self.turn else 0)
             if kind == "abort_and_prompt":
-                self.abort()
+                self.abort(user=True)
             elif claimed + len(self.steering) + len(self.follow_up) >= MAX_QUEUE:
                 raise RpcFailure("The prompt queue is full.", "session_busy")
             if self.turn:
@@ -597,11 +597,13 @@ class RpcServer:
                 if settled:
                     self.event("session_settled")
 
-    def abort(self, command=None, restore=False):
+    def abort(self, command=None, restore=False, *, user=False):
         with self.lock:
             if self.turn or self.steering or self.follow_up:
                 self.background_suppressed = True
             if self.turn:
+                if user:
+                    self.turn.user_interrupt = True
                 self.turn.cancel()
             data = self.restored_queue(command) if restore else None
             claimed = self.turn.take_uncommitted_steering() if self.turn else []
@@ -643,7 +645,7 @@ class RpcServer:
                                     "maxReassembledFrameBytes": MAX_LOGICAL})
             self.output.version = command["protocolVersion"]
         elif kind in ("abort", "abort_and_restore_queue"):
-            self.abort(command, restore=kind == "abort_and_restore_queue")
+            self.abort(command, restore=kind == "abort_and_restore_queue", user=True)
         elif kind in ("set_steering_mode", "set_follow_up_mode"):
             mode = command.get("mode")
             if mode not in ("all", "one-at-a-time"):

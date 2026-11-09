@@ -374,6 +374,8 @@ def stream_attempt(client, route, model, messages, schemas, effort, guard, show,
         route = replace(route, model=model)
     body = request_body(route, messages, schemas, effort, tool_choice)
     message = anthropic.MessageStream(guard, show, turn, tracker=tracker, on_text=on_text, speculation=speculation)
+    if turn:
+        turn.interrupt_snapshot = lambda: message.interruption_snapshot(route, "bedrock")
     try:
         for attempt in range(2):
             try:

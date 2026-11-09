@@ -74,6 +74,7 @@ import rpc_mode
 from rpc_session import SessionRpc
 import session_jsonl
 import session_exit as exit_log
+import interrupted_thinking as thinking_interrupt
 import snapcompact
 import subagents
 import task_isolation
@@ -383,6 +384,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             for call in calls
         ]]
         seq = session.append(batch)
+        if turn:
+            turn.interrupt_snapshot = None
         wire = turn.response(assistant) if turn else None
         phase = "mid"
         if not calls:
@@ -607,6 +610,9 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
     repetition = None
     buffer = dsml.TextBuffer() if heal_dsml else None
     visible, leaked = None, False
+    draft = thinking_interrupt.StreamDraft() if turn else None
+    if draft:
+        turn.interrupt_snapshot = draft.snapshot
     tool_options = {"tools": schemas} if schemas else {}
     if tool_choice and schemas:
         tool_options["tool_choice"] = tool_choice
@@ -615,6 +621,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
         if not piece:
             return
         if turn:
+            draft.append("text", piece)
             turn.delta("text", piece)
         if on_text:
             on_text(piece)
@@ -673,12 +680,15 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                         piece = buffer.feed(piece)
                     guard.push(reasoning if isinstance(reasoning, str) else None, piece, bool(parts))
                     if turn:
+                        draft.append("thinking", reasoning if isinstance(reasoning, str) else None)
                         turn.delta("thinking", reasoning if isinstance(reasoning, str) else None)
                     if isinstance(reasoning, str) and reasoning:
                         thinking.append(reasoning)
                     if tracker:
                         tracker.text("thinking", reasoning if isinstance(reasoning, str) else None)
                     emit_text(piece)
+                    if draft and parts:
+                        draft.append("other")
                     for part in parts:
                         call = calls.setdefault(part.index, {
                             "id": "", "type": "function", "function": {"name": "", "arguments": ""},
@@ -2243,7 +2253,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         def live_messages(system, route, *, before=None):
             messages = session.messages(
                 system, include_native=route.api != "chat-completions", include_archive=True,
-                thinking_route=chat_thinking_scope(route), before=before,
+                thinking_route=chat_thinking_scope(route), before=before, reader=route,
             )
             if eval_tool and (snapshot := eval_tool.context()):
                 messages.append({"role": "user", "content": snapshot})
@@ -2324,6 +2334,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                             )
             cost_gate.admit()
             if turn:
+                turn.interrupt_snapshot = None
+                turn.interruption_route = route
                 if getattr(turn, "steering_at_boundary", False):
                     turn.system = messages[0]["content"]
                     turn.request_leaf = session.leaf
@@ -2384,14 +2396,17 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if observe_title:
                     observe_title("")
             except RuleInterrupt:
-                if turn and hasattr(turn, "live"):
-                    turn.live.rollback()
+                if turn:
+                    turn.interrupt_snapshot = None
+                    if hasattr(turn, "live"):
+                        turn.live.rollback()
                 raise
             except Exception as error:
                 if turn:
                     if hasattr(turn, "live"):
                         turn.live.rollback()
                     turn.check()
+                    turn.interrupt_snapshot = None
                     turn.interrupted(error)
                 cause = error.__cause__
                 while cause is not None:
@@ -2635,16 +2650,24 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if focus:
                     instructions += "\n\nAdditional compaction instructions: " + focus
                 cancellation = active_turn() or handoff.Cancellation()
+                context_suffix = ""
                 if (backend := mnemopi or hindsight) and not child:
                     history = json.loads(transcript)["discarded_messages"]
                     with turn_scope(cancellation):
                         if context := backend.compaction_context(conversation_messages(history)):
-                            transcript += "\n\n" + context
+                            context_suffix += "\n\n" + context
                 if eval_tool and (snapshot := eval_tool.context()):
-                    transcript += "\n\n" + snapshot
-                messages = [{"role": "system", "content": instructions}, {"role": "user", "content": transcript}]
+                    context_suffix += "\n\n" + snapshot
 
                 def send(route, credential):
+                    document = transcript
+                    if '"_interrupted_thinking"' in document and not thinking_interrupt.reader_allows(route):
+                        parsed = json.loads(document)
+                        parsed["discarded_messages"] = [message for message in parsed["discarded_messages"]
+                                                        if "_interrupted_thinking" not in message]
+                        document = pack(parsed)
+                    messages = [{"role": "system", "content": instructions},
+                                {"role": "user", "content": document + context_suffix}]
                     cap = min(limit, route.max_output_tokens or limit)
                     bounded_route = replace(route, max_output_tokens=cap)
                     request = options[route.identity()]
@@ -2690,6 +2713,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         route.api, openai_responses,
                     )
                     def prepare(batch):
+                        if not thinking_interrupt.reader_allows(route):
+                            batch = [message for message in batch if "_interrupted_thinking" not in message]
+                        elif thinking_interrupt.note_role(route) == "developer":
+                            batch = [{**message, "role": "developer"} if "_interrupted_thinking" in message else message
+                                     for message in batch]
                         return inline.transform(batch if route.vision else session_jsonl.text_only(batch), route)[0]
 
                     payload = prepare(messages)
@@ -3278,7 +3306,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 return
             route, credential = router.route, router.credential
             system = system_prompt()
-            messages = (session.messages(system, include_native=False, include_archive=True)
+            messages = (session.messages(system, include_native=False, include_archive=True, reader=route)
                         if route.api in model_catalog.RESPONSES_APIS else live_messages(system, route)[0])
             messages = deepcopy(messages)
             messages.append({"role": "developer", "content": AUTOLEARN_PROMPT})
@@ -3517,11 +3545,19 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             except (CancelledError, KeyboardInterrupt) as error:
                 goal_interrupted = True
                 if agent_admitted and session.can_continue() and not getattr(turn, "goal_internal_abort", False):
-                    draft = turn.snapshot() if getattr(turn, "steering_at_boundary", False) else getattr(turn, "draft", None)
-                    if draft and isinstance(draft.get("content"), list):
-                        draft = {"content": session_jsonl.plain_text(draft["content"])}
-                    model = rpc_mode.model_metadata(router.route, None)
-                    session.append([exit_log.failure_message(model, str(error) or "Turn aborted.", reason="aborted", draft=draft)])
+                    snapshot = getattr(turn, "interrupt_snapshot", None)
+                    draft = snapshot() if snapshot else None
+                    source = getattr(turn, "interruption_route", None) or router.route
+                    model = rpc_mode.model_metadata(source, None)
+                    user = getattr(turn, "user_interrupt", False)
+                    reason = thinking_interrupt.USER_INTERRUPT if user else str(error) or "Turn aborted."
+                    failure = exit_log.failure_message(model, reason, reason="aborted", draft=draft)
+                    note = thinking_interrupt.continuity_note(failure, router.route) if user else None
+                    session.append([failure, note] if note else [failure])
+                    if user:
+                        failure["_live_interruption"] = True
+                    if turn:
+                        turn.interrupt_snapshot = None
                 raise
             except CostCapError as error:
                 if not child:
@@ -4288,7 +4324,7 @@ def run_session(args, state, session_id, workspace, rpc=None, account=None):
                 handle.session.append([message])
 
             target = rpc.serve(handle.run_task, record_input, handle.commands, handle.mcp, handle.jobs,
-                               retry_ready=lambda: handle.session.retry_target() is not None and handle.session.can_continue())
+                               retry_ready=lambda: handle.session.retry_target() is not None)
             keep_spend = target and rpc.transition and rpc.transition[0]["type"] == "fork"
             return target, handle.account if keep_spend else None, handle.session.id
         if args.task is not None or args.continue_session:
