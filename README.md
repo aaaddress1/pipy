@@ -255,6 +255,8 @@ Apple Silicon macOS 上，正式 Codex OAuth 的 HTTP 請求和 WebSocket 升級
 
 標準 Responses 路由可用 `providers.openaiResponsesWebsockets: true` 對已標示支援的模型啟用 WebSocket，或在自訂路由設 `prefer_websockets: true`。同一條連線只在設定與歷史前綴吻合時傳送差量。續接 ID 失效會重送完整輸入，連續三次失效會停止傳續接 ID。端點拒絕 WebSocket 升級時會沿用 HTTP/SSE，直到工作階段刷新。`/fresh`、`/clear` 與上下文重寫會關閉舊連線。 [上游標準 Responses WebSocket](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/models.md#standard-responses-websockets) · [OpenAI WebSocket 文件](https://developers.openai.com/api/docs/guides/websocket-mode)
 
+標準 OpenAI Responses 的 HTTP/SSE 在正式 OpenAI 端點預設啟用續接，送出 `store: true` 讓供應商儲存回應。工作階段、帳號、請求設定及歷史吻合時，透過 `previous_response_id` 傳送新增項目。HTTP 與 WebSocket 各自保存續接狀態。過期 ID 會以完整歷史重試一次，連續三次遭拒後停用續接。遇到零資料保留拒絕會立即以 `store: false` 重試。可在自訂路由設 `stateful_responses: false`，或用 `PI_OPENAI_STATEFUL=0` 關閉續接。自訂端點預設依模型相容性設定決定，未宣告支援時採完整重送。 [上游 HTTP 續接](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-responses.ts) · [OpenAI 工作階段文件](https://developers.openai.com/api/docs/guides/conversation-state#passing-context-from-the-previous-response)
+
 ## 已移植的行為
 
 - 設定 `--context-window` 後，預設在估算用量接近 70% 時準備背景摘要。若單次回合跳過門檻，只要仍在寬限區間內，前景便繼續執行。碰到區間上限或收到上下文溢位錯誤時，尚未完成的背景請求會取消，交由同步維護處理。追加的訊息與完整的工具呼叫和結果都會保留。若追加訊息使背景摘要無法騰出足夠空間，會用目前歷史重新摘要。`compaction.asyncEnabled: false` 可停用背景摘要。第一個可用方法為 Shake 或 Snapcompact 時會直接走同步維護。 [上游背景壓縮流程](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/session-maintenance.ts#L2329)

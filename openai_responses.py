@@ -16,6 +16,8 @@ from openai import APIConnectionError, APIError, APIStatusError
 import model_catalog
 import codex_responses
 from responses_effort import supported as supports_effort_updates
+from responses_chain import stored_host
+from responses_websocket import generation_evidence
 from cancellable_http import active_turn
 from cost_gate import CostCapError
 from handoff import deadline
@@ -491,7 +493,8 @@ def completed_message(response, route, model, fingerprint):
 
 
 @contextmanager
-def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None, effort_control=None):
+def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None, effort_control=None,
+                    http_chain=None):
     if codex_route:
         lite = codex_responses.lite_enabled(codex_route)
         codex_responses.request_shape(codex_route, body, lite=lite)
@@ -505,12 +508,48 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None,
         return
     if effort_control:
         effort_control.apply(body)
+    if websocket is not None and not websocket.sse_only and http_chain:
+        http_chain.reset()
     if websocket is not None and websocket.open():
         with closing(websocket.events(body)) as stream:
+            yield stream
+    elif http_chain:
+        with closing(chained_http_events(client, body, http_chain)) as stream:
             yield stream
     else:
         with client.responses.create(**sdk_body(body), stream=True) as stream:
             yield (event.to_dict() for event in stream)
+
+
+def chained_http_events(client, body, chain_state):
+    full, wire = chain_state.request(body)
+    for attempt in range(2):
+        first = True
+        try:
+            with client.responses.create(**sdk_body(wire), stream=True) as stream:
+                for incoming in stream:
+                    event = incoming.to_dict()
+                    kind = event["type"]
+                    response = event.get("response") or {}
+                    if first and attempt == 0 and kind in ("error", "response.failed") and not generation_evidence(response):
+                        error = response.get("error") or event.get("error") or event
+                        if chain_state.retry(wire, error, event.get("status") or event.get("status_code") or error.get("status")):
+                            break
+                    first = False
+                    if kind == "response.completed":
+                        event["_http_chain"] = full, bool(wire.get("previous_response_id"))
+                    yield event
+                else:
+                    return
+        except APIError as error:
+            detail = error.body if isinstance(error.body, dict) else {}
+            detail = detail["error"] if isinstance(detail.get("error"), dict) else detail
+            detail = {**detail, "message": detail.get("message") or error.message, "code": detail.get("code") or error.code}
+            if not first or attempt != 0 or not chain_state.retry(wire, detail, getattr(error, "status_code", None)):
+                raise
+        # A definite rejection permits one full retry. The stale counter only
+        # disables storage on later requests; a retention rejection disables it now.
+        full = wire = {**full, "store": not chain_state.zero_retention}
 
 
 def codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source, vision):
@@ -579,9 +618,11 @@ def codex_events(frames, identity, transport):
 def stream_attempt(
     client, route, model, messages, schemas, effort, guard, show, *, tool_choice=None, cancel=None, prompt_cache_key=None,
     turn=None, usage_observer=None, tracker=None, on_text=None, speculation=None, websocket=None, codex_turn=None,
-    live_source=None, effort_control=None,
+    live_source=None, effort_control=None, http_chain=None,
 ):
     body, fingerprint = request_body(route, model, messages, schemas, effort)
+    if stored_host(route):
+        body["store"] = True
     if tool_choice and schemas:
         body["tool_choice"] = ({"type": "function", "name": tool_choice["function"]["name"]}
                                if isinstance(tool_choice, dict) else tool_choice)
@@ -597,7 +638,7 @@ def stream_attempt(
     usage = reported_usage = None
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
-                             live_source=live_source, effort_control=effort_control) as stream:
+                             live_source=live_source, effort_control=effort_control, http_chain=http_chain) as stream:
             for event in stream:
                 if cancel:
                     cancel()
@@ -681,6 +722,8 @@ def stream_attempt(
                         for item in (message.get("_responses") or {}).get("items", ())
                     )):
                         raise EmptyTurn("Responses stopped without actionable output.", usage=usage)
+                    if http_chain and (chain_result := event.get("_http_chain")):
+                        http_chain.complete(*chain_result, response, message)
                     if show and not visible and message["content"]:
                         visible.append(message["content"])
                         print(message["content"], end="", flush=True)

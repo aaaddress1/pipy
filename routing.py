@@ -28,6 +28,7 @@ import codex_attestation
 import codex_responses
 from mcp_oauth import oauth_url
 import model_catalog
+from responses_chain import ResponsesChain, env_flag, stateful_enabled
 from responses_effort import EffortControl, supported as supports_effort_updates
 from model_secrets import CONFIG_KEY, KEYLESS, ConfigRequestAuth, ConfigSecrets, origin
 from responses_websocket import ResponsesSocket
@@ -75,6 +76,8 @@ class Route:
     connection: Connection | None = field(default=None, repr=False)
     metadata_pins: frozenset = field(default=frozenset(), repr=False, compare=False)
     prefer_websockets: bool = False
+    stateful_responses: bool | None = None
+    store_responses: bool = False
 
     def endpoint(self):
         if self.api == "anthropic-messages":
@@ -146,7 +149,7 @@ def load_prices(name, value):
 
 def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, context_promotion=False,
                 allow_unmatched=False, configured_models=None, extended_context=False, allow_judge=False,
-                responses_websockets=False, codex_websockets=None):
+                responses_websockets=False, codex_websockets=None, muse_store_responses=False):
     registry = configured_models or model_catalog
     if path is None:
         if not model_catalog.select_routed(registry, primary):
@@ -161,7 +164,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
         if not isinstance(fields, dict) or set(fields) - {
             "model", "catalog", "context_window", "base_url", "api_key_env", "promote_to", "fallbacks", "reasoning_effort",
             "api", "auth", "max_output_tokens", "cache_retention", "native_compaction", "cache_prices",
-            "responses_compaction_v2", "prefer_websockets",
+            "responses_compaction_v2", "prefer_websockets", "stateful_responses", "store_responses",
             "vision", "image_max_edge", "image_count_budget", "image_byte_budget", "image_tokens", "image_detail",
             "image_read_results",
             "broker_provider", "broker_accounts", "broker_scope",
@@ -228,6 +231,10 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             configured = fields.get("prefer_websockets", codex_websockets != "off")
             prefer_websockets = (codex_responses.websocket_enabled(catalog, configured)
                                  if type(configured) is bool else configured)
+        stateful_responses = fields.get("stateful_responses")
+        store_responses = fields.get("store_responses", api == "openai-responses" and env_flag(
+            "PI_MUSE_STORE_RESPONSES", catalog.get("provider") == "muse-code" and muse_store_responses,
+        ))
         vision = fields.get("vision", "image" in (catalog.get("input") or ()) and not compat.get("stripImageInput"))
         image_max_edge = fields.get("image_max_edge", compat.get("maxImageDimension"))
         official = api == "anthropic-messages" and isinstance(endpoint, str) and official_endpoint(endpoint)
@@ -338,6 +345,9 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             or type(native_compaction) is not bool
             or type(responses_compaction_v2) is not bool
             or type(prefer_websockets) is not bool
+            or "stateful_responses" in fields and type(stateful_responses) is not bool
+            or type(store_responses) is not bool
+            or api != "openai-responses" and {"stateful_responses", "store_responses"} & fields.keys()
             or "prefer_websockets" in fields and api not in model_catalog.RESPONSES_APIS
             or "responses_compaction_v2" in fields and api not in model_catalog.RESPONSES_APIS
             or responses_compaction_v2 and not native_compaction
@@ -354,7 +364,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             vision, image_max_edge, image_count, image_bytes, image_tokens, image_detail, image_reads,
             provider, frozenset(accounts) if accounts is not None else None, scope, key_override,
             replay_unsigned, prefix_mismatch, fallback_credit, chain, catalog or None, connection=connection,
-            prefer_websockets=prefer_websockets,
+            prefer_websockets=prefer_websockets, stateful_responses=stateful_responses, store_responses=store_responses,
             metadata_pins=frozenset(key for field_name, key in (
                 ("context_window", "contextWindow"), ("max_output_tokens", "maxTokens"), ("vision", "input"),
             ) if field_name in fields) | (
@@ -398,6 +408,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
                         None, target, None, anthropic_server_side_fallback=anthropic_server_side_fallback,
                         configured_models=configured_models, extended_context=extended_context,
                         responses_websockets=responses_websockets, codex_websockets=codex_websockets,
+                        muse_store_responses=muse_store_responses,
                     )[target]
             if matched and matched.window and matched.window > route.window and matched.name != name:
                 routes[matched.name] = matched
@@ -511,6 +522,7 @@ class Router:
         self.clients = {}
         self.responses_sockets = {}
         self.responses_efforts = OrderedDict()
+        self.responses_chains = OrderedDict()
         self.codex_identity = None
         self.blocked = {}
         self.local_quota = {}
@@ -685,6 +697,7 @@ class Router:
     def reset_provider_state(self):
         count = len(self.clients) + self.reset_responses_context()
         self.clients.clear()
+        self.responses_chains.clear()
         self.codex_identity = None
         self.pins.clear()
         self.pin_used.clear()
@@ -716,7 +729,22 @@ class Router:
 
     def reset_responses_context(self):
         self.responses_efforts.clear()
+        for chain in self.responses_chains.values():
+            chain.reset()
         return self.close_responses_sockets()
+
+    def responses_chain(self):
+        route, credential = self.route, self.credential
+        if not stateful_enabled(route):
+            return None
+        key = route.identity(), credential, self.session.transcript_id
+        chain = self.responses_chains.get(key)
+        if chain is None:
+            chain = self.responses_chains[key] = ResponsesChain()
+        self.responses_chains.move_to_end(key)
+        if len(self.responses_chains) > 16:
+            self.responses_chains.popitem(last=False)
+        return chain
 
     def responses_socket(self, route=None, credential=None, *, lite=None, model=None):
         route, credential = (self.route, self.credential) if route is None else (route, credential)
@@ -733,9 +761,7 @@ class Router:
                 )
             return self.responses_sockets[key]
         if key not in self.responses_sockets:
-            compat = (route.catalog_model or {}).get("compat") or {}
-            setting = os.getenv("PI_OPENAI_STATEFUL", "").strip().lower()
-            chain = setting not in ("0", "false", "off", "no") if setting else compat.get("statefulResponses") is not False
+            chain = stateful_enabled(route, websocket=True)
             self.responses_sockets[key] = ResponsesSocket(self.transport_loop, route.endpoint(),
                                                           partial(self.responses_headers, route, credential), chain=chain)
         return self.responses_sockets[key]

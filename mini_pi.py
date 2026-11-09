@@ -375,6 +375,7 @@ def stream_reply(
                         codex_turn=options.get("codex_turn"),
                         live_source=options.get("live_source"),
                         effort_control=options.get("effort_control"),
+                        http_chain=options.get("http_chain"),
                     )
                 else:
                     result = stream_attempt(client, model, messages, schemas, options, guard, show, tool_choice, cancel, turn,
@@ -1884,7 +1885,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 reply, usage = stream_reply(
                     router.client(), route.model, messages, schemas,
                     options | {"codex_turn": router.codex_turn(), "live_source": live_source,
-                               "effort_control": effort_control}, guard_options,
+                               "effort_control": effort_control, "http_chain": router.responses_chain()}, guard_options,
                     native_route=route, cache_observer=observer, show=show and turn is None,
                     cancel=cancellation.check if cancellation else None, turn=turn, usage_observer=router.usage_observer(),
                     anthropic_replay=anthropic_replay(route), credit=credit, meter=meter, tool_choice=choice, rules=rules,
@@ -3864,6 +3865,7 @@ def main():
         route_options = {
             "responses_websockets": dotted(settings, "providers.openaiResponsesWebsockets") is True,
             "codex_websockets": dotted(settings, "providers.openaiWebsockets"),
+            "muse_store_responses": dotted(settings, "providers.museCode.storeResponses") is True,
             "anthropic_server_side_fallback": dotted(settings, "providers.anthropic.serverSideFallback") is True,
             "context_promotion": dotted(settings, "contextPromotion.enabled") is True,
             "extended_context": dotted(settings, "extendedContext") is True,

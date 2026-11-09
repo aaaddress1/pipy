@@ -59,6 +59,14 @@ def stale_anchor(error):
     )
 
 
+def generation_evidence(response):
+    usage = response.get("usage") or {}
+    return bool(response.get("output")) or any(
+        type(usage.get(key)) in (int, float) and usage[key] > 0
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    )
+
+
 class ResponsesSocket:
     idle_seconds = IDLE_SECONDS
     receive_seconds = 120
@@ -184,12 +192,8 @@ class ResponsesSocket:
                 response = event.get("response") or {}
                 error = (response.get("error") or event.get("error") or event) if kind in ("error", "response.failed") else {}
                 status = event.get("status") or event.get("status_code") or error.get("status") or error.get("status_code")
-                usage = response.get("usage") or {}
-                generated = response.get("output") or any(
-                    isinstance(usage.get(key), (int, float)) and usage[key] > 0
-                    for key in ("input_tokens", "output_tokens", "total_tokens")
-                )
-                if first and delta is not None and not generated and status in (None, 400, 422) and self.rejects_anchor(error):
+                if (first and delta is not None and not generation_evidence(response)
+                    and status in (None, 400, 422) and self.rejects_anchor(error)):
                     if steering and steering.carried:
                         raise httpx.RemoteProtocolError("Codex steering successor lost its continuation.")
                     self.stale_anchors += 1
