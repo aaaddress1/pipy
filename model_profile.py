@@ -72,8 +72,6 @@ class ModelProfile:
         effort = dotted(settings, "defaultThinkingLevel")
         self.default_effort = EFFORT_NAMES.get(effort, "high") if isinstance(effort, str) else "high"
         self.revert = dotted(settings, "retry.fallbackRevertPolicy") != "never"
-        reserve = dotted(settings, "compaction.reserveTokens")
-        self.reserve = reserve if type(reserve) is int and reserve >= 0 else None
         configured = (provider.lower() for provider in patterns(dotted(settings, "modelProviderOrder")))
         self.provider_order = dict.fromkeys((*configured, *PROVIDER_ORDER))
         self.provider_rank = {provider: rank for rank, provider in enumerate(self.provider_order)}
@@ -353,15 +351,6 @@ class ModelProfile:
     def label(route):
         base = route_base(route)
         return f"{base}:{route.reasoning_effort}" if route.reasoning_effort else base
-
-    def fits(self, route, tokens):
-        if tokens is None or not route.window:
-            return True
-        proportional = max(1, route.window * 15 // 100)
-        reserve = max(proportional, 16384 if self.reserve is None else self.reserve)
-        if reserve >= route.window or self.reserve is None and reserve >= route.window - proportional:
-            reserve = proportional
-        return tokens <= max(0, route.window - reserve)
 
     def candidates(self, key, route, effort):
         if key not in self.chains:

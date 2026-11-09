@@ -211,7 +211,7 @@ class SessionRpc:
         return result
 
     def models(self, _):
-        return {"models": [model_info(route) for route in self.router.routes.values()]}
+        return {"models": [model_info(self.router.fit_context(route)) for route in self.router.routes.values()]}
 
     def set_model(self, command):
         provider, identifier = command.get("provider"), command.get("modelId")
@@ -222,6 +222,7 @@ class SessionRpc:
             route = self.router.routes.get(f"{provider}/{identifier}")
         if not route or route.model != identifier:
             raise RpcFailure("The configured model route was not found.")
+        route = self.router.fit_context(route)
         if route != self.router.route:
             if not self.router.switch(route, "RPC model switch"):
                 raise RpcFailure("No credential is available for the selected model route.")

@@ -106,6 +106,24 @@ class Route:
     def provider(self):
         return self.broker_provider or self.endpoint()
 
+    def context_tiers(self):
+        model = self.catalog_model or {}
+        if "contextWindow" in self.metadata_pins:
+            return None
+        standard = model.get("contextWindow")
+        if type(standard) is not int or standard < 128:
+            return None
+        extended = max(standard, model.get("maxContextWindow") or 0)
+        if model.get("_context_window_override"):
+            return standard, extended
+        policy = model_catalog.catalog_policy(model["provider"], model["id"], self.upstream)
+        extended = max(extended, policy.get("maxContextWindow") or 0)
+        premium = ((model.get("cost") or {}).get("longContext") or {}).get("inputThreshold")
+        if (type(premium) is int and premium >= 128
+                and not (model.get("longContextWindowUncapped") or policy.get("longContextWindowUncapped"))):
+            standard = min(standard, premium)
+        return standard, extended
+
     def effort(self, requested):
         effort = requested if self.reasoning_effort in (None, "auto") else self.reasoning_effort
         return model_catalog.thinking_effort(self.catalog_model, effort)
@@ -151,7 +169,8 @@ def load_prices(name, value):
 
 def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, context_promotion=False,
                 allow_unmatched=False, configured_models=None, extended_context=False, allow_judge=False,
-                responses_websockets=False, codex_websockets=None, muse_store_responses=False, responses_retention=None):
+                responses_websockets=False, codex_websockets=None, muse_store_responses=False, responses_retention=None,
+                compaction_policy=None):
     registry = configured_models or model_catalog
     if path is None:
         if not model_catalog.select_routed(registry, primary):
@@ -191,7 +210,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             raise ValueError(f"Route {name!r} requires the unsupported {transport!r} transport.")
         standard = catalog.get("contextWindow")
         maximum = catalog.get("maxContextWindow")
-        if extended_context and type(standard) is int and type(maximum) is int:
+        if not compaction_policy and extended_context and type(standard) is int and type(maximum) is int:
             standard = max(standard, maximum)
         context_window = (window if name == primary and window is not None
                           else fields.get("context_window", standard))
@@ -376,9 +395,11 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
                 ("context_window", "contextWindow"), ("max_output_tokens", "maxTokens"), ("vision", "input"),
             ) if field_name in fields) | (
                 {"contextWindow"} if (name == primary and window is not None)
-                or (extended_context and maximum is not None and context_window == maximum) else set()
+                or (not compaction_policy and extended_context and maximum is not None and context_window == maximum) else set()
             ),
         )
+        if compaction_policy:
+            route = compaction_policy.fit_route(route)
         if (
             anthropic_server_side_fallback and "server_side_fallbacks" not in fields and api == "anthropic-messages"
             and official_endpoint(route.endpoint())
@@ -416,6 +437,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
                         configured_models=configured_models, extended_context=extended_context,
                         responses_websockets=responses_websockets, codex_websockets=codex_websockets,
                         muse_store_responses=muse_store_responses, responses_retention=responses_retention,
+                        compaction_policy=compaction_policy,
                     )[target]
             if matched and matched.window and matched.window > route.window and matched.name != name:
                 routes[matched.name] = matched
@@ -520,9 +542,10 @@ class BrokerModelAuth(httpx.Auth):
 
 class Router:
     def __init__(self, routes, primary, session, fallback_on, clients_stack, transport_loop=None, broker=None,
-                 *, profile=None, primary_candidates=(), role_hint=None, secrets=None, fixed_primary=False):
+                 *, context_policy, profile=None, primary_candidates=(), role_hint=None, secrets=None, fixed_primary=False):
         self.routes = routes
-        self.primary = routes[primary]
+        self.context_policy = context_policy
+        self.primary = self.fit_context(routes[primary])
         self.session = session
         self.fallback_on = fallback_on
         self.fixed_primary = fixed_primary
@@ -552,17 +575,20 @@ class Router:
         self.thinking = lambda: profile.default_effort if profile and self.route.catalog_model else None
         self.restore()
 
+    def fit_context(self, route):
+        return self.context_policy.fit_route(route)
+
     def restore(self):
         self.pinned_chain = self.fallback_origin = None
         self.clear_inherited_effort()
         self.refusal_pinned = False
-        primaries = [self.routes[name] for name in self.primary_candidates]
+        primaries = [self.fit_context(self.routes[name]) for name in self.primary_candidates]
         if not self.fixed_primary:
             for primary in primaries:
                 restored = self.session.last_route(primary.identity())
                 selected = next((route for route in self.routes.values() if route.identity() == restored), None)
                 if selected and (credential := self.available(selected)) is not None:
-                    self.primary, self.route, self.credential = primary, selected, credential
+                    self.primary, self.route, self.credential = primary, self.fit_context(selected), credential
                     return
         for primary in primaries:
             if (credential := self.available(primary)) is not None:
@@ -830,6 +856,7 @@ class Router:
         return settings
 
     def switch(self, target, reason):
+        target = self.fit_context(target)
         credential = self.available(target)
         if credential is None or target == self.route:
             return False
@@ -860,8 +887,8 @@ class Router:
             vision = route.vision
             if "input" in updates:
                 vision = "image" in updates["input"] and not (model.get("compat") or {}).get("stripImageInput")
-            updated = replace(route, window=window, max_output_tokens=output, vision=vision,
-                              catalog_model={**model, **updates})
+            updated = self.fit_context(replace(route, window=window, max_output_tokens=output, vision=vision,
+                                               catalog_model={**model, **updates}))
             self.routes[name] = updated
             if name == self.route.name:
                 self.route = updated
@@ -872,7 +899,7 @@ class Router:
         target = self.route.promote_to
         if self.fixed_primary or not target or target in visited:
             return False
-        candidate = self.routes[target]
+        candidate = self.fit_context(self.routes[target])
         if not self.route.window or not candidate.window or candidate.window <= self.route.window:
             return False
         previous = self.route.name
@@ -982,7 +1009,7 @@ class Router:
         source = self.route
         visited.add(self.route.name)
         for name in direct:
-            candidate = self.routes[name]
+            candidate = self.fit_context(self.routes[name])
             if defer_anthropic and candidate.api == "anthropic-messages" and (
                 candidate.provider() == defer_anthropic.provider() and candidate.model != defer_anthropic.model
                 and not defer_anthropic.can_redeem_credit(candidate, credit_targets)
@@ -990,7 +1017,8 @@ class Router:
                 continue
             if name in visited or time.monotonic() < self.cooldowns.get(name, 0):
                 continue
-            if name in profile_candidates and not self.profile.fits(candidate, context_tokens):
+            budget = self.context_policy.budget.prompt_budget(candidate.window)
+            if name in profile_candidates and context_tokens is not None and budget is not None and context_tokens > budget:
                 continue
             if self.profile and key and (
                 candidate.provider(), candidate.model, candidate.api, candidate.endpoint(), candidate.upstream, candidate.effort(effort)

@@ -61,6 +61,7 @@ class Usage:
     completion_tokens: int
     context_tokens: int | None = None
     context_prompt_tokens: int | None = None
+    context_completion_tokens: int | None = None
 
     @classmethod
     def from_response(cls, response):
@@ -69,14 +70,16 @@ class Usage:
         input_details = usage.get("input_tokens_details") or {}
         output_details = usage.get("output_tokens_details") or {}
         orchestration_input = input_details.get("orchestration_input_tokens") or 0
-        orchestration = orchestration_input + (output_details.get("orchestration_output_tokens") or 0)
+        orchestration_output = output_details.get("orchestration_output_tokens") or 0
+        orchestration = orchestration_input + orchestration_output
         total = usage.get("total_tokens")
         if type(total) is not int or total <= 0:
-            return cls(inputs, outputs, inputs + outputs, inputs)
+            return cls(inputs, outputs, inputs + outputs, inputs, outputs)
         primary = inputs + outputs
         includes_orchestration = orchestration and abs(total - primary) <= abs(total - primary - orchestration)
         prompt = max(0, inputs - orchestration_input) if includes_orchestration else inputs
-        return cls(inputs, outputs, max(0, total - orchestration), prompt)
+        completion = max(0, outputs - orchestration_output) if includes_orchestration else outputs
+        return cls(inputs, outputs, max(0, total - orchestration), prompt, completion)
 
 
 def replay_bytes(item):

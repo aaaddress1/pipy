@@ -76,6 +76,7 @@ import subagents
 import task_isolation
 from cache_warmer import CacheWarmer
 from cancellable_http import CancellableTransport, TransportLoop, active_turn, turn_scope
+from compaction_policy import CompactionPolicy
 from cost_gate import CostCapError, CostGate, entry_usage, total_cost
 from maintenance_retry import MaintenanceRetry
 from memory import MemoryOptions, bounded, clear_memory, consolidate, guidance, injection, memory_status, redact_memory
@@ -1249,13 +1250,20 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         cost_gate = CostGate(session, spent, args.warn_cost, args.max_cost, cost_notice, account,
                              parent_gate, child.request if child else None, ancestors)
         shared_vault = getattr(args, "model_vault", None)
+        maintenance_layers = getattr(args, "compaction_layers", None)
+        if maintenance_layers is None:
+            maintenance_layers = (args.rule_config, *project_context.settings_layers(workspace))
+        context_policy = CompactionPolicy(maintenance_layers, percent=args.compact_at, keep_recent=args.keep_recent,
+                                          agent=child.task.agent.name if child else None)
         router = Router(args.routes, args.model, session, args.fallback_on, client_stack,
                         getattr(args, "transport_loop", None), getattr(args, "model_credentials", None),
-                        profile=getattr(args, "model_profile", None), primary_candidates=getattr(args, "primary_candidates", ()),
+                        context_policy=context_policy, profile=getattr(args, "model_profile", None),
+                        primary_candidates=getattr(args, "primary_candidates", ()),
                         role_hint=getattr(args, "model_role_hint", None), secrets=getattr(args, "config_secrets", None),
                         fixed_primary=bool(getattr(args, "per_call_guard", None)))
         session.restore_portable(router.route)
-        session.configure_archive(router.route, args.snapcompact_shape, args.compact_at)
+        budget = context_policy.for_route(router.route)
+        session.configure_archive(router.route, args.snapcompact_shape, budget.trigger(router.route.window))
         warmer = CacheWarmer(args.cache_warming)
         inline = InlineImages(args.snapcompact_system_prompt, args.snapcompact_tool_results, args.snapcompact_shape)
         last_inline = 0
@@ -1687,6 +1695,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         def open_child(runtime, child_workspace, lineage, revived=False):
             task = runtime.task
             options = argparse.Namespace(**vars(args))
+            options.compaction_layers = maintenance_layers
             with args.task_route_lock:
                 for name in task.routes:
                     if name not in args.routes:
@@ -2220,9 +2229,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             def key(candidate):
                 return candidate.endpoint(), candidate.api, candidate.model, candidate.upstream
 
-            for candidate in filter(eligible, candidates):
+            for candidate in filter(eligible, map(router.fit_context, candidates)):
                 unique.setdefault(key(candidate), candidate)
-            largest = max((candidate for candidate in tuple(router.routes.values()) if eligible(candidate)
+            largest = max((candidate for candidate in map(router.fit_context, tuple(router.routes.values())) if eligible(candidate)
                            and key(candidate) not in unique), key=lambda route: route.window or 0, default=None)
             if largest:
                 unique[key(largest)] = largest
@@ -2294,6 +2303,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         def compaction_summarizer():
             candidates = maintenance_routes(preferred=True)
             options = {route.identity(): request_options(route) for route in candidates}
+            limit = context_policy.for_route(router.route).summary_limit()
 
             def summarize(transcript, focus=None):
                 instructions = SUMMARY_INSTRUCTIONS
@@ -2310,10 +2320,15 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 messages = [{"role": "system", "content": instructions}, {"role": "user", "content": transcript}]
 
                 def send(route, credential):
+                    cap = min(limit, route.max_output_tokens or limit)
+                    bounded_route = replace(route, max_output_tokens=cap)
+                    request = options[route.identity()]
+                    if route.api == "chat-completions" and not route.catalog_model:
+                        request = request | {"max_completion_tokens": cap}
                     with router.new_client(route, credential, timeout=90) as client:
                         reply, _ = stream_reply(
-                            client, route.model, messages, [], options[route.identity()], guard_options, show=False,
-                            native_route=route, cancel=cancellation.check,
+                            client, route.model, messages, [], request, guard_options, show=False,
+                            native_route=bounded_route, cancel=cancellation.check,
                             meter=cost_gate.meter(route, "compaction"),
                         )
                     if reply.get("tool_calls") or not reply["content"]:
@@ -2384,9 +2399,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             warmer.invalidate()
             router.reset_responses_context()
 
-        maintenance_layers = (args.rule_config, *project_context.settings_layers(workspace))
         compaction = Compaction(
-            session, router.route.window, args.compact_at, args.keep_recent,
+            session, router.route.window, budget.percent, budget.keep_recent,
             compaction_summarizer(), workers, args.compaction_methods, native_compactor(),
             on_context_change=context_changed, prepare_handoff=prepare_handoff,
             context_discount=context_discount, disable_inline=disable_inline,
@@ -2395,8 +2409,17 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             async_enabled=eval_setting(maintenance_layers, "compaction.asyncEnabled") is not False,
             auto_enabled=eval_setting(maintenance_layers, "compaction.enabled") is not False,
             mid_turn_enabled=child is not None or eval_setting(maintenance_layers, "compaction.midTurnEnabled") is not False,
+            budget=budget,
         )
         bound = (router.route, router.credential)
+
+        def reset_compaction_route():
+            route = router.route
+            session.restore_portable(route)
+            budget = context_policy.for_route(route)
+            session.configure_archive(route, args.snapcompact_shape, budget.trigger(route.window))
+            inline.disabled = False
+            compaction.change_model(route.window, compaction_summarizer(), native_compactor(), budget=budget)
 
         def bind_context(*, refresh=False):
             nonlocal bound
@@ -2404,10 +2427,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 refresh_local_metadata(router.route, selection=True)
             current = (router.route, router.credential)
             if current != bound:
-                session.restore_portable(router.route)
-                session.configure_archive(router.route, args.snapcompact_shape, args.compact_at)
-                inline.disabled = False
-                compaction.change_model(router.route.window, compaction_summarizer(), native_compactor())
+                reset_compaction_route()
                 bound = current
                 if rpc and rpc.ready:
                     rpc.event("model_changed")
@@ -3162,10 +3182,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             router.reset_provider_state()
             router.restore()
             restore_effort()
-            session.restore_portable(router.route)
-            session.configure_archive(router.route, args.snapcompact_shape, args.compact_at)
-            inline.disabled = False
-            compaction.change_model(router.route.window, compaction_summarizer(), native_compactor())
+            reset_compaction_route()
             bound = (router.route, router.credential)
             if announce:
                 print(f"Session branch moved to {session.leaf if session.leaf is not None else 'root'}.")
@@ -3882,8 +3899,8 @@ def main():
     parser.add_argument("--continue", dest="continue_session", action="store_true", help="continue its unfinished turn")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".mini-pi")
     parser.add_argument("--context-window", type=int, help="active model context window in tokens")
-    parser.add_argument("--compact-at", type=int, default=70, help="context percentage that commits a summary")
-    parser.add_argument("--keep-recent", type=int, default=20_000, help="maximum retained recent tokens")
+    parser.add_argument("--compact-at", type=int, help="override configured context percentage (default: 70)")
+    parser.add_argument("--keep-recent", type=int, help="override configured maximum retained recent tokens (default: 20000)")
     parser.add_argument(
         "--compaction-methods",
         help="ordered maintenance methods: native,snapcompact,handoff,shake,soft",
@@ -3945,7 +3962,8 @@ def main():
     ):
         parser.error("invalid idle maintenance settings")
     if (
-        not 1 <= args.compact_at <= 99 or args.keep_recent < 1
+        (args.compact_at is not None and not 1 <= args.compact_at <= 99)
+        or (args.keep_recent is not None and args.keep_recent < 1)
         or (args.memory_idle_hours is not None and not 0 <= args.memory_idle_hours <= 720)
         or (args.context_window is not None and args.context_window < 128)
     ):
@@ -4037,6 +4055,8 @@ def main():
             args.fallback_on = policy if policy in ("any", "usage-limit", "except-usage-limit") else "any"
         if dotted(settings, "retry.modelFallback") is False:
             args.fallback_on = "off"
+        context_policy = CompactionPolicy((settings, *project_context.settings_layers(workspace)),
+                                          percent=args.compact_at, keep_recent=args.keep_recent)
         route_options = {
             "responses_websockets": dotted(settings, "providers.openaiResponsesWebsockets") is True,
             "responses_retention": dotted(settings, "providers.cacheRetention"),
@@ -4044,7 +4064,7 @@ def main():
             "muse_store_responses": dotted(settings, "providers.museCode.storeResponses") is True,
             "anthropic_server_side_fallback": dotted(settings, "providers.anthropic.serverSideFallback") is True,
             "context_promotion": dotted(settings, "contextPromotion.enabled") is True,
-            "extended_context": dotted(settings, "extendedContext") is True,
+            "compaction_policy": context_policy,
             "configured_models": catalog_for(settings, state, args.config_secrets),
         }
         args.routes = (load_routes(args.route_config, args.model, args.context_window, allow_unmatched=True, **route_options)

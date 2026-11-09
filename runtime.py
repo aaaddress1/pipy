@@ -19,6 +19,7 @@ import session_graph as graph
 from service_runtime import SCHEMA as SERVICE_SCHEMA
 import snapcompact
 from cancellable_http import active_turn, turn_scope
+from compaction_policy import Budget
 from model_catalog import RESPONSES_APIS
 from recovery import StreamInterrupted, TRANSPORT_ERRORS
 from shake import AUTO, RESCUE, artifact_id, plan
@@ -285,10 +286,10 @@ class Session:
             self.compact(start, summary, metadata)
             self.batches[:0] = archived
 
-    def configure_archive(self, route, shape, percent):
+    def configure_archive(self, route, shape, threshold):
         self.archive_route = route
         self.archive_shape = shape
-        self.archive_threshold = route.window * percent // 100 if route.window else None
+        self.archive_threshold = threshold
         self._archive_view = None
         self.archive_images_disabled = False
 
@@ -604,15 +605,15 @@ class Compaction:
         self, session, window, percent, keep_recent, summarize, executor, methods=("native", "shake", "soft"),
         native_compact=None, on_context_change=None, prepare_handoff=None, context_discount=None, disable_inline=None,
         on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True, mid_turn_enabled=True,
+        budget=None,
     ):
         self.session = session
         self.window = window
-        self.percent = percent
+        self.budget = budget or Budget(percent=percent, keep_recent=keep_recent)
         self.auto_enabled = auto_enabled
         self.async_enabled = async_enabled
         self.mid_turn_enabled = mid_turn_enabled
-        self.threshold = window * percent // 100 if window else None
-        self.keep_recent = keep_recent
+        self.threshold = self.budget.trigger(window)
         self.summarize = summarize
         self.executor = executor
         self.methods = methods
@@ -637,9 +638,11 @@ class Compaction:
             self.pending.future.cancel()
             self.pending = None
 
-    def change_model(self, window, summarize, native_compact=None):
+    def change_model(self, window, summarize, native_compact=None, *, budget=None):
         self.window = window
-        self.threshold = window * self.percent // 100 if window else None
+        if budget is not None:
+            self.budget = budget
+        self.threshold = self.budget.trigger(window)
         self.summarize = summarize
         self.native_compact = native_compact
         self.reset_context()
@@ -691,21 +694,28 @@ class Compaction:
             estimated = max(estimated, actual_at_request + estimated - estimate_at_request)
         return max(estimated, stored) if floor_stored else estimated
 
+    @property
+    def prompt_budget(self):
+        return self.budget.prompt_budget(self.window)
+
+    def fits_prompt(self, system):
+        return self.prompt_budget is None or self.estimate(self.messages(system), floor_stored=True) <= self.prompt_budget
+
     def cut_index(self):
         if len(self.session.batches) < 2:
             return None
-        budget = self.keep_recent
-        if self.threshold:
-            recovery = self.threshold * 80 // 100
-            proportional = max(self.window * 15 // 100, 1)
-            effective = max(proportional, 16_384)
-            reserve = min(16_384, proportional if effective >= self.window - proportional else effective)
-            budget = min(budget, max(1, recovery - reserve if recovery > reserve else recovery // 2))
-        kept = 0
-        cut = len(self.session.batches) - 1
+        budget = self.budget.recent_budget(self.window)
         thinking_route = self.thinking_route()
+        batches = self.session.batches
+        if self.measured:
+            stored = tokens([portable_message(message, thinking_route) for _, batch in batches for message in batch])
+            prompt = self.measured[1]
+            if prompt > stored:
+                budget = max(1, budget * stored // prompt)
+        kept = 0
+        cut = len(batches) - 1
         for index in range(cut, -1, -1):
-            kept += tokens([portable_message(message, thinking_route) for message in self.session.batches[index][1]])
+            kept += tokens([portable_message(message, thinking_route) for message in batches[index][1]])
             if kept > budget:
                 break
             cut = index
@@ -758,6 +768,7 @@ class Compaction:
         methods = self.methods if methods is None else methods
         if not methods:
             return False
+        retrying = reason in ("overflow", "incomplete")
         if reason == "threshold" and (self.threshold is None or phase == "mid" and not self.mid_turn_enabled):
             return False
         estimated = self.estimate(self.messages(system), floor_stored=reason == "threshold")
@@ -798,14 +809,16 @@ class Compaction:
                     return reclaimed
                 if reclaimed:
                     changed = True
-                    if self.threshold is None or self.estimate(self.messages(system)) <= self.threshold * 80 // 100:
+                    if retrying and self.fits_prompt(system):
+                        return True
+                    if not retrying and (
+                        self.threshold is None or self.estimate(self.messages(system)) <= self.threshold * 80 // 100
+                    ):
                         return True
             else:
-                recovery_band = (
-                    self.threshold * 80 // 100
-                    if method == "snapcompact" and reason in ("threshold", "overflow", "incomplete") and self.threshold
-                    else None
-                )
+                recovery_band = self.prompt_budget if retrying else None
+                if method == "snapcompact" and reason == "threshold" and self.threshold:
+                    recovery_band = self.threshold * 80 // 100
                 attempt = partial(
                     self.summarize_history, system, reason != "threshold", method, recovery_band,
                     pending_only=method == "handoff" and reason in ("overflow", "media"),
@@ -814,15 +827,14 @@ class Compaction:
                 if self.maintenance_attempt(reason, method, attempt):
                     return True
         if reason in ("threshold", "overflow", "incomplete") and self.shrink_archive(system):
-            return True
-        if reason in ("overflow", "incomplete") and "shake" in methods:
+            if not retrying or self.fits_prompt(system):
+                return True
+            changed = True
+        if retrying and "shake" in methods:
             changed = self.shake(RESCUE) or changed
         if reason == "threshold" and phase == "mid" and not changed:
             self.threshold_dead_end = self.threshold_cut()
-        return changed and (
-            reason not in ("overflow", "incomplete") or self.window is None
-            or self.estimate(self.messages(system)) < self.window
-        )
+        return changed and (not retrying or self.fits_prompt(system))
 
     def threshold_cut(self):
         index = self.cut_index()
@@ -1062,7 +1074,7 @@ class Compaction:
             result = future.result()
             summary = CompactionSummary(result) if isinstance(result, str) else result
             native = summary.native if isinstance(summary, CompactionSummary) else None
-            grew = estimated - snapshot.context_tokens > max(self.keep_recent, 8192)
+            grew = estimated - snapshot.context_tokens > max(self.budget.keep_recent, 8192)
             band = self.armed_recovery_band(snapshot, summary)
             if (grew and not (native and native.get("block"))) or not self.compaction_costs(
                 system, self.messages(system), snapshot, summary, band, True,
@@ -1072,7 +1084,8 @@ class Compaction:
     def armed_recovery_band(self, snapshot, summary, default=None):
         native = summary.native if isinstance(summary, CompactionSummary) else None
         if self.threshold and self.session.leaf != snapshot.leaf and not (native and native.get("block")):
-            return self.threshold * 80 // 100
+            band = self.threshold * 80 // 100
+            return min(default, band) if default is not None else band
         return default
 
     def summarize_history(self, system, force, method, recovery_band=None, *, pending_only=False, automatic=True, focus=None):

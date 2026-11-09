@@ -105,6 +105,7 @@ class TurnRecovery:
         self.same_model_retry = False
         self.body_timeout_seen = False
         self.body_timeout_retry = False
+        self.output_cap_retry = False
         self.retry_attempts = 0
         self.fallback_cooldown = None
         self.request_system = None
@@ -115,8 +116,8 @@ class TurnRecovery:
 
     def maintain(self, system, phase="pre"):
         self.bind_context()
-        if self.body_timeout_retry:
-            self.body_timeout_retry = False
+        if self.body_timeout_retry or self.output_cap_retry:
+            self.body_timeout_retry = self.output_cap_retry = False
             return
         same_model, self.same_model_retry = self.same_model_retry, False
 
@@ -389,19 +390,25 @@ class TurnRecovery:
 
         self.compaction.observe(messages, error.usage)
         threshold = self.compaction.threshold
-        below_threshold = threshold is not None and self.compaction.estimate(messages) <= threshold
-        if below_threshold and error.text.strip() and not error.tool_draft:
+        occupancy = self.compaction.provider_context
+        output = getattr(error.usage, "context_completion_tokens", None)
+        if output is None:
+            output = getattr(error.usage, "completion_tokens", 0) or 0
+        prompt = max(0, occupancy - output) if occupancy else self.compaction.estimate(messages, floor_stored=True)
+        exhausted = threshold is None or prompt > threshold or occupancy > self.compaction.prompt_budget
+        if not exhausted and error.text.strip() and not error.tool_draft:
             self.session.append([{"role": "assistant", "content": error.text}])
             print("[generation limit reached; kept the visible response]", file=sys.stderr)
             return "finish"
-        if not below_threshold and self.promote():
+        if self.promote():
             return "retry"
         if self.take("incomplete output"):
-            if not below_threshold and self.compaction.maintain(system, reason="incomplete"):
+            if exhausted and self.compaction.maintain(system, reason="incomplete"):
                 return "retry"
-            if below_threshold:
+            if not exhausted:
                 if self.attempts["incomplete output"] == 1:
                     self.remind("The model hit its output limit. Continue in smaller steps.")
+                self.output_cap_retry = True
                 return "retry"
         if error.text.strip() and not error.tool_draft:
             self.remind("The previous response hit its output limit. Continue where its visible text stopped.", text=error.text)

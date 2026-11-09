@@ -203,6 +203,8 @@ class Provider:
             )}
         if "contextWindow" in override and "maxContextWindow" not in override:
             row.pop("maxContextWindow", None)
+        if model or "contextWindow" in override:
+            row["_context_window_override"] = True
         row.update(provider=self.name, id=identifier)
         if discovered:
             row["_discovered"] = True
