@@ -2361,6 +2361,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             on_event=rpc.event if rpc else None,
             thinking_route=lambda: chat_thinking_scope(router.route),
             async_enabled=dotted(args.rule_config, "compaction.asyncEnabled") is not False,
+            auto_enabled=dotted(args.rule_config, "compaction.enabled") is not False,
         )
         bound = (router.route, router.credential)
 
@@ -2546,6 +2547,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 base_delay=getattr(args, "maintenance_retry_base", .5),
                 retry_enabled=getattr(args, "maintenance_retry_enabled", True),
                 loop_redirect=loop_level_setting != "off" and os.getenv("PI_NO_THINKING_LOOP_GUARD") != "1",
+                check=cancellation.check if cancellation else None,
             )
 
         sharpshooter = None
@@ -3846,7 +3848,7 @@ def main():
     parser.add_argument("--compact-at", type=int, default=70, help="context percentage that commits a summary")
     parser.add_argument("--keep-recent", type=int, default=20_000, help="maximum retained recent tokens")
     parser.add_argument(
-        "--compaction-methods", default="native,snapcompact,handoff,shake,soft",
+        "--compaction-methods",
         help="ordered maintenance methods: native,snapcompact,handoff,shake,soft",
     )
     parser.add_argument("--handoff-save-to-disk", action="store_true", help="save automatic handoff documents")
@@ -3887,11 +3889,13 @@ def main():
         parser.error("MCP notification debounce must be nonnegative")
     if args.mode != "interactive" and (args.task is not None or args.continue_session or args.export_jsonl):
         parser.error(f"--mode {args.mode} accepts prompts on stdin")
-    args.compaction_methods = tuple(part.strip() for part in args.compaction_methods.split(","))
-    if len(set(args.compaction_methods)) != len(args.compaction_methods) or any(
-        method not in ("native", "snapcompact", "handoff", "shake", "soft") for method in args.compaction_methods
-    ):
-        parser.error("--compaction-methods must list distinct methods from native,snapcompact,handoff,shake,soft")
+    default_methods = ("native", "snapcompact", "handoff", "shake", "soft")
+    if args.compaction_methods is not None:
+        args.compaction_methods = tuple(part.strip() for part in args.compaction_methods.split(","))
+        if len(set(args.compaction_methods)) != len(args.compaction_methods) or any(
+            method not in default_methods for method in args.compaction_methods
+        ):
+            parser.error("--compaction-methods must list distinct methods from native,snapcompact,handoff,shake,soft")
     if args.export_jsonl and (not (args.session or args.fork or args.import_jsonl) or args.task is not None or args.continue_session):
         parser.error("--export-jsonl requires a session source and no task")
     if not args.cwd.is_dir() or min(args.max_steps, args.retry_max_retries or 0, args.retry_max_delay or 0) < 0:
@@ -3950,6 +3954,12 @@ def main():
         args.task_route_lock = RLock()
         args.task_user_dir = agent_config_dir(active_profile()) / "agents"
         args.rule_config = settings
+        if args.compaction_methods is None:
+            configured = dotted(settings, "compaction.methodOrder")
+            args.compaction_methods = tuple(dict.fromkeys(
+                "native" if method == "remote" else method for method in configured
+                if isinstance(method, str) and (method == "remote" or method in default_methods)
+            )) if isinstance(configured, list) else default_methods
         for flag, key in (("warn_cost", "session.warnCost"), ("max_cost", "session.maxCost")):
             threshold = dotted(settings, key)
             if getattr(args, flag) is None and threshold is not None:

@@ -145,6 +145,14 @@ def nodes(db, session, leaf, after=0):
     """, (leaf, session, session, after)).fetchall()
 
 
+def apply_elision(message, edit):
+    if isinstance(edit, dict):
+        if saved := message.get("_responses"):
+            return {**message, "_responses": {**saved, "prefix": edit["responses_prefix"]}}
+        return message
+    return {**message, "content": edit}
+
+
 def stored_batches(db, session, leaf, start=0, before=None, *, apply_elisions=True):
     rows = db.execute(ANCESTORS + """
         SELECT b.seq,b.messages FROM ancestry a
@@ -162,9 +170,9 @@ def stored_batches(db, session, leaf, start=0, before=None, *, apply_elisions=Tr
             if seq in by_seq and 0 <= index < len(by_seq[seq]):
                 by_seq[seq][index] = message
         else:
-            for seq, index, content in json.loads(data):
+            for seq, index, edit in json.loads(data):
                 if seq in by_seq and 0 <= index < len(by_seq[seq]):
-                    by_seq[seq][index]["content"] = content
+                    by_seq[seq][index] = apply_elision(by_seq[seq][index], edit)
     return batches
 
 

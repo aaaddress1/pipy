@@ -50,6 +50,12 @@ class ContextWindowExceeded(IncompleteTurn):
     pass
 
 
+class ResponsesBodyReadTimeout(APIStatusError):
+    """The submitted HTTP request contained full Responses history."""
+
+    replay_prefixes = None
+
+
 RECOVERABLE_ERRORS = (IncompleteTurn, APIStatusError, ModelCredentialError, ThinkingLoop)
 
 
@@ -81,7 +87,7 @@ def media_rejection(error):
 class TurnRecovery:
     def __init__(self, session, compaction, router, rate_limit_walks_chain, bind_context, max_retries, max_delay,
                  wait=time.sleep, auto_reset=None, wait_for_usage_reset=False, base_delay=.5, retry_enabled=True,
-                 loop_redirect=True):
+                 loop_redirect=True, check=None):
         self.session = session
         self.compaction = compaction
         self.router = router
@@ -95,7 +101,11 @@ class TurnRecovery:
         self.base_delay = base_delay
         self.retry_enabled = retry_enabled
         self.loop_redirect = loop_redirect
+        self.check = check
         self.same_model_retry = False
+        self.body_timeout_seen = False
+        self.body_timeout_retry = False
+        self.retry_attempts = 0
         self.fallback_cooldown = None
         self.request_system = None
         self.attempts = {}
@@ -105,6 +115,9 @@ class TurnRecovery:
 
     def maintain(self, system):
         self.bind_context()
+        if self.body_timeout_retry:
+            self.body_timeout_retry = False
+            return
         same_model, self.same_model_retry = self.same_model_retry, False
         while (
             not same_model and self.router.route.promote_to
@@ -140,6 +153,7 @@ class TurnRecovery:
         if not self.router.fallback(self.visited_routes, usage_limit, deferred, **options):
             return None
         self.attempts.clear()
+        self.retry_attempts = 0
         self.attempted_credentials.clear()
         return "retry"
 
@@ -166,6 +180,29 @@ class TurnRecovery:
         count = self.attempts.get(reason, 0) + 1
         self.attempts[reason] = count
         return count if count <= limit else None
+
+    def take_retry(self):
+        if self.retry_attempts >= self.max_retries:
+            return None
+        self.retry_attempts += 1
+        return self.retry_attempts
+
+    def recover_body_read_timeout(self, error):
+        if (self.body_timeout_seen or not self.retry_enabled or self.retry_attempts >= self.max_retries
+            or not self.compaction.auto_enabled or "shake" not in self.compaction.methods):
+            return None
+        self.body_timeout_seen = True
+        if not self.compaction.shake_for_body_read_timeout(self.check, error.replay_prefixes):
+            return None
+        attempt = self.take_retry()
+        hint = retry_after(error.response, error, provider=self.router.route.broker_provider)
+        delay = max(hint or 0, retry_backoff(attempt, self.base_delay))
+        if self.max_delay and delay > self.max_delay:
+            return None
+        print(f"[Responses request-body timeout; retrying a smaller request in {delay:g}s]", file=sys.stderr)
+        self.wait(delay)
+        self.body_timeout_retry = True
+        return "retry"
 
     def restore_quota(self, hint=None):
         if not self.auto_reset or type(self.router.credential) is not int:
@@ -221,7 +258,7 @@ class TurnRecovery:
         deadline = now + (hint if hint is not None else QUOTA_GUESS) * 1000
         block = self.router.mark_quota(deadline, hint is not None)
         self.fallback_cooldown = hint if hint is not None else QUOTA_GUESS
-        attempt = self.take("provider quota", self.max_retries)
+        attempt = self.take_retry()
         if attempt is not None and self.router.select_alternate(self.attempted_credentials):
             return "retry"
         if kind == "billing":
@@ -235,8 +272,10 @@ class TurnRecovery:
         self.request_system = system
         if getattr(error, "replay_unsafe", False):
             return None
+        if isinstance(error, ResponsesBodyReadTimeout):
+            return self.recover_body_read_timeout(error)
         if isinstance(error, ThinkingLoop):
-            attempt = self.take("thinking loop", self.max_retries) if self.retry_enabled else None
+            attempt = self.take_retry() if self.retry_enabled else None
             if attempt is None:
                 return None
             delay = retry_backoff(attempt, self.base_delay)
@@ -266,7 +305,7 @@ class TurnRecovery:
                 return None
             if restored := self.restore_quota():
                 return restored
-            attempt = self.take("provider quota", self.max_retries)
+            attempt = self.take_retry()
             active, timed, _ = self.router.quota_availability()
             return self.wait_quota(UsageBlock(None, active, prior_timed=timed), timed is not None, attempt)
         if isinstance(error, ModelCredentialError):
@@ -372,11 +411,12 @@ class TurnRecovery:
         if not self.router.promote(self.visited_routes):
             return False
         self.attempts.clear()
+        self.retry_attempts = 0
         self.attempted_credentials.clear()
         return True
 
     def retry_or_fallback(self, reason, provider_delay=None, *, retry_allowed=True, rate_limited=False, retry_first=False):
-        attempt = self.take(reason, self.max_retries) if retry_allowed else None
+        attempt = self.take_retry() if retry_allowed else None
         delay = max(provider_delay or 0, retry_backoff(attempt, self.base_delay)) if attempt is not None else None
         if self.fallback_cooldown is None and provider_delay:
             self.fallback_cooldown = provider_delay

@@ -52,7 +52,7 @@ def portable_message(message, thinking_route=None):
     private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
-               "_thinking_loop_redirect")
+               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -311,14 +311,16 @@ class Session:
         for seq, batch in self.batches:
             for index, message in enumerate(batch):
                 if (seq, index) in replacements:
-                    batch[index] = {**message, "content": replacements[seq, index]}
+                    batch[index] = graph.apply_elision(message, replacements[seq, index])
 
-    def archive_elisions(self, replacements, artifacts):
+    def archive_elisions(self, replacements, artifacts, *, check=None):
         with database(self.path) as db:
             db.executemany(
                 "INSERT OR IGNORE INTO artifacts(session, id, content) VALUES (?, ?, ?)",
                 ((self.id, identifier, text) for identifier, text in artifacts.items()),
             )
+            if check:
+                check()
             leaf = graph.append(
                 db, self.id, self.leaf, "elision",
                 payload=[(seq, index, text) for (seq, index), text in replacements.items()],
@@ -592,12 +594,12 @@ class Compaction:
     def __init__(
         self, session, window, percent, keep_recent, summarize, executor, methods=("native", "shake", "soft"),
         native_compact=None, on_context_change=None, prepare_handoff=None, context_discount=None, disable_inline=None,
-        on_event=None, thinking_route=None, async_enabled=True,
+        on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True,
     ):
         self.session = session
         self.window = window
         self.percent = percent
-        self.auto_enabled = True
+        self.auto_enabled = auto_enabled
         self.async_enabled = async_enabled
         self.threshold = window * percent // 100 if window else None
         self.keep_recent = keep_recent
@@ -688,21 +690,35 @@ class Compaction:
         return Snapshot(self.session.first_kept, self.session.batches[cut][0], estimated, payload,
                         self.session.navigation_epoch, self.session.leaf)
 
-    def shake(self, preset):
-        portable = [(seq, [portable_message(message) for message in batch]) for seq, batch in self.session.batches]
-        replacements, artifacts, savings = plan(portable, tokens, preset)
+    def shake_for_body_read_timeout(self, check=None, replay_prefixes=None):
+        return self.shake(AUTO, tool_results_only=True, check=check, replay_prefixes=replay_prefixes)
+
+    def shake(self, preset, *, tool_results_only=False, check=None, replay_prefixes=None):
+        if check:
+            check()
+        replacements, artifacts, savings = plan(
+            self.session.batches, tokens, preset, tool_results_only=tool_results_only,
+            message_tokens=lambda message: tokens(portable_message(message)),
+        )
         if not savings:
             return False
-        self.on_context_change()
+        elided = len(replacements)
+        if replay_prefixes:
+            for seq, batch in self.session.batches:
+                for index, message in enumerate(batch):
+                    if saved := message.get("_responses"):
+                        if prefix := replay_prefixes.get((saved["route"], saved["prefix"])):
+                            replacements[seq, index] = {"responses_prefix": prefix}
         try:
-            self.session.archive_elisions(replacements, artifacts)
+            self.session.archive_elisions(replacements, artifacts, check=check)
         except SQLiteError:
             print("[shake: could not save recovery artifacts]", file=sys.stderr)
             return False
+        self.on_context_change()
         self.discard_pending()
         self.last_cuts.clear()
         self.native_speculation_failed = False
-        print(f"[shake: reclaimed ~{savings} tokens in {len(replacements)} messages]", file=sys.stderr)
+        print(f"[shake: reclaimed ~{savings} tokens in {elided} messages]", file=sys.stderr)
         return True
 
     def maintain(self, system, reason="threshold", focus=None, *, methods=None):

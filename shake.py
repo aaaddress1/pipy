@@ -90,8 +90,23 @@ def elide(content, ranges, count_tokens, artifacts):
     return content
 
 
-def plan(batches, count_tokens, preset):
+def tool_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(part["text"] for part in content or () if part["type"] == "text" and part["text"])
+
+
+def replace_tool_text(content, replacement):
+    if isinstance(content, str):
+        return replacement
+    first = next(index for index, part in enumerate(content) if part["type"] == "text" and part["text"])
+    return [{"type": "text", "text": replacement} if index == first else part
+            for index, part in enumerate(content) if index == first or part["type"] != "text"]
+
+
+def plan(batches, count_tokens, preset, *, tool_results_only=False, message_tokens=None):
     """Return message content overrides, their artifact bodies, and actual estimated savings."""
+    message_tokens = message_tokens or count_tokens
     replacements, artifacts = {}, {}
     recent = savings = 0
     for seq, batch in reversed(batches):
@@ -102,26 +117,34 @@ def plan(batches, count_tokens, preset):
         }
         for index in range(len(batch) - 1, -1, -1):
             message = batch[index]
-            protected = recent < preset.protect_tokens
-            recent += count_tokens(message)
+            tool = message["role"] == "tool"
+            useless = tool and tool_results_only and not message.get("_tool_error") and (
+                message.get("_tool_useless") or (message.get("_tool_details") or {}).get("useless")
+            )
+            protected = recent < preset.protect_tokens and not useless
+            recent += message_tokens(message)
             content = message.get("content")
-            if protected or not isinstance(content, str) or not content.strip():
+            if protected:
                 continue
-            if message["role"] == "tool":
-                if content.startswith("[shaken ~") or protected_result(calls.get(message.get("tool_call_id")), preset):
+            if tool:
+                original = tool_text(content)
+                if (not original.strip() or original.startswith("[shaken ~") or "_tool_pruned_at" in message
+                    or protected_result(calls.get(message.get("tool_call_id")), preset)):
                     continue
-                ranges = [(0, len(content))]
-            elif message["role"] in ("user", "assistant", "developer"):
+                ranges = [(0, len(original))]
+            elif (not tool_results_only and message["role"] in ("user", "assistant", "developer")
+                  and isinstance(content, str) and content.strip()):
+                original = content
                 ranges = [
                     (start, end) for start, end in block_ranges(content)
                     if count_tokens(content[start:end]) >= FENCE_MIN_TOKENS
                 ]
             else:
                 continue
-            replacement = elide(content, ranges, count_tokens, artifacts)
-            if replacement != content:
-                replacements[seq, index] = replacement
-                savings += count_tokens(content) - count_tokens(replacement)
+            replacement = elide(original, ranges, count_tokens, artifacts)
+            if replacement != original:
+                replacements[seq, index] = replace_tool_text(content, replacement) if tool else replacement
+                savings += count_tokens(original) - count_tokens(replacement)
 
     if savings <= 0 or savings < preset.min_savings:
         return {}, {}, 0

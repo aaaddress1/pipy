@@ -139,6 +139,18 @@ def text_and_images(content):
     return "\n".join(block["text"] for block in output)
 
 
+def valid_elision(edit):
+    if isinstance(edit, dict):
+        return set(edit) == {"responses_prefix"} and isinstance(edit["responses_prefix"], str)
+    return isinstance(edit, str) or isinstance(edit, list) and all(
+        isinstance(part, dict) and (
+            part.get("type") == "text" and isinstance(part.get("text"), str)
+            or part.get("type") == "image_url" and isinstance(part.get("image_url"), dict)
+            and isinstance(part["image_url"].get("url"), str)
+        ) for part in edit
+    )
+
+
 def import_message(entry):
     kind = entry["type"]
     if kind == "branch_summary":
@@ -191,6 +203,10 @@ def import_message(entry):
             result["_tool_details"] = message["details"]
         if type(message.get("isError")) is bool:
             result["_tool_error"] = message["isError"]
+        if type(message.get("prunedAt")) in (int, float):
+            result["_tool_pruned_at"] = message["prunedAt"]
+        if message.get("useless") is True:
+            result["_tool_useless"] = True
         return result
     if role == "assistant":
         content = message.get("content") or ()
@@ -343,7 +359,7 @@ def import_journal(db_path, workspace, source):
                 for item in entry.get("data") or ():
                     if (
                         isinstance(item, list) and len(item) == 3 and isinstance(item[0], str) and item[0] in batches
-                        and type(item[1]) is int and isinstance(item[2], str)
+                        and type(item[1]) is int and valid_elision(item[2])
                     ):
                         edits.append((batches[item[0]], item[1], item[2]))
                 node = graph.append(db, session, parent, "elision", payload=edits)
@@ -431,6 +447,10 @@ def export_message(message, call_names):
                   "timestamp": now}
         if details := message.get("_tool_details"):
             result["details"] = details
+        if "_tool_pruned_at" in message:
+            result["prunedAt"] = message["_tool_pruned_at"]
+        if message.get("_tool_useless"):
+            result["useless"] = True
     elif role == "assistant":
         if message.get("_thinking"):
             content.insert(0, {"type": "thinking", "thinking": message["_thinking"]})

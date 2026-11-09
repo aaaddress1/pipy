@@ -1,6 +1,7 @@
 """Responses transport for the shared Mini Pi transcript."""
 
 import json
+import re
 import sys
 import time
 from concurrent.futures import CancelledError
@@ -25,7 +26,10 @@ from responses_websocket import generation_evidence
 from cancellable_http import active_turn, sse_frames
 from cost_gate import CostCapError
 from handoff import deadline
-from recovery import ContextWindowExceeded, EmptyTurn, IncompleteTurn, StreamInterrupted, TRANSPORT_ERRORS, context_overflow
+from recovery import (
+    ContextWindowExceeded, EmptyTurn, IncompleteTurn, ResponsesBodyReadTimeout, StreamInterrupted, TRANSPORT_ERRORS,
+    context_overflow, retry_after,
+)
 from runtime import CompactionSummary, responses_replay_matches, responses_replay_scope, tokens
 from snapcompact import responses_content
 from snapcompact_inline import stb_messages
@@ -40,6 +44,8 @@ GATEWAY_FIELDS = frozenset(("provider", "providerOptions", "caching", "cache_anc
 EXTRA_FIELDS = GATEWAY_FIELDS | {"prompt_cache_options", "cache_control"}
 V2_TIMEOUT = 300
 STABLE_REPLAY_PREFIX = "stable:"
+TOOL_REPLAY_PREFIX = "tool-output-independent:"
+BODY_READ_TIMEOUT = re.compile(r"\btimed out reading request body\b", re.I)
 
 
 def sdk_body(body):
@@ -60,11 +66,19 @@ class Usage:
         return cls(usage.get("input_tokens") or 0, usage.get("output_tokens") or 0)
 
 
-def append_items(items, digests, added):
+def replay_bytes(item):
+    return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def append_items(items, digests, added, canonical):
     for item in added:
-        encoded = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        encoded = replay_bytes(item)
         for digest in digests:
             digest.update(encoded)
+        if canonical:
+            # Shake may replace the result text while keeping the call and every native output item.
+            canonical.update(replay_bytes({key: value for key, value in item.items() if key != "output"})
+                             if item.get("type") == "function_call_output" else encoded)
         items.append(item)
 
 
@@ -72,13 +86,14 @@ def replay_digest(instructions, tools, effort):
     return sha256(json.dumps([instructions, tools, effort], ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
 
-def request_body(route, model, messages, schemas, effort, *, max_tokens=None, user_items=None):
+def request_body(route, model, messages, schemas, effort, *, max_tokens=None, user_items=None, replay_prefixes=None):
     instructions = "\n\n".join(message["content"] for message in messages if message["role"] == "system")
     tools = [{"type": "function", "strict": False, **schema["function"]} for schema in schemas]
     identity = route.identity() if route.model == model else None
     stable = bool(identity and supports_effort_updates(route))
     prefix_tag = STABLE_REPLAY_PREFIX if stable else ""
     digest = replay_digest(instructions, tools, STABLE_REPLAY_PREFIX if stable else effort)
+    canonical = digest.copy() if identity and route.api == "openai-responses" else None
     # Older sessions included the effort in the replay fingerprint. Preserve
     # their native items only when the original instructions, tools and history still match.
     legacy = ()
@@ -104,11 +119,15 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
             content = message.get("content")
             calls = message.get("tool_calls", [])
             saved = message.get("_responses")
+            canonical_prefix = prefix_tag + TOOL_REPLAY_PREFIX + canonical.hexdigest() if canonical else None
             if (
                 identity and saved and saved["route"] == identity and saved["text"] == content and saved["calls"] == calls
-                and (saved["prefix"] == prefix_tag + digest.hexdigest()
+                and (canonical_prefix is not None and saved["prefix"] == canonical_prefix
+                     or saved["prefix"] == prefix_tag + digest.hexdigest()
                      or any(saved["prefix"] == candidate.hexdigest() for candidate in legacy))
             ):
+                if replay_prefixes is not None and canonical_prefix and saved["prefix"] != canonical_prefix:
+                    replay_prefixes[identity, saved["prefix"]] = canonical_prefix
                 added = [{key: value for key, value in item.items() if key != "id"}
                          if item.get("type") == "web_search_call" else item for item in saved["items"]]
             else:
@@ -125,7 +144,7 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
             added = [{"role": role, "content": responses_content(message.get("content") or "")}]
         if user_items is not None and authored:
             user_items.extend(item for item in added if item.get("role") == "user")
-        append_items(items, digests, added)
+        append_items(items, digests, added, canonical)
     body = {
         "model": route.wire_model(effort) if identity else model, "input": items,
         "store": False, "include": ["reasoning.encrypted_content"],
@@ -144,7 +163,7 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
         body["reasoning"] = {"summary": "auto"}
         if effort != "auto":
             body["reasoning"]["effort"] = effort
-    return body, prefix_tag + digest.hexdigest()
+    return body, prefix_tag + (TOOL_REPLAY_PREFIX + canonical.hexdigest() if canonical else digest.hexdigest())
 
 
 def compaction_summary(route, items):
@@ -542,9 +561,24 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None,
 
 def http_events(client, body, prepare_resumed, limits):
     watch = stream_watchdog.Watchdog("Responses stream", limits)
-    client = watch.client(client)
+    client = watch.client(client).with_options(max_retries=0)
+    request = sdk_body(body)
     with watch.opening():
-        stream = client.responses.create(**sdk_body(body), stream=True)
+        for attempt in range(6):
+            try:
+                stream = client.responses.create(**request, stream=True)
+                break
+            except APIStatusError as error:
+                if error.status_code != 408 or not BODY_READ_TIMEOUT.search(error.response.text):
+                    raise
+                if "previous_response_id" not in body:
+                    raise ResponsesBodyReadTimeout(error.message, response=error.response, body=error.body) from error
+                hint = retry_after(error.response, error)
+                if attempt == 5 or error.response.headers.get("x-should-retry") == "false" or hint is not None and hint > 60:
+                    raise
+                delay = .5 * 2 ** attempt if hint is None else hint
+                budget = watch.network_budget()
+                watch.wait(delay if budget is None else min(delay, budget))
     if prepare_resumed and body.get("store") is True:
         yield from responses_resume.events(client, stream, prepare_resumed, watch)
         return
@@ -671,7 +705,8 @@ def stream_attempt(
     turn=None, usage_observer=None, tracker=None, on_text=None, speculation=None, websocket=None, codex_turn=None,
     live_source=None, effort_control=None, http_chain=None,
 ):
-    body, fingerprint = request_body(route, model, messages, schemas, effort)
+    replay_prefixes = {}
+    body, fingerprint = request_body(route, model, messages, schemas, effort, replay_prefixes=replay_prefixes)
     prepare_resumed = None
     if stored_host(route):
         body["store"] = True
@@ -795,6 +830,9 @@ def stream_attempt(
                         visible.append(message["content"])
                         print(message["content"], end="", flush=True)
                     return message, usage
+    except ResponsesBodyReadTimeout as error:
+        error.replay_prefixes = replay_prefixes
+        raise
     except APIStatusError:
         raise
     except (APIError, ValueError, KeyError, TypeError, *TRANSPORT_ERRORS) as error:
