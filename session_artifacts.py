@@ -1,9 +1,12 @@
 """Transfer the artifact directory that accompanies a session journal."""
 
+import os
 import re
 import shutil
 import stat
 from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from shake import artifact_id
 
@@ -45,6 +48,16 @@ def copy_files(source, target, *, skip=None):
                 shutil.copyfileobj(reader, writer)
 
 
+def artifact_files(directory):
+    if stat.S_ISDIR(file_mode(directory)):
+        for path in sorted(directory.iterdir()):
+            mode = file_mode(path)
+            if stat.S_ISDIR(mode):
+                yield from artifact_files(path)
+            elif stat.S_ISREG(mode):
+                yield path
+
+
 @contextmanager
 def copy_sidecar(source, target, *, create=False, skip=None):
     source_exists = stat.S_ISDIR(file_mode(source))
@@ -71,6 +84,31 @@ def stored_artifacts(directory):
             if artifact_id(content) != match[1]:
                 raise ValueError(f"Artifact content does not match its id: {path.name}")
             yield match[1], content
+
+
+@contextmanager
+def install_sidecar(source, target, *, replace=False):
+    if not replace:
+        with copy_sidecar(source, target, skip=PIPY_ARTIFACT.fullmatch):
+            yield
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=target.parent, prefix=".session-unpack-") as temporary:
+        incoming = Path(temporary) / "incoming"
+        backup = incoming.with_name("backup")
+        with copy_sidecar(source, incoming, skip=PIPY_ARTIFACT.fullmatch):
+            if os.path.lexists(target):
+                target.rename(backup)
+            try:
+                if incoming.exists():
+                    incoming.rename(target)
+                yield
+            except BaseException:
+                if target.exists():
+                    target.rename(incoming)
+                if os.path.lexists(backup):
+                    backup.rename(target)
+                raise
 
 
 def read_numbered(directory, identifier, offset, limit):

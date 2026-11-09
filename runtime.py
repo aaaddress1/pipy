@@ -54,7 +54,7 @@ def portable_message(message, thinking_route=None):
     private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
-               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless")
+               "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -466,13 +466,14 @@ class Session:
             )
 
     def can_continue(self):
-        batches = self.batches
-        if not batches and (covered := (self.native_summary or {}).get("replay_through")):
+        message = next((message for _, batch in reversed(self.batches) for message in reversed(batch)
+                        if "_session_transfer" not in message), None)
+        if message is None and (covered := (self.native_summary or {}).get("replay_through")):
             with database(self.path) as db:
                 batches = self.read_batches(db, covered, covered + 1)
-        if not batches:
+            message = batches[-1][1][-1] if batches else None
+        if message is None:
             return False
-        message = batches[-1][1][-1]
         return message["role"] in ("user", "tool", "developer") or paused_turn(message) and not message.get("_pause_exhausted")
 
     def messages(
@@ -515,7 +516,7 @@ class Session:
                 if message.get("_branch_summary") else (
                     message["content"] if any(message.get(key) for key in (
                         "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
-                        "_thinking_loop_redirect"))
+                        "_thinking_loop_redirect", "_session_transfer"))
                     else "[Agent recovery]\n" + message["content"]
                 )
             )}

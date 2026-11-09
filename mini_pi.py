@@ -3173,7 +3173,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 try:
                     target = str(UUID(source))
                 except ValueError:
-                    target, _, _ = session_jsonl.import_journal(path, scope, Path(source))
+                    target, _, _ = session_jsonl.import_journal(path, scope, Path(source), blob_dirs=(agent_dir / "blobs",))
                 with database(path) as db:
                     owner = db.execute("SELECT workspace FROM sessions WHERE id = ?", (target,)).fetchone()
                 if owner != (scope,):
@@ -3809,7 +3809,11 @@ def main():
 
         profile = active_profile()
         return run_ttsr(ttsr, broker_settings(profile), agent_config_dir(profile))
-    parser = argparse.ArgumentParser(description=__doc__, epilog="Use 'ps --help' or 'ttsr --help' for subcommands.")
+    if (transfer := command_args(sys.argv[1:], "session")) is not None:
+        from session_transfer import run as run_transfer
+
+        return run_transfer(transfer, agent_config_dir(active_profile()))
+    parser = argparse.ArgumentParser(description=__doc__, epilog="Use 'ps --help', 'ttsr --help' or 'session --help' for subcommands.")
     parser.add_argument("task", nargs="?", help="task for the coding agent; omit for interactive mode")
     parser.add_argument("--mode", choices=["interactive", "rpc", "acp"], default="interactive")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL"), help="provider/model, route alias, or raw model ID")
@@ -3932,6 +3936,7 @@ def main():
             state.mkdir(parents=True, exist_ok=True)
             session_id, skipped, missing = session_jsonl.import_journal(
                 state / "sessions.sqlite3", os.path.normcase(str(workspace)), source,
+                blob_dirs=(agent_config_dir(active_profile()) / "blobs",),
             )
             print(f"[imported session: {session_id}]", file=sys.stderr)
             if skipped or missing:

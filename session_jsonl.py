@@ -14,7 +14,8 @@ from uuid import uuid4
 
 import session_graph as graph
 from runtime import database, initialize, pack
-from session_artifacts import PIPY_ARTIFACT, copy_sidecar, sidecar, stored_artifacts
+from session_artifacts import PIPY_ARTIFACT, copy_sidecar, install_sidecar, sidecar, stored_artifacts
+from session_blobs import hydrate_images
 from shake import artifact_id, block_ranges, tool_text
 from snapcompact_inline import is_failed
 
@@ -163,6 +164,8 @@ def import_message(entry):
         message = {"role": "developer", "content": plain_text(text_and_images(entry.get("content")))}
         if entry.get("customType") == "thinking-loop-redirect":
             message["_thinking_loop_redirect"] = True
+        if entry.get("customType") == "session-transfer":
+            message["_session_transfer"] = mapping(entry.get("details"))
         if entry.get("customType") == "memory-recall-changes":
             message["_memory_recall_changes"] = mapping(entry.get("details"))
         if entry.get("customType") == "async-result":
@@ -340,16 +343,22 @@ def restore_shake_artifacts(db, session, parent, edits):
                 db.execute("INSERT OR IGNORE INTO artifacts VALUES (?, ?, ?)", (session, identifier, region))
 
 
-def import_journal(db_path, workspace, source):
+def import_journal(db_path, workspace, source, *, session_id=None, replace=False, notice=None, blob_dirs=(),
+                   preserve_identity=False):
     source = source.resolve(strict=True)
     header, rows, skipped = read_journal(source)
     order, missing = ordered_rows(rows)
-    session = str(uuid4())
+    session = session_id or str(uuid4())
     initialize(db_path)
     mapped, batches, pending = {None: None}, {None: 0}, {None: {}}
     artifacts = sidecar(source)
-    target = Path(db_path).parent / "artifacts" / session
-    with copy_sidecar(artifacts, target, skip=PIPY_ARTIFACT.fullmatch), database(db_path) as db:
+    state = Path(db_path).parent
+    target = state / "artifacts" / session
+    blob_dirs = (state / "blobs", *blob_dirs)
+    blob_cache = {}
+    with install_sidecar(artifacts, target, replace=replace), database(db_path) as db:
+        if replace:
+            graph.drop_journal(db, session)
         db.execute("INSERT INTO sessions(id,workspace,updated) VALUES (?,?,?)", (session, workspace, time.time()))
         db.executemany("INSERT INTO artifacts(session,id,content) VALUES (?,?,?)",
                        ((session, identifier, text) for identifier, text in stored_artifacts(artifacts)))
@@ -361,15 +370,19 @@ def import_journal(db_path, workspace, source):
             db.execute("INSERT INTO session_titles VALUES (?,?,?)", (session, title, title_source))
         original_id = header.get("id")
         if isinstance(original_id, str) and original_id:
+            parent_id = header.get("parentSession") if preserve_identity or session == original_id else original_id
             cache_key = header.get("providerPromptCacheKey")
             if not isinstance(cache_key, str) or not 0 < len(cache_key) <= 64:
-                cache_key = session
-            db.execute("INSERT INTO session_origins VALUES (?,?,?)", (session, original_id, cache_key))
+                cache_key = original_id if session_id and len(original_id) <= 64 else session
+            if isinstance(parent_id, str) or cache_key != session:
+                db.execute("INSERT INTO session_origins VALUES (?,?,?)",
+                           (session, parent_id if isinstance(parent_id, str) else "", cache_key))
         for entry in order:
             identifier, parent_id, kind = entry["id"], entry.get("parentId"), entry["type"]
             parent = mapped[parent_id]
             last, calls = batches[parent_id], pending[parent_id]
             node = parent
+            hydrate_images(entry, blob_dirs, blob_cache)
             message = import_message(entry)
             if message and message["role"] == "tool" and message["tool_call_id"] in calls:
                 seq, index = calls[message["tool_call_id"]]
@@ -424,6 +437,8 @@ def import_journal(db_path, workspace, source):
                 entry["id"] for entry in reversed(rows) if entry.get("activeLeafId", entry["id"]) == entry["id"]
             ), None)
         leaf = mapped[selected]
+        if notice:
+            leaf, _ = insert_batch(db, session, leaf, [notice])
         graph.set_head(db, session, leaf)
         graph.projection(db, session, *graph.checkpoint(db, session, leaf))
     return session, skipped, missing
@@ -452,6 +467,9 @@ def export_message(message, call_names):
         if message.get("_thinking_loop_redirect"):
             return {"type": "custom_message", "customType": "thinking-loop-redirect", "content": message["content"],
                     "display": False, "attribution": "agent"}
+        if details := message.get("_session_transfer"):
+            return {"type": "custom_message", "customType": "session-transfer", "content": message["content"],
+                    "display": True, "details": details}
         if message.get("_branch_summary"):
             return {"type": "branch_summary", "summary": message["content"], "fromId": ""}
         if changes := message.get("_memory_recall_changes"):
@@ -543,17 +561,19 @@ def export_message(message, call_names):
     return {"type": "message", "message": result, "miniPi": {"message": message}}
 
 
-def journal_entries(db, session, workspace, leaf, node_ids=None):
+def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=None):
     imported = db.execute("SELECT header FROM session_imports WHERE session = ?", (session,)).fetchone()
     header = json.loads(imported[0]) if imported else {}
     created = header.get("timestamp")
     origin = db.execute("SELECT parent,prompt_cache_key FROM session_origins WHERE session = ?", (session,)).fetchone()
-    header = {**header, "type": "session", "id": session, "version": VERSION, "cwd": workspace,
+    header = {**header, "type": "session", "id": header_id or session, "version": VERSION, "cwd": workspace,
               "timestamp": created if isinstance(created, str) and 0 < len(created) <= 40 else timestamp()}
     if row := db.execute("SELECT title,source FROM session_titles WHERE session=?", (session,)).fetchone():
         header["title"], header["titleSource"] = row
     if origin:
-        header.update(parentSession=origin[0], providerPromptCacheKey=origin[1])
+        header["providerPromptCacheKey"] = origin[1]
+        if origin[0] and origin[0] != header["id"]:
+            header["parentSession"] = origin[0]
     yield title_slot(header)
     yield header
     mapped, anchors, call_names = {None: None}, {0: None}, {}
@@ -672,7 +692,7 @@ def journal_entries(db, session, workspace, leaf, node_ids=None):
     yield make({"type": "custom", "customType": "mini-pi.active-leaf", "activeLeafId": active}, active)
 
 
-def export_journal(db_path, session, workspace, leaf, output):
+def export_journal(db_path, session, workspace, leaf, output, *, header_id=None):
     temporary = None
     try:
         with NamedTemporaryFile(dir=output.parent, delete=False) as file:
@@ -681,7 +701,7 @@ def export_journal(db_path, session, workspace, leaf, output):
         with database(db_path) as db:
             db.execute("BEGIN")
             with opener(temporary, "wt", encoding="utf-8", newline="\n") as file:
-                for record in journal_entries(db, session, workspace, leaf):
+                for record in journal_entries(db, session, workspace, leaf, header_id=header_id):
                     file.write(pack(record) + "\n")
             target = sidecar(output)
             if os.path.lexists(target):

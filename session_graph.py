@@ -56,6 +56,11 @@ SPECULATIVE_TASK_TREE = """WITH RECURSIVE speculative_tasks(session) AS (
     SELECT l.child FROM subagent_links l JOIN speculative_tasks s ON l.owner=s.session
 )
 """
+JOURNAL_TABLES = (
+    "batches", "artifacts", "context_elisions", "native_compactions", "model_switches", "session_recaps",
+    "session_heads", "session_nodes", "session_labels", "session_titles", "session_origins", "session_imports",
+    "session_entry_sources", "session_usage_attempts",
+)
 
 
 def task_subtree(db, root):
@@ -67,16 +72,18 @@ def task_subtree(db, root):
 
 
 def delete_task_subtree(db, children):
-    for table in (
-        "batches", "artifacts", "context_elisions", "native_compactions", "model_switches", "session_recaps",
-        "extractions", "memory_rollouts", "session_heads", "session_nodes", "session_labels", "session_titles", "session_origins", "session_imports",
-        "session_entry_sources", "session_usage_attempts", "speculative_task_roots",
-    ):
+    for table in (*JOURNAL_TABLES, "extractions", "memory_rollouts", "speculative_task_roots"):
         db.executemany(f"DELETE FROM {table} WHERE session = ?", ((sid,) for sid in children))
     db.executemany("DELETE FROM peer_messages WHERE sender = ? OR recipient = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM subagent_specs WHERE child = ?", ((sid,) for sid in children))
     db.executemany("DELETE FROM subagent_links WHERE owner = ? OR child = ?", ((sid, sid) for sid in children))
     db.executemany("DELETE FROM sessions WHERE id = ?", ((sid,) for sid in children))
+
+
+def drop_journal(db, session):
+    for table in JOURNAL_TABLES:
+        db.execute(f"DELETE FROM {table} WHERE session = ?", (session,))
+    db.execute("DELETE FROM sessions WHERE id = ?", (session,))
 
 
 PROMPTS = Path(__file__).with_name("prompts")
