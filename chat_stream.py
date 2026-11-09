@@ -19,6 +19,7 @@ FINISH_ALIASES = {"end": "stop", "max_tokens": "length", "function_call": "tool_
 TRANSIENT_FINISH = frozenset(("error", "network_error", "insufficient_system_resource", "unknown", "other",
                               "unspecified", "finish_reason_unspecified"))
 NATIVE_FAILURES = frozenset(("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "NETWORK_ERROR"))
+REPETITION_REASONS = frozenset(("repetition", "repetition_detected"))
 USAGE_DEFAULTS = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
@@ -32,6 +33,18 @@ def finish_reason(reason):
 def native_error(choice):
     reason = getattr(choice, "native_finish_reason", None)
     return reason if isinstance(reason, str) and reason.upper() in NATIVE_FAILURES else None
+
+
+def is_repetition(value):
+    return isinstance(value, str) and value.lower() in REPETITION_REASONS
+
+
+def repetition_reason(choice):
+    finish, stop = field(choice, "finish_reason"), field(choice, "stop_reason")
+    if not (is_repetition(finish) or is_repetition(stop)):
+        return None
+    return " ".join(f"{key}={value}" for key, value in (("finish_reason", finish), ("stop_reason", stop))
+                    if isinstance(value, str) and value)
 
 
 def has_cache_details(usage):
@@ -53,7 +66,8 @@ def progress(data):
     delta = choice.get("delta")
     native = choice.get("native_finish_reason")
     return (data.get("usage") is not None or choice.get("usage") is not None
-            or bool(choice.get("finish_reason")) or isinstance(native, str) and native.upper() in NATIVE_FAILURES
+            or bool(choice.get("finish_reason")) or is_repetition(choice.get("stop_reason"))
+            or isinstance(native, str) and native.upper() in NATIVE_FAILURES
             or isinstance(delta, dict) and any(delta.get(key) for key in (
                 "content", "refusal", "reasoning", "reasoning_content", "reasoning_text", "tool_calls", "function_call",
             )))

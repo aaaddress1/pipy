@@ -11,6 +11,7 @@ from openai import APIConnectionError, APIStatusError
 
 from auth_broker import ModelCredentialError, ModelQuotaError
 from rate_limits import QUOTA_GUESS, TRANSIENT_DELAYS, UsageBlock, classify_rate_limit, quota_wait, retry_after
+from thinking_loop import REDIRECT, ThinkingLoop
 
 TRANSPORT_ERRORS = (APIConnectionError, NetworkError, RemoteProtocolError, TimeoutException)
 MAX_RECOVERIES = 3
@@ -49,7 +50,7 @@ class ContextWindowExceeded(IncompleteTurn):
     pass
 
 
-RECOVERABLE_ERRORS = (IncompleteTurn, APIStatusError, ModelCredentialError)
+RECOVERABLE_ERRORS = (IncompleteTurn, APIStatusError, ModelCredentialError, ThinkingLoop)
 
 
 def context_overflow(error):
@@ -79,7 +80,8 @@ def media_rejection(error):
 
 class TurnRecovery:
     def __init__(self, session, compaction, router, rate_limit_walks_chain, bind_context, max_retries, max_delay,
-                 wait=time.sleep, auto_reset=None, wait_for_usage_reset=False, base_delay=.5, retry_enabled=True):
+                 wait=time.sleep, auto_reset=None, wait_for_usage_reset=False, base_delay=.5, retry_enabled=True,
+                 loop_redirect=True):
         self.session = session
         self.compaction = compaction
         self.router = router
@@ -92,6 +94,8 @@ class TurnRecovery:
         self.wait_for_usage_reset = wait_for_usage_reset
         self.base_delay = base_delay
         self.retry_enabled = retry_enabled
+        self.loop_redirect = loop_redirect
+        self.same_model_retry = False
         self.fallback_cooldown = None
         self.request_system = None
         self.attempts = {}
@@ -101,8 +105,9 @@ class TurnRecovery:
 
     def maintain(self, system):
         self.bind_context()
+        same_model, self.same_model_retry = self.same_model_retry, False
         while (
-            self.router.route.promote_to
+            not same_model and self.router.route.promote_to
             and self.compaction.threshold is not None
             and self.compaction.estimate(self.compaction.messages(system)) > self.compaction.threshold
             and self.promote()
@@ -230,6 +235,19 @@ class TurnRecovery:
         self.request_system = system
         if getattr(error, "replay_unsafe", False):
             return None
+        if isinstance(error, ThinkingLoop):
+            attempt = self.take("thinking loop", self.max_retries) if self.retry_enabled else None
+            if attempt is None:
+                return None
+            delay = retry_backoff(attempt, self.base_delay)
+            if self.max_delay:
+                delay = min(delay, self.max_delay)
+            print(f"[Thinking loop detected. Retrying on the same model ({attempt}/{self.max_retries}).]", file=sys.stderr)
+            self.wait(delay)
+            if self.loop_redirect:
+                self.session.append([{"role": "developer", "content": REDIRECT, "_thinking_loop_redirect": True}])
+            self.same_model_retry = True
+            return "retry"
         if isinstance(error, ClassifierRefusal):
             if error.unexecuted_turn:
                 self.remember_unexecuted(error)

@@ -17,6 +17,7 @@ from cost_gate import CostCapError
 from handoff import Cancellation
 from live_steering import LiveQueue
 from session_jsonl import export_message
+from thinking_loop import ThinkingLoop
 
 
 MAX_FRAME = 1024 * 1024
@@ -162,7 +163,7 @@ def wire_message(message, call_names):
     entry = export_message(message, call_names)
     if entry["type"] == "message":
         return entry["message"]
-    if entry.get("customType") in ("async-result", "irc:incoming", "launch-completion", "ttsr-injection"):
+    if entry.get("customType") in ("async-result", "irc:incoming", "launch-completion", "ttsr-injection", "thinking-loop-redirect"):
         return {"role": "custom", **{key: value for key, value in entry.items() if key != "type"},
                 "timestamp": int(time() * 1000)}
     return {"role": "custom", "customType": entry["type"], "content": message["content"], "display": True}
@@ -248,6 +249,8 @@ class RpcTurn(Cancellation):
     def interrupted(self, error, aborted=False):
         if self.draft is not None:
             wire = {**self.draft, "stopReason": "aborted" if aborted else "error", "errorMessage": str(error)}
+            if isinstance(error, ThinkingLoop):
+                wire.update(content=[], errorId=error.error_id)
             self.server.event("message_end", message=wire, messageId=self.message_id)
             self.server.event("turn_end", message=wire, toolResults=[])
             self.messages.append(wire)
@@ -409,6 +412,8 @@ class RpcServer:
             detail = {"message": str(error), "retryable": False}
             if isinstance(error, CostCapError):
                 detail["code"] = error.code
+            if isinstance(error, ThinkingLoop):
+                detail["errorId"] = error.error_id
             if isinstance(error, APIStatusError):
                 detail.update(httpStatus=error.status_code, retryable=error.status_code == 429 or error.status_code >= 500)
             frame["error"] = detail

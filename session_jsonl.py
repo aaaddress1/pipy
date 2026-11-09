@@ -145,6 +145,8 @@ def import_message(entry):
         return {"role": "developer", "content": str(entry.get("summary") or ""), "_branch_summary": True}
     if kind == "custom_message":
         message = {"role": "developer", "content": plain_text(text_and_images(entry.get("content")))}
+        if entry.get("customType") == "thinking-loop-redirect":
+            message["_thinking_loop_redirect"] = True
         if entry.get("customType") == "memory-recall-changes":
             message["_memory_recall_changes"] = mapping(entry.get("details"))
         if entry.get("customType") == "async-result":
@@ -394,6 +396,9 @@ def export_parts(content):
 def export_message(message, call_names):
     role = message["role"]
     if role == "developer":
+        if message.get("_thinking_loop_redirect"):
+            return {"type": "custom_message", "customType": "thinking-loop-redirect", "content": message["content"],
+                    "display": False, "attribution": "agent"}
         if message.get("_branch_summary"):
             return {"type": "branch_summary", "summary": message["content"], "fromId": ""}
         if changes := message.get("_memory_recall_changes"):

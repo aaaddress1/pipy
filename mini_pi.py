@@ -354,7 +354,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
 def stream_reply(
     client, model, messages, schemas, options, guard_options, *, show=True, native_route=None, cache_observer=None,
     tool_choice=None, cancel=None, turn=None, usage_observer=None, anthropic_replay=None, credit=None, meter=None, rules=None,
-    on_text=None, speculation=None, websocket=None,
+    on_text=None, speculation=None, websocket=None, loop_retries=2,
 ):
     heal_dsml = dsml.targeted(model, native_route)
     if native_route and (native_route.catalog_model or {}).get("supportsTools") is False:
@@ -373,7 +373,7 @@ def stream_reply(
     if not schemas or credit or tool_choice in ("none", "auto"):
         speculation = None
     level, check_text = guard_options
-    for attempt in range(3):
+    for attempt in range(loop_retries + 1):
         if cancel:
             cancel()
         guard = StreamGuard(loop_level(model, level), check_text)
@@ -442,10 +442,12 @@ def stream_reply(
                 speculation.discard()
             if meter:
                 meter.finish("error")
-            if attempt == 2 or credit and credit.server_tools:
-                raise
             if on_text:
                 on_text(None)
+            if credit and credit.server_tools:
+                error.replay_unsafe = True
+            if attempt == loop_retries or getattr(error, "replay_unsafe", False):
+                raise
             credit = None
             print(f"[{error} Retrying the model request.]", file=sys.stderr)
             delay = 0.5 * 2 ** attempt
@@ -470,6 +472,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
     text, thinking, calls, finish, usage = [], [], {}, None, None
     cached_tokens_header = upstream_provider = None
     native_failure = None
+    repetition = None
     buffer = dsml.TextBuffer() if heal_dsml else None
     visible, leaked = None, False
     tool_options = {"tools": schemas} if schemas else {}
@@ -522,6 +525,10 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                 for choice in choices:
                     if not chunk.usage and (reported := chat_stream.choice_usage(choice)):
                         usage = reported
+                    repetition = repetition or chat_stream.repetition_reason(choice)
+                    if repetition:
+                        finish = "repetition"
+                        continue
                     delta = getattr(choice, "delta", None)
                     reasoning = (getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                                  or getattr(delta, "reasoning_text", None))
@@ -566,8 +573,9 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                         break
             if stream.done and finish is None:
                 finish = "stop"
-            finish_markup()
-            if finish:
+            if not repetition:
+                finish_markup()
+            if finish and not repetition:
                 guard.finish()
     except TRANSPORT_ERRORS as error:
         if not finish:
@@ -576,14 +584,17 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                 else f"Provider stream interrupted ({type(error).__name__}).",
                 text="".join(text), tool_draft=bool(calls), usage=usage,
             ) from error
-        finish_markup()
-        guard.finish()
+        if not repetition:
+            finish_markup()
+            guard.finish()
     finally:
         if usage_observer and usage is not None:
             usage_observer(usage, cached_tokens_header)
         if show and text:
             print()
     visible = "".join(text) if visible is None else visible
+    if repetition:
+        raise ThinkingLoop(f"Provider reported a repetition stop: {repetition}")
     if finish == "stop" and calls:
         finish = "tool_calls"
     if native_failure or finish in chat_stream.TRANSIENT_FINISH:
@@ -1354,7 +1365,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 available.update(eval_child_tools(path, child.task))
             return available
 
-        guard_options = (args.loop_guard, not args.no_loop_guard_text)
+        loop_level_setting = args.loop_guard
+        if loop_level_setting == "auto" and dotted(args.rule_config, "model.loopGuard.enabled") is False:
+            loop_level_setting = "off"
+        guard_options = (loop_level_setting, not args.no_loop_guard_text
+                         and dotted(args.rule_config, "model.loopGuard.checkAssistantContent") is not False)
         reasoning_effort = args.reasoning_effort
         profile = getattr(args, "model_profile", None)
         auto_level = None
@@ -1999,7 +2014,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     native_route=route, cache_observer=observer, show=show and turn is None,
                     cancel=cancellation.check if cancellation else None, turn=turn, usage_observer=router.usage_observer(),
                     anthropic_replay=anthropic_replay(route), credit=credit, meter=meter, tool_choice=choice, rules=rules,
-                    speculation=stream_spec, on_text=observe_title, websocket=router.responses_socket(),
+                    speculation=stream_spec, on_text=observe_title, websocket=router.responses_socket(), loop_retries=0,
                 )
                 if observe_title:
                     observe_title("")
@@ -2522,13 +2537,15 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     return with_terminal_consent(args.transport_loop, operation, turn)
                 return args.transport_loop.call(operation(None), turn)
 
+            cancellation = turn or active_turn()
             return TurnRecovery(
                 session, compaction, router, args.rate_limit_walks_chain, bind_context,
-                args.retry_max_retries, args.retry_max_delay, wait=turn.wait if turn else time.sleep,
+                args.retry_max_retries, args.retry_max_delay, wait=cancellation.wait if cancellation else time.sleep,
                 auto_reset=reset if automatic else None,
                 wait_for_usage_reset=getattr(args, "wait_for_usage_reset", False),
                 base_delay=getattr(args, "maintenance_retry_base", .5),
                 retry_enabled=getattr(args, "maintenance_retry_enabled", True),
+                loop_redirect=loop_level_setting != "off" and os.getenv("PI_NO_THINKING_LOOP_GUARD") != "1",
             )
 
         sharpshooter = None

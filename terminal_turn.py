@@ -18,6 +18,7 @@ from btw import ANSI
 from cost_gate import usd
 from handoff import Cancellation
 from live_steering import LiveQueue
+from thinking_loop import ThinkingLoop
 
 
 def clear_terminal(editor):
@@ -128,7 +129,7 @@ class TerminalTurn(Cancellation):
             self.flush_text(message.get("content"))
 
     def interrupted(self, error, aborted=False):
-        self.flush_text("".join(self.text))
+        self.flush_text(None if isinstance(error, ThinkingLoop) else "".join(self.text))
 
     def steering(self):
         with self.server.lock:

@@ -51,7 +51,8 @@ def paused_turn(message):
 def portable_message(message, thinking_route=None):
     private = ("_anthropic", "_responses", "_thinking", "_branch_from_node", "_rpc", "_tool_details", "_tool_error",
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
-               "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak")
+               "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
+               "_thinking_loop_redirect")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -506,7 +507,8 @@ class Session:
                 graph.SUMMARY_CONTEXT.replace("{{summary}}", message["content"])
                 if message.get("_branch_summary") else (
                     message["content"] if any(message.get(key) for key in (
-                        "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes"))
+                        "_async_jobs", "_irc_messages", "_service_runs", "_ttsr_rules", "_memory_recall_changes",
+                        "_thinking_loop_redirect"))
                     else "[Agent recovery]\n" + message["content"]
                 )
             )}

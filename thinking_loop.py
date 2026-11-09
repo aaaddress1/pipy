@@ -2,10 +2,12 @@
 
 import os
 from collections import deque
+from pathlib import Path
 
 import regex
 
 
+REDIRECT = (Path(__file__).with_name("prompts") / "thinking-loop-redirect.md").read_text(encoding="utf-8").rstrip()
 TAIL = 4096
 MAX_PERIOD = 1024
 SCAN_STRIDE = 128
@@ -156,7 +158,7 @@ class Detector:
 
 
 class ThinkingLoop(RuntimeError):
-    pass
+    error_id = 0x00010000
 
 
 class StreamGuard:
