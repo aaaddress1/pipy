@@ -257,6 +257,8 @@ Apple Silicon macOS 上，正式 Codex OAuth 的 HTTP 請求和 WebSocket 升級
 
 標準 OpenAI Responses 的 HTTP/SSE 在正式 OpenAI 端點預設啟用續接，送出 `store: true` 讓供應商儲存回應。工作階段、帳號、請求設定及歷史吻合時，透過 `previous_response_id` 傳送新增項目。HTTP 與 WebSocket 各自保存續接狀態。過期 ID 會以完整歷史重試一次，連續三次遭拒後停用續接。遇到零資料保留拒絕會立即以 `store: false` 重試。可在自訂路由設 `stateful_responses: false`，或用 `PI_OPENAI_STATEFUL=0` 關閉續接。自訂端點預設依模型相容性設定決定，未宣告支援時採完整重送。 [上游 HTTP 續接](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-responses.ts) · [OpenAI 工作階段文件](https://developers.openai.com/api/docs/guides/conversation-state#passing-context-from-the-previous-response)
 
+Muse Code 可設定 `providers.museCode.storeResponses: true`，或用 `PI_MUSE_STORE_RESPONSES=1` 啟用供應商儲存回應。SSE 斷線時，若已有回應 ID 且只收到推理內容，會用同一個端點和憑證每五秒查詢一次原回應，最多兩分鐘或 24 次。取回的文字、工具呼叫與用量交回原本的回合處理，已串流的推理不會重播。收到可見答案或工具草稿後斷線時，沿用一般的串流錯誤處理。 [上游斷線取回](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/test/openai-responses-resume.test.ts) · [Responses 取回 API](https://developers.openai.com/api/reference/resources/responses/methods/retrieve)
+
 ## 已移植的行為
 
 - 設定 `--context-window` 後，預設在估算用量接近 70% 時準備背景摘要。若單次回合跳過門檻，只要仍在寬限區間內，前景便繼續執行。碰到區間上限或收到上下文溢位錯誤時，尚未完成的背景請求會取消，交由同步維護處理。追加的訊息與完整的工具呼叫和結果都會保留。若追加訊息使背景摘要無法騰出足夠空間，會用目前歷史重新摘要。`compaction.asyncEnabled: false` 可停用背景摘要。第一個可用方法為 Shake 或 Snapcompact 時會直接走同步維護。 [上游背景壓縮流程](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/session-maintenance.ts#L2329)

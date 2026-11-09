@@ -6,6 +6,7 @@ import time
 from concurrent.futures import CancelledError
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from functools import partial
 from hashlib import sha256
 from itertools import chain
 from urllib.parse import urlsplit
@@ -15,6 +16,7 @@ from openai import APIConnectionError, APIError, APIStatusError
 
 import model_catalog
 import codex_responses
+import responses_resume
 from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
 from responses_websocket import generation_evidence
@@ -494,7 +496,7 @@ def completed_message(response, route, model, fingerprint):
 
 @contextmanager
 def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None, effort_control=None,
-                    http_chain=None):
+                    http_chain=None, prepare_resumed=None):
     if codex_route:
         lite = codex_responses.lite_enabled(codex_route)
         codex_responses.request_shape(codex_route, body, lite=lite)
@@ -514,21 +516,29 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None,
         with closing(websocket.events(body)) as stream:
             yield stream
     elif http_chain:
-        with closing(chained_http_events(client, body, http_chain)) as stream:
+        with closing(chained_http_events(client, body, http_chain, prepare_resumed)) as stream:
             yield stream
     else:
-        with client.responses.create(**sdk_body(body), stream=True) as stream:
-            yield (event.to_dict() for event in stream)
+        with closing(http_events(client, body, prepare_resumed)) as stream:
+            yield stream
 
 
-def chained_http_events(client, body, chain_state):
+def http_events(client, body, prepare_resumed):
+    stream = client.responses.create(**sdk_body(body), stream=True)
+    if prepare_resumed and body.get("store") is True:
+        yield from responses_resume.events(client, stream, prepare_resumed)
+    else:
+        with stream:
+            yield from (event.to_dict() for event in stream)
+
+
+def chained_http_events(client, body, chain_state, prepare_resumed=None):
     full, wire = chain_state.request(body)
     for attempt in range(2):
         first = True
         try:
-            with client.responses.create(**sdk_body(wire), stream=True) as stream:
-                for incoming in stream:
-                    event = incoming.to_dict()
+            with closing(http_events(client, wire, prepare_resumed)) as stream:
+                for event in stream:
                     kind = event["type"]
                     response = event.get("response") or {}
                     if first and attempt == 0 and kind in ("error", "response.failed") and not generation_evidence(response):
@@ -621,8 +631,10 @@ def stream_attempt(
     live_source=None, effort_control=None, http_chain=None,
 ):
     body, fingerprint = request_body(route, model, messages, schemas, effort)
+    prepare_resumed = None
     if stored_host(route):
         body["store"] = True
+        prepare_resumed = partial(completed_message, route=route, model=model, fingerprint=fingerprint)
     if tool_choice and schemas:
         body["tool_choice"] = ({"type": "function", "name": tool_choice["function"]["name"]}
                                if isinstance(tool_choice, dict) else tool_choice)
@@ -638,7 +650,8 @@ def stream_attempt(
     usage = reported_usage = None
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
-                             live_source=live_source, effort_control=effort_control, http_chain=http_chain) as stream:
+                             live_source=live_source, effort_control=effort_control, http_chain=http_chain,
+                             prepare_resumed=prepare_resumed) as stream:
             for event in stream:
                 if cancel:
                     cancel()
@@ -700,11 +713,12 @@ def stream_attempt(
                     usage = Usage.from_response(response)
                     details = {"text": "".join(visible), "tool_draft": tool_draft, "usage": usage}
                     error = response.get("error") or {}
+                    resumed = event.get("_resumed_message")
                     if error.get("code") in ("context_length_exceeded", "context_window_exceeded"):
                         raise ContextWindowExceeded("Responses context window exceeded.", **details)
-                    if kind == "response.incomplete" and (response.get("incomplete_details") or {}).get(
-                        "reason"
-                    ) == "max_output_tokens":
+                    if kind == "response.incomplete" and (
+                        resumed or (response.get("incomplete_details") or {}).get("reason") == "max_output_tokens"
+                    ):
                         raise IncompleteTurn("Responses reached the generation limit.", **details)
                     if kind != "response.completed" or response.get("status") != "completed":
                         raise StreamInterrupted("Responses did not complete the turn.", **details)
@@ -713,9 +727,9 @@ def stream_attempt(
                         text = "\n".join(piece for item in response["output"] if (piece := item_text(item, "\n")))
                         return {"role": "assistant", "content": text or None}, usage
                     tool_draft |= any(item.get("type") == "function_call" for item in response["output"])
-                    message = completed_message(response, route, model, fingerprint)
-                    if thinking:
-                        message["_thinking"] = "".join(thinking)
+                    message = resumed or completed_message(response, route, model, fingerprint)
+                    if thought := event.get("_resumed_thinking") or "".join(thinking):
+                        message["_thinking"] = thought
                     if (not response.get("_steered") and not message.get("tool_calls")
                         and not (message["content"] or "").strip() and not any(
                         item["type"] == "reasoning" and (item.get("encrypted_content") or "").strip()
