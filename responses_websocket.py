@@ -144,7 +144,20 @@ class ResponsesSocket:
     def rejects_anchor(self, error):
         return stale_anchor(error)
 
-    def events(self, body, *, normalize=None, retain_baseline=True):
+    def send(self, body, turn):
+        self.loop.call(self.connection.send(json.dumps(body)), turn)
+
+    def receive(self, turn, timeout):
+        raw = self.loop.call(asyncio.wait_for(self.connection.recv(), timeout), turn)
+        try:
+            event = json.loads(raw)
+        except (ValueError, UnicodeError) as error:
+            raise httpx.RemoteProtocolError("Responses WebSocket sent invalid JSON.") from error
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            raise httpx.RemoteProtocolError("Responses WebSocket sent an invalid event.")
+        return event
+
+    def events(self, body, *, normalize=None, retain_baseline=True, steering=None):
         turn = active_turn()
         request = {**body, "type": "response.create"}
         baseline, self.baseline = self.baseline, None
@@ -152,16 +165,15 @@ class ResponsesSocket:
         wire = {**request, "previous_response_id": baseline[0], "input": delta} if delta is not None else request
         ended = False
         try:
-            self.loop.call(self.connection.send(json.dumps(wire)), turn)
+            if steering:
+                wire, delta = steering.start(request, wire, delta)
+            if wire is not None:
+                self.send(wire, turn)
             first = True
             while True:
-                raw = self.loop.call(asyncio.wait_for(self.connection.recv(), self.receive_seconds), turn)
-                try:
-                    event = json.loads(raw)
-                except (ValueError, UnicodeError) as error:
-                    raise httpx.RemoteProtocolError("Responses WebSocket sent invalid JSON.") from error
-                if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-                    raise httpx.RemoteProtocolError("Responses WebSocket sent an invalid event.")
+                event = steering.receive(turn) if steering else self.receive(turn, self.receive_seconds)
+                if steering and steering.control(event):
+                    continue
                 if normalize:
                     event = normalize(event)
                 kind = event["type"]
@@ -174,9 +186,11 @@ class ResponsesSocket:
                     for key in ("input_tokens", "output_tokens", "total_tokens")
                 )
                 if first and delta is not None and not generated and status in (None, 400, 422) and self.rejects_anchor(error):
+                    if steering and steering.carried:
+                        raise httpx.RemoteProtocolError("Codex steering successor lost its continuation.")
                     self.stale_anchors += 1
                     delta = None
-                    self.loop.call(self.connection.send(json.dumps(request)), turn)
+                    self.send(request, turn)
                     continue
                 if self.starts_response(kind):
                     first = False
@@ -198,13 +212,23 @@ class ResponsesSocket:
                             output = self.replay_output(response["output"])
                             if output is not None:
                                 self.baseline = (response["id"], deepcopy(request), deepcopy(output))
+                    if steering:
+                        complete, ended = ended, False
+                        if steering.terminal(self.baseline, turn):
+                            ended = complete
+                        else:
+                            self.baseline = None
                     yield event
                     return
                 yield event
         except (OSError, TimeoutError, WebSocketException) as error:
             raise httpx.RemoteProtocolError("Responses WebSocket closed before completion.") from error
         finally:
-            if ended:
-                self.loop.call(self.arm_idle())
-            else:
-                self.close()
+            try:
+                if steering:
+                    steering.abort()
+            finally:
+                if ended:
+                    self.loop.call(self.arm_idle())
+                else:
+                    self.close()

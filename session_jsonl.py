@@ -175,6 +175,8 @@ def import_message(entry):
         return local
     if role == "user":
         result = {"role": "user", "content": text_and_images(message.get("content"))}
+        if message.get("liveSteered") is True:
+            result["liveSteered"] = True
         if message.get("attribution") == "agent" and plain_text(result["content"]).startswith("[MCP notification] "):
             result["_mcp_notification"] = True
         return result
@@ -462,6 +464,8 @@ def export_message(message, call_names):
         }
     else:
         result = {"role": role, "content": content, "timestamp": now}
+        if role == "user" and message.get("liveSteered") is True:
+            result["liveSteered"] = True
         if role == "user" and message.get("_mcp_notification"):
             result["attribution"] = "agent"
     if role == "assistant" and (metadata := message.get("_rpc")):

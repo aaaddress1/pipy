@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from collections import deque
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from functools import cache
@@ -16,6 +17,7 @@ import httpx
 from auth_broker_cache import config_root
 from cancellable_http import active_turn
 from local_oauth import jwt_payload
+from live_steering import SteerExchange
 from responses_websocket import ResponsesSocket, delta_input
 
 
@@ -254,6 +256,10 @@ class OutputItems:
                 "response.incomplete": "incomplete", "response.failed": "failed",
             }[kind]
             response["status"] = status
+            if status == "incomplete" and (response.get("incomplete_details") or {}).get("reason") == "steered":
+                response["status"] = status = "completed"
+                response["_steered"] = True
+                event["type"] = "response.completed"
             if not response.get("output"):
                 response["output"] = [self.items[index] for index in sorted(self.items)]
             if kind == "response.done":
@@ -273,6 +279,14 @@ class CodexSocket(ResponsesSocket):
         self.lock = Lock()
         self.models_etag = None
         self.metadata_credentials = None
+        self.steering_unsupported = False
+        self.accepted_steers = []
+        self.steer_frames = deque()
+
+    async def disconnect(self):
+        self.accepted_steers.clear()
+        self.steer_frames.clear()
+        await super().disconnect()
 
     def append_input(self, baseline, request):
         delta = delta_input(baseline, request, codex=True)
@@ -300,7 +314,7 @@ class CodexSocket(ResponsesSocket):
             self.models_etag = value
 
     @contextmanager
-    def exchange(self, body, headers, identity, *, lite=False, compaction=False):
+    def exchange(self, body, headers, identity, *, lite=False, compaction=False, live_source=None, vision=True):
         if self.sse_only or not self.lock.acquire(blocking=False):
             yield None
             return
@@ -336,7 +350,15 @@ class CodexSocket(ResponsesSocket):
             if identity.state:
                 metadata[TURN_STATE] = identity.state
             wire = {**body, "stream": True, "client_metadata": metadata}
-            with closing(self.events(wire, normalize=OutputItems().normalize, retain_baseline=not compaction)) as stream:
+
+            def reopen():
+                if not self.open(headers=list(upgrade.items()), connection_key=credentials):
+                    raise httpx.RemoteProtocolError("Could not reopen the Codex steering socket.")
+
+            steering = (SteerExchange(self, live_source, lite, vision, reopen)
+                        if live_source is not None or self.accepted_steers else None)
+            with closing(self.events(wire, normalize=OutputItems().normalize, retain_baseline=not compaction,
+                                     steering=steering)) as stream:
                 yield stream
         finally:
             self.lock.release()

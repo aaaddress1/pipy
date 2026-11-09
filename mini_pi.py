@@ -130,10 +130,12 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
 
     def append_input(content, notification=False, *, queued=False, admitted=None, metadata=None, note=None):
-        work = content if queued and terminal_turn else None
+        work = content if queued and (terminal_turn or isinstance(content, rpc_mode.Work)) else None
         if work:
             content = work.content
         message = content if isinstance(content, dict) else {"role": "user", "content": content}
+        if work and work.live_steered:
+            message["liveSteered"] = True
         if child and (message.get("_async_jobs") or message.get("_service_runs")):
             child.invalidate_yield()
         if turn and message.get("_ttsr_kind") == "judged":
@@ -145,7 +147,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             if note:
                 messages.append({"role": "developer", "content": note, "_memory_recall_changes": metadata["data"]})
             session.append(messages, before=metadata)
-        if work:
+        if work and terminal_turn:
             work.accept()
         elif admitted and not notification and message["role"] == "user":
             admitted()
@@ -154,7 +156,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         if on_input and not notification and message["role"] == "user":
             if cancellation:
                 cancellation.check()
-            on_input(content)
+            on_input(message["content"] if message.get("liveSteered") else content)
 
     def rule_notice(hits, kind):
         if turn and kind != "prose":
@@ -371,6 +373,7 @@ def stream_reply(
                         tool_choice=tool_choice, cancel=cancel, prompt_cache_key=options.get("prompt_cache_key"), turn=turn,
                         usage_observer=observer, tracker=tracker, on_text=on_text, speculation=speculation, websocket=websocket,
                         codex_turn=options.get("codex_turn"),
+                        live_source=options.get("live_source"),
                     )
                 else:
                     result = stream_attempt(client, model, messages, schemas, options, guard, show, tool_choice, cancel, turn,
@@ -1849,6 +1852,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 ) if speculation else None
                 schemas = tool_schemas(active_tools)
                 options = request_options()
+                live_source = None
+                if (turn and not turn.background and route.api == codex_responses.API
+                    and compat.get("supportsSteering") is True
+                    and dotted(args.rule_config, "providers.openaiLiveSteering") is True):
+                    live_source = getattr(turn, "live", None)
                 observe_title = None
                 if titles and not titles.named:
                     credential = router.credential
@@ -1870,7 +1878,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         titles.observe(piece, fork_title)
 
                 reply, usage = stream_reply(
-                    router.client(), route.model, messages, schemas, options | {"codex_turn": router.codex_turn()}, guard_options,
+                    router.client(), route.model, messages, schemas,
+                    options | {"codex_turn": router.codex_turn(), "live_source": live_source}, guard_options,
                     native_route=route, cache_observer=observer, show=show and turn is None,
                     cancel=cancellation.check if cancellation else None, turn=turn, usage_observer=router.usage_observer(),
                     anthropic_replay=anthropic_replay(route), credit=credit, meter=meter, tool_choice=choice, rules=rules,
@@ -1879,9 +1888,13 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if observe_title:
                     observe_title("")
             except RuleInterrupt:
+                if turn and hasattr(turn, "live"):
+                    turn.live.rollback()
                 raise
             except Exception as error:
                 if turn:
+                    if hasattr(turn, "live"):
+                        turn.live.rollback()
                     turn.check()
                     turn.interrupted(error)
                 cause = error.__cause__

@@ -241,6 +241,8 @@ Anthropic 快取續期需要啟用 `cache_retention`，並在路由的 `cache_pr
 
 Codex 模型可用 `--model openai-codex/gpt-6-sol` 選擇，憑證來自 `OPENAI_CODEX_OAUTH_TOKEN` 或既有 OAuth 帳號。Codex 預設優先用 WebSocket，可用 `PI_CODEX_WEBSOCKET=0` 或自訂路由的 `prefer_websockets: false` 改走 HTTP/SSE。續接會回放加密推理與完整工具結果，同一回合沿用伺服器的路由識別。完整 Responses 與 Lite 的連線狀態各自保存。同步 V2 壓縮可走 WebSocket，斷線時以 HTTP 重送完整壓縮請求。背景 V2 壓縮使用獨立識別碼並走 HTTP/SSE。 [上游 Codex Responses](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-codex-responses.ts)
 
+開啟 `providers.openaiLiveSteering: true` 後，終端 Enter 或 RPC `steer` 可將新指令送進支援 steering 的 Codex WebSocket 回應。伺服器接受後，程式會讀取自動開始的下一段回應，或等工具完成後只傳工具結果。拒絕或逾時的指令會回到佇列，等下一個可插入的邊界。此設定預設關閉。 [上游 steering 協定](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-codex/live-steering.ts)
+
 視覺路由可設定 `vision: true`，讓 Snapcompact 在本機把舊歷史排成依序重放的文字和 PNG。原文與圖框一併保存在 SQLite，再次壓縮時會重新排版。切換到文字路由或供應商拒絕圖像時，會改用同一份封存文字。`--snapcompact-shape` 預設 `auto`，也可指定版型。路由可用 `image_max_edge`、`image_count_budget`、`image_byte_budget`、`image_tokens` 和 `image_detail` 配合實際部署。字型採上游資產，Silver 的授權與作者資訊隨附。[上游 Snapcompact](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md#snapcompact-method)
 
 `--snapcompact-system-prompt agents-md` 可在估算節省 token 時將已載入的專案指令轉成圖框，`all` 則可處理整份系統提示。預設 `none`。專案指令支援 `AGENTS.md`、`CLAUDE.md`、`.omp/`、`.agent/`、`.agents/` 及工作目錄的 Claude、Gemini、Copilot 指令檔，同一層只取優先順序最高的檔案。`--snapcompact-tool-results` 允許成像大型成功工具結果。讀檔預設保留文字，支援的 Opus 路由會啟用讀檔成像，也可以在路由用 `image_read_results` 覆寫。成像只改寫當次請求。圖片超過額度時會撤回較新的成像結果並送出原文。[上游即時成像規則](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/snapcompact-inline.ts)
@@ -320,4 +322,4 @@ Python 與 Oh My Pi 可互讀 AES-256-GCM 加密的 v2 broker 快照。預設在
 
 用 `--mcp-notifications` 或 `/mcp notifications on` 訂閱資源更新。同一資源的短時間連續通知會合併，預設等待 500 毫秒。通知會在模型請求邊界交付，或在 ACP、JSONL RPC 和互動終端空閒時啟動背景回合。宿主取消回合後，更新會留待下一次明確送出的 prompt。透過管線輸入的 CLI 會在下一個 prompt 交付更新。
 
-目前快取續期支援 Anthropic Messages。Codex 即時 steering、裝置證明、其他記憶後端、外部 artifact／blob 互通、完整的樹狀選擇器與指令檔探索、RPC 宿主擴充、其餘 ACP 擴充和完整工具集仍需移植。[上游壓縮行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md) · [上游記憶行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/memory.md)
+目前快取續期支援 Anthropic Messages。Codex 裝置證明、其他記憶後端、外部 artifact／blob 互通、完整的樹狀選擇器與指令檔探索、RPC 宿主擴充、其餘 ACP 擴充和完整工具集仍需移植。[上游壓縮行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md) · [上游記憶行為](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/memory.md)

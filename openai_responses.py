@@ -469,13 +469,14 @@ def completed_message(response, route, model, fingerprint):
 
 
 @contextmanager
-def response_events(client, body, websocket, *, codex_route=None, identity=None):
+def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None):
     if codex_route:
         lite = codex_responses.lite_enabled(codex_route)
         codex_responses.request_shape(codex_route, body, lite=lite)
         headers = identity.decorate(body, lite=lite)
         endpoint = codex_responses.endpoint(codex_route.endpoint())
-        with closing(codex_live_events(client, body, endpoint, headers, identity, websocket, lite)) as stream:
+        with closing(codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source,
+                                       codex_route.vision)) as stream:
             yield stream
         return
     if websocket is not None and websocket.open():
@@ -486,13 +487,13 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None)
             yield (event.to_dict() for event in stream)
 
 
-def codex_live_events(client, body, endpoint, headers, identity, websocket, lite):
+def codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source, vision):
     if websocket:
         saved = identity.state, websocket.models_etag
         for attempt in range(codex_responses.WEBSOCKET_RETRIES + 1):
             exposed = False
             try:
-                with websocket.exchange(body, headers, identity, lite=lite) as stream:
+                with websocket.exchange(body, headers, identity, lite=lite, live_source=live_source, vision=vision) as stream:
                     if stream is None:
                         break
                     for event in stream:
@@ -507,11 +508,18 @@ def codex_live_events(client, body, endpoint, headers, identity, websocket, lite
                         yield event
                 return
             except (httpx.RemoteProtocolError, APIStatusError) as error:
-                if isinstance(error, APIStatusError) and error.code != "websocket_connection_limit_reached":
+                code = getattr(error, "code", None)
+                native_lane = code == "unsupported_native_inflight_message"
+                if isinstance(error, APIStatusError) and not native_lane and code != "websocket_connection_limit_reached":
                     raise
+                if native_lane:
+                    websocket.steering_unsupported = True
                 if exposed:
                     websocket.sse_only = True
                     raise httpx.RemoteProtocolError("Codex WebSocket interrupted streamed output.") from error
+                if native_lane:
+                    saved = None, None
+                    headers = {key: value for key, value in headers.items() if key != codex_responses.TURN_STATE}
                 identity.state, websocket.models_etag = saved
                 if attempt == codex_responses.WEBSOCKET_RETRIES:
                     websocket.sse_only = True
@@ -545,6 +553,7 @@ def codex_events(frames, identity, transport):
 def stream_attempt(
     client, route, model, messages, schemas, effort, guard, show, *, tool_choice=None, cancel=None, prompt_cache_key=None,
     turn=None, usage_observer=None, tracker=None, on_text=None, speculation=None, websocket=None, codex_turn=None,
+    live_source=None,
 ):
     body, fingerprint = request_body(route, model, messages, schemas, effort)
     if tool_choice and schemas:
@@ -561,7 +570,8 @@ def stream_attempt(
     stream_tools = {}
     usage = reported_usage = None
     try:
-        with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn) as stream:
+        with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
+                             live_source=live_source) as stream:
             for event in stream:
                 if cancel:
                     cancel()
@@ -639,10 +649,11 @@ def stream_attempt(
                     message = completed_message(response, route, model, fingerprint)
                     if thinking:
                         message["_thinking"] = "".join(thinking)
-                    if not message.get("tool_calls") and not (message["content"] or "").strip() and not any(
+                    if (not response.get("_steered") and not message.get("tool_calls")
+                        and not (message["content"] or "").strip() and not any(
                         item["type"] == "reasoning" and (item.get("encrypted_content") or "").strip()
                         for item in (message.get("_responses") or {}).get("items", ())
-                    ):
+                    )):
                         raise EmptyTurn("Responses stopped without actionable output.", usage=usage)
                     if show and not visible and message["content"]:
                         visible.append(message["content"])

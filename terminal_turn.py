@@ -17,6 +17,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from btw import ANSI
 from cost_gate import usd
 from handoff import Cancellation
+from live_steering import LiveQueue
 
 
 def clear_terminal(editor):
@@ -46,6 +47,7 @@ class TerminalWork:
     operation: object = None
     admitted: bool = False
     returned: bool = False
+    live_steered: bool = False
 
     def accept(self):
         self.admitted = True
@@ -70,6 +72,7 @@ class TerminalTurn(Cancellation):
         self.server = lane
         self.works = works
         self.claimed = []
+        self.live = LiveQueue(self, lane.steers, lambda: lane.steering_mode, lane.repaint)
         self.background = works[0].background
         self.soft_steering = lane.interrupt_mode != "wait"
         self.compacting = bool(works[0].operation)
@@ -130,7 +133,10 @@ class TerminalTurn(Cancellation):
     def steering(self):
         with self.server.lock:
             self.check()
-            incoming = self.server.take(self.server.steers, self.server.steering_mode)
+            accepted, deferred = self.live.drain()
+            for work in accepted:
+                work.live_steered = True
+            incoming = accepted + deferred if accepted else self.server.take(self.server.steers, self.server.steering_mode)
             self.claimed.extend(incoming)
         if incoming:
             self.server.repaint()
@@ -138,7 +144,7 @@ class TerminalTurn(Cancellation):
 
     def has_steering(self):
         with self.server.lock:
-            return bool(self.server.steers)
+            return bool(self.live.accepted or self.server.steers)
 
     @contextmanager
     def admission(self, work):
@@ -264,7 +270,7 @@ class TerminalLane:
                 print(f"mini-pi: {error}", file=sys.stderr)
             finally:
                 with self.lock:
-                    for item in [*turn.claimed, *turn.works[1:]]:
+                    for item in [*turn.claimed, *turn.live.take_all(), *turn.works[1:]]:
                         if text := item.restore():
                             self.returned.append(text)
                     if (work.on_drop or failed) and (text := work.restore()):
@@ -302,7 +308,7 @@ class TerminalLane:
             self.steers.clear()
             self.followups.clear()
             if turn:
-                waiting = [*turn.claimed, *turn.works[1:], *waiting]
+                waiting = [*turn.claimed, *turn.live.take_all(), *turn.works[1:], *waiting]
                 turn.claimed.clear()
                 turn.cancel()
             self.background_paused = True

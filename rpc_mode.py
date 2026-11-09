@@ -5,6 +5,7 @@ import json
 import sys
 from collections import deque
 from concurrent.futures import CancelledError
+from contextlib import contextmanager
 from dataclasses import dataclass
 from tempfile import SpooledTemporaryFile
 from threading import Condition, RLock, Thread
@@ -14,6 +15,7 @@ from openai import APIStatusError
 
 from cost_gate import CostCapError
 from handoff import Cancellation
+from live_steering import LiveQueue
 from session_jsonl import export_message
 
 
@@ -171,6 +173,7 @@ class Work:
     command: dict
     content: object
     ack_pending: bool = False
+    live_steered: bool = False
 
     @property
     def text(self):
@@ -198,7 +201,10 @@ class RpcTurn(Cancellation):
         self.draft = None
         self.message_id = None
         self.withdrawn = []
+        self.claimed = []
         self.interrupt_responses = []
+        self.live = LiveQueue(self, server.steering, lambda: server.steering_mode,
+                              lambda: server.event("queue_update", **server.queues()))
 
     def publish(self, message):
         wire = wire_message(message, self.call_names)
@@ -252,14 +258,29 @@ class RpcTurn(Cancellation):
             self.check()
             queue = self.server.steering
             count = len(queue) if self.server.steering_mode == "all" else min(1, len(queue))
-            work = [queue.popleft() for _ in range(count)]
-            self.works.extend(work)
+            accepted, deferred = self.live.drain()
+            work = accepted + deferred if accepted else [queue.popleft() for _ in range(count)]
+            for entry in accepted:
+                entry.live_steered = True
+            self.claimed.extend(work)
             if work:
                 self.server.event("queue_update", **self.server.queues())
-        return [entry.content for entry in work]
+        return work
+
+    @contextmanager
+    def admission(self, work):
+        with self.server.lock:
+            self.check()
+            yield
+            self.claimed.remove(work)
+            self.works.append(work)
+
+    def take_uncommitted_steering(self):
+        claimed, self.claimed = self.claimed, []
+        return claimed + self.live.take_all()
 
     def has_steering(self):
-        return bool(self.server.steering)
+        return bool(self.live.accepted or self.server.steering)
 
     def tool_start(self, call):
         function = call["function"]
@@ -344,7 +365,10 @@ class RpcServer:
         return MAX_LOGICAL if self.output.version == 2 else MAX_FRAME - 1
 
     def restored_queue(self, command):
-        queues = {"steering": self.steering, "followUp": self.follow_up}
+        turn = self.turn
+        claimed = [*turn.claimed, *turn.live.accepted, *turn.live.deferred, *turn.live.pending] if turn else []
+        queues = {"steering": [*claimed, *self.steering],
+                  "followUp": self.follow_up}
         payload = {key: [work.restored() for work in queue] for key, queue in queues.items()}
         limit = self.response_limit()
         empty = {"steering": [], "followUp": []}
@@ -421,9 +445,12 @@ class RpcServer:
                 if words and words[0] in ("/clear", "/fresh"):
                     raise RpcFailure(f"Wait for the current response to finish or abort it before running {words[0]}.", "session_busy")
             kind = command["type"]
+            claimed = (len(self.turn.claimed) + len(self.turn.live.pending) + len(self.turn.live.accepted)
+                       + len(self.turn.live.deferred)
+                       if self.turn else 0)
             if kind == "abort_and_prompt":
                 self.abort()
-            elif len(self.steering) + len(self.follow_up) >= MAX_QUEUE:
+            elif claimed + len(self.steering) + len(self.follow_up) >= MAX_QUEUE:
                 raise RpcFailure("The prompt queue is full.", "session_busy")
             if self.turn:
                 if kind != "abort_and_prompt" and self.mcp and self.mcp.is_prompt_command(work.content):
@@ -510,6 +537,7 @@ class RpcServer:
                     except Exception as exc:
                         error, status = exc, "error"
                         break
+                self.steering.extendleft(reversed(turn.take_uncommitted_steering()))
                 queued = self.steering or self.follow_up
                 background = self.next_background() if not queued else None
                 self.awaiting_jobs = bool(self.has_pending_jobs())
@@ -538,7 +566,8 @@ class RpcServer:
             if self.turn:
                 self.turn.cancel()
             data = self.restored_queue(command) if restore else None
-            dropped = [*self.steering, *self.follow_up]
+            claimed = self.turn.take_uncommitted_steering() if self.turn else []
+            dropped = [*claimed, *self.steering, *self.follow_up]
             self.steering.clear()
             self.follow_up.clear()
             if dropped:
@@ -557,8 +586,9 @@ class RpcServer:
 
     def queues(self):
         with self.lock:
-            return {"steering": [work.text for work in self.steering],
-                    "followUp": [work.text for work in self.follow_up], "liveSteered": 0}
+            accepted = self.turn.live.accepted if self.turn else ()
+            return {"steering": [work.text for work in (*accepted, *self.steering)],
+                    "followUp": [work.text for work in self.follow_up], "liveSteered": len(accepted)}
 
     def require_idle(self):
         if self.turn:
