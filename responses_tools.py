@@ -154,3 +154,19 @@ class StreamedTools:
             index = next(index for index, item in enumerate(native) if item["type"] == "function_call")
             native.insert(index, {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
         return {**response, "output": native}, safe
+
+    def completed_output(self, output):
+        if output:
+            identifiers = {item.get("id") for item in output if item["type"] == "web_search_call"}
+            searches = [(index, item) for index, item in self.finished.items()
+                        if item["type"] == "web_search_call" and item.get("id") not in identifiers]
+            if not searches:
+                return output
+            output = list(output)
+            for index, item in sorted(searches):
+                output.insert(min(index, len(output)), item)
+            return output
+        # Some providers deliver native items only through output_item.done.
+        indexed = [*self.finished.items(), *((draft.index, {**draft.item, "arguments": draft.raw})
+                                            for draft in self.calls.values() if draft.closed)]
+        return [item for _, item in sorted(indexed, key=lambda entry: (entry[0] is None, entry[0] or 0))]

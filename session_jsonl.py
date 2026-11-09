@@ -208,6 +208,8 @@ def import_message(entry):
             result["tool_calls"] = calls
         if reasoning:
             result["_thinking"] = "\n".join(reasoning)
+        if not calls and message.get("stopReason") == "stop" and mapping(message.get("stopDetails")).get("type") == "pause_turn":
+            result["_stop_details"] = {"type": "pause_turn"}
         if isinstance(message.get("inputTransformations"), list):
             result["_input_transformations"] = message["inputTransformations"]
         return result
@@ -474,6 +476,8 @@ def export_message(message, call_names):
         result["usage"].update(metadata.get("usage", {}))
     if role == "assistant" and (transformations := message.get("_input_transformations")):
         result["inputTransformations"] = transformations
+    if role == "assistant" and (details := message.get("_stop_details")):
+        result["stopDetails"] = details
     return {"type": "message", "message": result, "miniPi": {"message": message}}
 
 

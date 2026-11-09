@@ -27,7 +27,7 @@ class NoRedirectConnect(connect):
 
 def replay_item(item):
     ignore = {"status"}
-    if item.get("type") in ("message", "function_call", "custom_tool_call"):
+    if item.get("type") in ("message", "function_call", "custom_tool_call", "web_search_call"):
         ignore.add("id")
     return {key: value for key, value in item.items() if key not in ignore}
 

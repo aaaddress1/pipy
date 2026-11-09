@@ -93,7 +93,7 @@ from recovery import (
     EmptyTurn, IncompleteTurn, RECOVERABLE_ERRORS, StepLimitReached, StreamInterrupted, TRANSPORT_ERRORS, TurnRecovery,
 )
 from routing import Router, load_routes
-from runtime import Compaction, Session, database, initialize, pack, responses_replay_scope
+from runtime import Compaction, Session, database, initialize, pack, paused_turn, responses_replay_scope
 from session_graph import SUMMARY_PROMPT, stored_batches
 from shake import MANUAL
 from snapcompact_inline import InlineImages, chat_tool_images
@@ -119,6 +119,7 @@ OUTPUT_LIMIT = 16_000
 ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 ARTIFACT_HEAD_BYTES = 3 * 1024 * 1024
 ARTIFACT_URL = re.compile(r"artifact://([a-f0-9]{64})(?:\?offset=([0-9]{1,12}))?")
+MAX_PAUSED_TURN_CONTINUATIONS = 8
 
 
 def run_agent(task, query, tools, max_steps, session, compaction, system_prompt, make_recovery, turn=None,
@@ -173,6 +174,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         raise RuntimeError("This session has no unfinished turn to continue.")
     steps = range(max_steps) if max_steps else count()
     yield_retries = 0
+    pause_continuations = 0
 
     if turn:
         for extra in turn.works[1:]:
@@ -231,6 +233,15 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         matched = rules.response if rules else None
         calls = assistant.get("tool_calls", [])
         skipped = assistant.get("_tool_stop") == "length"
+        continue_paused = False
+        if calls:
+            pause_continuations = 0
+        elif paused_turn(assistant):
+            continue_paused = pause_continuations < MAX_PAUSED_TURN_CONTINUATIONS
+            if continue_paused:
+                pause_continuations += 1
+            else:
+                assistant["_pause_exhausted"] = True
         for call in calls:
             function = call["function"]
             function["name"] = tool_alias(function["name"], active_tools)
@@ -274,6 +285,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
                 continue
             if rules:
                 rules.age += 1
+            if continue_paused:
+                continue
             if jobs and jobs.ready():
                 continue
             if child and child.budget_stopped():

@@ -109,7 +109,8 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
                 and (saved["prefix"] == prefix_tag + digest.hexdigest()
                      or any(saved["prefix"] == candidate.hexdigest() for candidate in legacy))
             ):
-                added = saved["items"]
+                added = [{key: value for key, value in item.items() if key != "id"}
+                         if item.get("type") == "web_search_call" else item for item in saved["items"]]
             else:
                 added = [{"role": role, "content": content}] if content else []
                 added += [
@@ -465,6 +466,10 @@ def item_text(item, separator=""):
     return ""
 
 
+def completed_search(item):
+    return item["type"] == "web_search_call" and item.get("status", "completed") == "completed"
+
+
 def completed_message(response, route, model, fingerprint):
     output = response["output"]
     text = "".join(item_text(item) for item in output)
@@ -483,13 +488,22 @@ def completed_message(response, route, model, fingerprint):
             replay.append(item)
         elif kind == "message" and item["role"] == "assistant":
             replay.append(item)
-        elif kind == "reasoning" and item.get("encrypted_content"):
+        elif kind == "reasoning" and item.get("encrypted_content") or completed_search(item):
             replay.append(item)
     if len({call["id"] for call in calls}) != len(calls):
         raise ValueError("Responses returned duplicate function calls.")
     message = {"role": "assistant", "content": text or None}
     if calls:
         message["tool_calls"] = calls
+    elif response.get("status") == "completed" and (
+        response.get("end_turn") is False or route.api == "openai-responses" and not text.strip()
+        and any(map(completed_search, output))
+        and not any(item["type"] == "image_generation_call" and item.get("result") for item in output)
+    ):
+        message["_stop_details"] = {"type": "pause_turn"}
+        if not text.strip():
+            message["content"] = None
+            replay = [item for item in replay if item["type"] != "message"]
     if replay and route.model == model:
         message["_responses"] = {
             "route": route.identity(), "prefix": fingerprint, "text": message["content"],
@@ -720,6 +734,7 @@ def stream_attempt(
                     resumed = event.get("_resumed_message")
                     truncated = False
                     executable = True
+                    reconstructed_text = False
                     if error.get("code") in ("context_length_exceeded", "context_window_exceeded"):
                         raise ContextWindowExceeded("Responses context window exceeded.", **details)
                     at_limit = (response.get("incomplete_details") or {}).get("reason") == "max_output_tokens"
@@ -733,6 +748,17 @@ def stream_attempt(
                         response, truncated = recovered, True
                     elif kind != "response.completed" or response.get("status") != "completed":
                         raise StreamInterrupted("Responses did not complete the turn.", **details)
+                    if not truncated:
+                        output = stream_tools.completed_output(response.get("output"))
+                        if details["text"] and not any(item["type"] == "message" and item.get("content") for item in output):
+                            output = [*output, {"type": "message", "role": "assistant", "content": [
+                                {"type": "output_text", "text": details["text"], "annotations": []},
+                            ]}]
+                            reconstructed_text = True
+                            if websocket is not None:
+                                websocket.baseline = None
+                        if output is not response.get("output"):
+                            response = {**response, "output": output}
                     guard.finish()
                     if tool_choice in ("none", "auto"):
                         text = "\n".join(piece for item in response["output"] if (piece := item_text(item, "\n")))
@@ -743,13 +769,13 @@ def stream_attempt(
                         message["_tool_stop"] = "length"
                     if thought := event.get("_resumed_thinking") or "".join(thinking):
                         message["_thinking"] = thought
-                    if (not response.get("_steered") and not message.get("tool_calls")
+                    if (not response.get("_steered") and not message.get("tool_calls") and not message.get("_stop_details")
                         and not (message["content"] or "").strip() and not any(
                         item["type"] == "reasoning" and (item.get("encrypted_content") or "").strip()
                         for item in (message.get("_responses") or {}).get("items", ())
                     )):
                         raise EmptyTurn("Responses stopped without actionable output.", usage=usage)
-                    if not truncated and http_chain and (chain_result := event.get("_http_chain")):
+                    if not truncated and not reconstructed_text and http_chain and (chain_result := event.get("_http_chain")):
                         http_chain.complete(*chain_result, response, message)
                     if show and not visible and message["content"]:
                         visible.append(message["content"])
