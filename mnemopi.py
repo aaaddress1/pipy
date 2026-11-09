@@ -14,7 +14,7 @@ import yaml
 from auth_broker import dotted
 from cancellable_http import active_turn, turn_scope, wait_for_result
 from handoff import Cancellation
-from hindsight import MEMORY_TAGS, conversation, persisted_recall, recall_query
+from hindsight import MEMORY_TAGS, conversation, conversation_turns, persisted_recall, recall_query
 from memory import redact_memory
 from memory_files import atomic_text, select_memory_lines
 from mnemopi_embeddings import Embeddings
@@ -352,7 +352,7 @@ class Mnemopi:
         if not latest.strip():
             return None, None
         try:
-            history = conversation(self.session, after_reset=True)
+            history = conversation(self.session, after_reset=True, last_turns=self.turns - 1)
             text, memories = self.block(self.lookup(recall_query(history, latest, self.turns, self.max_query)))
         except ValueError as error:
             self.notice(str(error))
@@ -385,31 +385,33 @@ class Mnemopi:
         if self.parent:
             return 0
         bank = self.banks[self.retain_bank]
-        transcript_id = self.session.transcript_id
-        floor = self.retention_floor[1] if self.retention_floor and self.retention_floor[0] == transcript_id else 0
-        with open_bank(bank.path) as db:
-            retained = max(floor, bank.cursor(db, transcript_id))
-        messages = conversation(self.session, after_reset=True)
-        turns = [index for index, (role, _, _) in enumerate(messages) if role == "user"]
-        if len(turns) <= retained or not force and len(turns) - retained < self.every:
-            return 0
-        messages = messages[turns[retained]:]
+        with self.session.writer:
+            transcript_id = self.session.transcript_id
+            total = conversation_turns(self.session, after_reset=True)
+            if not total or not force and total < self.every:
+                return 0
+            floor = self.retention_floor[1] if self.retention_floor and self.retention_floor[0] == transcript_id else 0
+            with open_bank(bank.path) as db:
+                retained = max(floor, bank.cursor(db, transcript_id))
+            if total <= retained or not force and total - retained < self.every:
+                return 0
+            messages = conversation(self.session, after_reset=True, after_turn=retained)
         clean = [(role, self.clean(MEMORY_TAGS.sub("", content)).strip()) for role, content, _ in messages]
         clean = [(role, content) for role, content in clean if content]
         transcript = "\n\n".join(f"[role: {role}]\n{content}\n[{role}:end]" for role, content in clean)
         embedding = "\n\n".join(format_content(content) for _, content in clean)
         metadata = {"session_id": transcript_id, "source_id": transcript_id + "-" + timestamp(),
-                    "cwd": str(self.workspace), "message_count": len(clean), "retained_through_user_turn": len(turns)}
+                    "cwd": str(self.workspace), "message_count": len(clean), "retained_through_user_turn": total}
         if transcript:
             identifier = bank.retain(transcript, source="coding-agent-transcript", importance=.65, metadata=metadata,
-                                     veracity="unknown", memory_type="episode", embed_text=embedding, through=len(turns))
+                                     veracity="unknown", memory_type="episode", embed_text=embedding, through=total)
             if identifier:
                 self.queue_embedding(bank, identifier, embedding)
                 if extract:
                     user_text = "\n\n".join(f"[role: user]\n{content}\n[user:end]" for role, content in clean if role == "user")
                     self.link_memory(bank, identifier, transcript, user_text)
                     self.queue_extraction(bank, identifier, transcript, user_text)
-                return len(turns) - retained
+                return total - retained
         return 0
 
     def end_turn(self):
@@ -450,7 +452,7 @@ class Mnemopi:
             for bank in self.banks.values():
                 bank.clear()
             self.retention_floor = (self.session.transcript_id,
-                                    sum(role == "user" for role, _, _ in conversation(self.session, after_reset=True)))
+                                    conversation_turns(self.session, after_reset=True))
             self.recall = ""
             self.session.record_metadata({"type": "custom", "customType": "memory_recall_clear", "data": self.scope})
             return "Cleared scoped Mnemopi memory."

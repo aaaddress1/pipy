@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from memory_transcript import user_turns
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_heads (
@@ -141,12 +143,16 @@ def transfer_message(kind, **fields):
 
 
 def batch_payload(messages, timestamp=None):
-    payload = {"timestamp": timestamp} if timestamp else {}
+    payload = {"memoryUserTurns": user_turns(messages)}
+    if any("_memory_recall_changes" in message for message in messages):
+        payload["memoryRecallChanges"] = True
+    if timestamp:
+        payload["timestamp"] = timestamp
     for message in reversed(messages):
         if marker := transfer_details(message.get("_session_transfer")):
             payload["sessionTransfer"] = marker
             break
-    return payload or None
+    return payload
 
 
 def last_transfer(db, session):

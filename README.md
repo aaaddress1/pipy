@@ -170,6 +170,8 @@ JSON 路由可加 `"catalog": "openai/gpt-5.4"` 繼承目錄資料，並用路�
 
 `memory.backend: hindsight` 使用 `hindsight.apiUrl` 指定的記憶服務，預設為 `http://localhost:8888`。可用 `HINDSIGHT_API_URL` 與 `HINDSIGHT_API_TOKEN` 指定端點與憑證。它支援首回合回憶、按回合保存對話，以及 `retain`、`recall`、`reflect` 和選用的 `learn`。工具寫入會先排入本機佇列，在服務接受後移除。預設以專案標籤隔離，開啟 `hindsight.globalScope` 才能主動寫入跨專案記憶。`/memory mm` 可管理服務端的 mental models。 [上游 Hindsight](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/memory.md#hindsight-remote-backend)
 
+Hindsight 與 Mnemopi 在代理回合結束後檢查使用者回合數，達到各自的保存間隔才擷取對話。恢復工作階段後，首次回憶只讀取查詢需要的最近回合。Hindsight 保存完整對話時會驗證並重用前次已保存的前綴。
+
 `memory.backend: mnemopi` 使用 BEAM 格式的 SQLite 記憶銀行。支援 `retain`、`recall`、`reflect`、`memory_edit` 和 `read memory://<id>`。預設為 `per-project`，`per-project-tagged` 會同時查詢本專案與共用銀行。工作階段記錄會保存第一次注入的回憶，恢復時另外交付撤銷或更新提醒。`/memory sync` 將到齡的工作記憶整併成情節。預設可用全文搜尋。需要向量召回時，可用 `mnemopi.embeddingApiUrl` 和 `mnemopi.embeddingModel` 指定受信任的 embeddings 服務。 [上游 Mnemopi](https://github.com/can1357/oh-my-pi/tree/24439066040e006eb08da7b204f0ac41c79d2de9/packages/mnemopi)
 
 Mnemopi 的 `llmMode: smol` 透過 `memory` 模型角色在背景擷取事實。`remote` 使用設定的 `llmBaseUrl` 和 `llmModel`，`none` 使用文字規則。自動保存對話時只把使用者訊息交給擷取器。結構化結果分別寫入事實、指令、偏好、時間線和三元組。情節整併會寫入摘要節點與關係，`mnemopi.proactiveLinking: true` 則在保存工作記憶時建立連結。 [上游擷取流程](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/mnemopi/src/core/extraction.ts) · [上游情節圖譜](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/mnemopi/src/core/episodic-graph.ts)

@@ -289,7 +289,8 @@ class Bank:
 
     def cursor(self, db, session):
         rows = db.execute("""
-            SELECT content,json_extract(metadata_json,'$.source_id') AS source_id,
+            SELECT CASE WHEN json_type(metadata_json,'$.retained_through_user_turn') IS NOT 'integer'
+                        THEN content END AS content,json_extract(metadata_json,'$.source_id') AS source_id,
                    json_extract(metadata_json,'$.retained_through_user_turn') AS through
             FROM working_memory WHERE source='coding-agent-transcript' AND json_valid(metadata_json)
             AND json_extract(metadata_json,'$.session_id')=? ORDER BY rowid

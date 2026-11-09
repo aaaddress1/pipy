@@ -6,6 +6,7 @@ import random
 import re
 import subprocess
 import time
+from collections import deque
 from concurrent.futures import CancelledError, TimeoutError
 from datetime import datetime
 from difflib import unified_diff
@@ -20,15 +21,14 @@ import httpx
 from auth_broker import dotted
 from memory import redact_memory
 from memory_files import atomic_text
+from memory_transcript import MEMORY_TAGS, NON_CONVERSATIONAL, conversation_messages, conversation_text, substantive, user_turns
 from reset_fence import bun_hash, shared_file_lock
 from runtime import database
 from cancellable_http import active_turn, turn_scope
 from handoff import Cancellation
-from session_graph import ANCESTORS, stored_batches
-from session_jsonl import plain_text
+from session_graph import ANCESTORS
 
 
-MEMORY_TAGS = re.compile(r"<(memories|mental_models|hindsight_memories|relevant_memories)>.*?</\1>", re.S)
 CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 EVENT = re.compile(r"omp-retain-[0-9a-f]{32}\.json\Z")
 DAY = 86_400
@@ -76,29 +76,87 @@ def retain_time():
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
-def conversation(session, *, after_reset=False):
-    start = session.transcript_start if after_reset else 0
-    with database(session.path) as db:
-        batches = stored_batches(db, session.id, session.leaf, start, apply_elisions=False)
-        stamps = dict(db.execute(ANCESTORS + """
-            SELECT n.batch, coalesce(json_extract(source.metadata, '$.timestamp'), json_extract(n.payload, '$.timestamp'))
+VISIBLE_ROW = " AND ".join(f"json_type(m.value, '$.{key}') IS NULL" for key in NON_CONVERSATIONAL)
+
+
+def conversation_turn_batches(db, session, start):
+    rows = db.execute(ANCESTORS + """
+        SELECT n.id,n.batch,json_extract(n.payload,'$.memoryUserTurns'),
+               CASE WHEN json_type(n.payload,'$.memoryUserTurns') IS NULL THEN b.messages END
+        FROM ancestry a JOIN session_nodes n ON n.id=a.id
+        JOIN batches b ON b.session=n.session AND b.seq=n.batch
+        WHERE n.kind='batch' AND n.batch>=? ORDER BY n.batch
+    """, (session.leaf, session.id, session.id, start))
+    older, counts = [], []
+    for node, seq, count, raw in rows:
+        if count is None:
+            messages = json.loads(raw)
+            count = user_turns(messages)
+            older.append((count, any("_memory_recall_changes" in message for message in messages), session.id, node))
+        counts.append((seq, count))
+    if older:
+        db.executemany("UPDATE session_nodes SET payload=json_set(coalesce(payload,'{}'),'$.memoryUserTurns',?,"
+                       "'$.memoryRecallChanges',?) "
+                       "WHERE session=? AND id=?", older)
+    return counts
+
+
+def conversation_turns(session, *, after_reset=False):
+    with session.writer, database(session.path) as db:
+        start = session.transcript_start if after_reset else 0
+        return sum(count for _, count in conversation_turn_batches(db, session, start))
+
+
+def conversation(session, *, after_reset=False, after_turn=0, last_turns=None):
+    if last_turns is not None and last_turns <= 0:
+        return []
+    with session.writer, database(session.path) as db:
+        start = session.transcript_start if after_reset else 0
+        counts = conversation_turn_batches(db, session, start) if after_turn or last_turns is not None else ()
+        if last_turns is not None:
+            after_turn = max(after_turn, sum(count for _, count in counts) - last_turns)
+        remaining = after_turn
+        if after_turn:
+            for seq, count in counts:
+                if count > remaining:
+                    start = seq
+                    break
+                remaining -= count
+            else:
+                return []
+        rows = db.execute(ANCESTORS + f"""
+            SELECT json_extract(m.value,'$.role'), json_extract(m.value,'$.content'), json_type(m.value,'$.content'),
+                   coalesce(json_extract(source.metadata,'$.timestamp'),json_extract(n.payload,'$.timestamp'))
             FROM ancestry a JOIN session_nodes n ON n.id=a.id
+            JOIN batches b ON b.session=n.session AND b.seq=n.batch JOIN json_each(b.messages) m
             LEFT JOIN session_entry_sources source ON source.node=n.id AND source.session=n.session
-            WHERE n.kind='batch' AND n.batch>=?
-        """, (session.leaf, session.id, session.id, start)))
-    return [entry for seq, batch in batches for entry in conversation_messages(batch, stamps.get(seq))]
-
-
-def conversation_messages(messages, timestamp=None):
+            WHERE n.kind='batch' AND n.batch>=? AND json_extract(m.value,'$.role') IN ('user','assistant')
+            AND {VISIBLE_ROW} ORDER BY n.batch,CAST(m.key AS INTEGER)
+        """, (session.leaf, session.id, session.id, start)).fetchall()
     entries = []
-    for message in messages:
-        if message["role"] not in ("user", "assistant") or any(
-                key in message for key in ("_mcp_notification", "_async_jobs", "_service_runs", "_goal_message")):
+    waiting_for_user = bool(after_turn)
+    for role, content, kind, stamp in rows:
+        text = conversation_text(json.loads(content) if kind == "array" else content)
+        if not substantive(text):
             continue
-        content = plain_text(message.get("content"))
-        if any(char.isalnum() for char in MEMORY_TAGS.sub("", content)):
-            entries.append((message["role"], content, timestamp))
+        if waiting_for_user:
+            if role != "user":
+                continue
+            if remaining:
+                remaining -= 1
+                continue
+            waiting_for_user = False
+        entries.append((role, text, stamp))
     return entries
+
+
+def retention_prefix(digest, messages):
+    for message in messages:
+        for value in message:
+            data = (value or "").encode("utf-8", errors="replace")
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(data)
+    return digest
 
 
 def recall_query(history, latest, turns, limit):
@@ -126,8 +184,10 @@ def persisted_recall(session, scope):
     with database(session.path) as db:
         rows = db.execute(ANCESTORS + """
             SELECT n.kind,n.payload,
-                CASE WHEN b.messages LIKE '%"_memory_recall_changes"%' THEN b.messages END
-            FROM ancestry a JOIN session_nodes n ON n.id=a.id LEFT JOIN batches b ON b.seq=n.batch
+                CASE WHEN json_type(n.payload,'$.memoryUserTurns') IS NULL THEN
+                    CASE WHEN b.messages LIKE '%"_memory_recall_changes"%' THEN b.messages END
+                WHEN json_extract(n.payload,'$.memoryRecallChanges')=1 THEN b.messages END
+            FROM ancestry a JOIN session_nodes n ON n.id=a.id LEFT JOIN batches b ON b.seq=n.batch AND b.session=n.session
             ORDER BY n.id DESC
         """, (session.leaf, session.id, session.id))
         turn_followed = False
@@ -208,6 +268,9 @@ class Hindsight:
         self.last_retained = 0
         self.last_transcript = None
         self.retained_transcript_id = None
+        self.retained_prefix = None
+        self.retention_queue = deque()
+        self.last_window_ms = 0
         self.drain_job = self.retain_job = self.mental_job = None
         self.drain_at = None
         self.bank_lock = RLock()
@@ -315,7 +378,8 @@ class Hindsight:
             return
         if not latest.strip():
             return
-        result = self.context(conversation(self.session, after_reset=True), latest)
+        history = conversation(self.session, after_reset=True, last_turns=self.recall_turns - 1)
+        result = self.context(history, latest)
         if signal := active_turn():
             signal.check()
         if result is not None:
@@ -358,12 +422,12 @@ class Hindsight:
             return "Cleared the local Hindsight context. The remote memory bank is managed on the server."
         if verb in ("sync", "enqueue", "rebuild"):
             self.flush()
-            if self.retain_job:
-                self.retain_job.result()
-            self.retain_job = self.executor.submit(self.retain, conversation(self.session, after_reset=True),
-                                                   transcript_id=self.session.transcript_id, force=True)
+            with self.session.writer:
+                history = conversation(self.session, after_reset=True)
+                transcript_id = self.session.transcript_id
+            job = self.schedule_retention(history, transcript_id, force=True)
             if verb == "sync":
-                self.retain_job.result()
+                job.result()
                 return "Hindsight retention ran."
             return "Hindsight retention enqueued."
         if verb == "mm":
@@ -606,14 +670,26 @@ class Hindsight:
             boundaries = [index for index, (role, _, _) in enumerate(messages) if role == "user"]
             window = self.every + self.overlap
             messages = messages[boundaries[-window] if len(boundaries) >= window else 0:]
-            document += "-" + str(int(time.time() * 1000))
+            self.last_window_ms = max(self.last_window_ms + 1, int(time.time() * 1000))
+            document += "-" + str(self.last_window_ms)
+        full = self.retain_mode == "full-session"
+        digest = sha256() if full else None
+        rendered, offset = None, 0
+        if full and not force and same_transcript and self.retained_prefix:
+            previous_count, previous_key = self.retained_prefix
+            if previous_count <= len(messages) and (
+                retention_prefix(digest, messages[:previous_count]).digest() == previous_key
+            ):
+                rendered, offset = self.last_transcript, previous_count
+            else:
+                digest = sha256()
         sections = []
-        for role, text, timestamp in messages:
+        for role, text, timestamp in messages[offset:]:
             text = self.clean(MEMORY_TAGS.sub("", text)).strip()
             if any(char.isalnum() for char in text):
                 stamp = f"[timestamp: {timestamp}]\n" if timestamp else ""
                 sections.append(f"[role: {role}]\n{stamp}{text}\n[{role}:end]")
-        transcript = "\n\n".join(sections)
+        transcript = "\n\n".join([rendered, *sections] if rendered else sections)
         if not transcript or not force and same_transcript and self.retain_mode == "full-session" and transcript == self.last_transcript:
             return
         item = {"content": transcript, "document_id": document, "context": self.clean(self.retain_context),
@@ -626,17 +702,42 @@ class Hindsight:
         except HindsightError as error:
             self.notice(str(error))
         else:
-            self.last_retained, self.last_transcript = count, transcript
-            self.retained_transcript_id = transcript_id
+            prefix = (len(messages), retention_prefix(digest, messages[offset:]).digest()) if full else None
+            with self.condition:
+                self.last_retained, self.last_transcript = count, transcript
+                self.retained_transcript_id, self.retained_prefix = transcript_id, prefix
+
+    def schedule_retention(self, messages, transcript_id, *, force=False):
+        with self.condition:
+            record = messages, transcript_id, force
+            if self.retain_mode == "full-session" and self.retention_queue and not force and (
+                self.retention_queue[-1][1:] == (transcript_id, False)
+            ):
+                self.retention_queue[-1] = record
+            else:
+                self.retention_queue.append(record)
+            if self.retain_job is None or self.retain_job.done():
+                self.retain_job = self.executor.submit(self.drain_retention)
+            return self.retain_job
+
+    def drain_retention(self):
+        while True:
+            with self.condition:
+                if not self.retention_queue:
+                    self.retain_job = None
+                    return
+                messages, transcript_id, force = self.retention_queue.popleft()
+            self.retain(messages, transcript_id=transcript_id, force=force)
 
     def end_turn(self):
         if self.auto_retain:
-            transcript_id = self.session.transcript_id
-            history = conversation(self.session, after_reset=True)
-            retained = self.last_retained if transcript_id == self.retained_transcript_id else 0
-            if sum(role == "user" for role, _, _ in history) - retained >= self.every:
-                if self.retain_job is None or self.retain_job.done():
-                    self.retain_job = self.executor.submit(self.retain, history, transcript_id=transcript_id)
+            with self.session.writer:
+                transcript_id = self.session.transcript_id
+                with self.condition:
+                    retained = self.last_retained if transcript_id == self.retained_transcript_id else 0
+                if conversation_turns(self.session, after_reset=True) - retained >= self.every:
+                    history = conversation(self.session, after_reset=True)
+                    self.schedule_retention(history, transcript_id)
         self.schedule_drain()
 
     def mental_models(self, detail="content"):
