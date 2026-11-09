@@ -5,6 +5,7 @@ import re
 from copy import deepcopy
 from urllib.parse import urlsplit
 
+from responses_cache import mark
 from responses_websocket import delta_input, stale_anchor
 
 
@@ -25,6 +26,8 @@ def stored_host(route):
 def stateful_enabled(route, *, websocket=False):
     if route.api != "openai-responses":
         return False
+    if not websocket and route.cache_retention == "none":
+        return False
     compat = (route.catalog_model or {}).get("compat") or {}
     if not websocket and compat.get("storeResponses") is True and not stored_host(route):
         return False
@@ -41,6 +44,7 @@ def stateful_enabled(route, *, websocket=False):
 class ResponsesChain:
     def __init__(self):
         self.baseline = None
+        self.breakpoint = None
         self.stale_failures = 0
         self.disabled = False
         self.zero_retention = False
@@ -48,10 +52,12 @@ class ResponsesChain:
     def reset(self):
         self.baseline = None
 
-    def request(self, body):
+    def request(self, body, breakpoint=None):
         full = {**body, "store": not self.zero_retention and (body.get("store") is True or not self.disabled)}
-        baseline, self.baseline = self.baseline, None
-        delta = delta_input(baseline, full) if not self.disabled else None
+        baseline = self.baseline if not self.disabled and self.breakpoint == breakpoint else None
+        self.baseline, self.breakpoint = None, breakpoint
+        full = mark(full, breakpoint, baseline[1]["input"] if baseline else None)
+        delta = delta_input(baseline, full)
         if delta is None:
             return full, full
         return full, {**full, "input": delta, "previous_response_id": baseline[0]}

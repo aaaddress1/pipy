@@ -16,6 +16,7 @@ from openai import APIConnectionError, APIError, APIStatusError
 
 import model_catalog
 import codex_responses
+import responses_cache
 import responses_resume
 from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
@@ -35,14 +36,15 @@ CONTEXT_PREFIXES = (
     "context replaced.", "branch-return summary:",
 )
 GATEWAY_FIELDS = frozenset(("provider", "providerOptions", "caching", "cache_anchor_items", "cache_ttl"))
+EXTRA_FIELDS = GATEWAY_FIELDS | {"prompt_cache_options", "cache_control"}
 V2_TIMEOUT = 300
 STABLE_REPLAY_PREFIX = "stable:"
 
 
 def sdk_body(body):
-    extra = {key: value for key, value in body.items() if key in GATEWAY_FIELDS}
+    extra = {key: value for key, value in body.items() if key in EXTRA_FIELDS}
     if extra:
-        return {**{key: value for key, value in body.items() if key not in GATEWAY_FIELDS}, "extra_body": extra}
+        return {**{key: value for key, value in body.items() if key not in EXTRA_FIELDS}, "extra_body": extra}
     return body
 
 
@@ -126,7 +128,8 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
         "model": route.wire_model(effort) if identity else model, "input": items,
         "store": False, "include": ["reasoning.encrypted_content"],
     }
-    body.update(model_catalog.gateway_body(route.catalog_model, responses=True, cache_retention=route.cache_retention))
+    retention = {"short": "5m", "long": "1h"}.get(route.cache_retention, route.cache_retention)
+    body.update(model_catalog.gateway_body(route.catalog_model, responses=True, cache_retention=retention))
     if not (route.catalog_model or {}).get("omitMaxOutputTokens"):
         body["max_output_tokens"] = max_tokens or route.max_output_tokens
     if instructions:
@@ -496,7 +499,7 @@ def completed_message(response, route, model, fingerprint):
 
 @contextmanager
 def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None, effort_control=None,
-                    http_chain=None, prepare_resumed=None):
+                    http_chain=None, prepare_resumed=None, breakpoint=None):
     if codex_route:
         lite = codex_responses.lite_enabled(codex_route)
         codex_responses.request_shape(codex_route, body, lite=lite)
@@ -513,13 +516,13 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None,
     if websocket is not None and not websocket.sse_only and http_chain:
         http_chain.reset()
     if websocket is not None and websocket.open():
-        with closing(websocket.events(body)) as stream:
+        with closing(websocket.events(responses_cache.mark(body, breakpoint))) as stream:
             yield stream
     elif http_chain:
-        with closing(chained_http_events(client, body, http_chain, prepare_resumed)) as stream:
+        with closing(chained_http_events(client, body, http_chain, prepare_resumed, breakpoint)) as stream:
             yield stream
     else:
-        with closing(http_events(client, body, prepare_resumed)) as stream:
+        with closing(http_events(client, responses_cache.mark(body, breakpoint), prepare_resumed)) as stream:
             yield stream
 
 
@@ -532,8 +535,8 @@ def http_events(client, body, prepare_resumed):
             yield from (event.to_dict() for event in stream)
 
 
-def chained_http_events(client, body, chain_state, prepare_resumed=None):
-    full, wire = chain_state.request(body)
+def chained_http_events(client, body, chain_state, prepare_resumed=None, breakpoint=None):
+    full, wire = chain_state.request(body, breakpoint)
     for attempt in range(2):
         first = True
         try:
@@ -559,7 +562,7 @@ def chained_http_events(client, body, chain_state, prepare_resumed=None):
                 raise
         # A definite rejection permits one full retry. The stale counter only
         # disables storage on later requests; a retention rejection disables it now.
-        full = wire = {**full, "store": not chain_state.zero_retention}
+        full = wire = responses_cache.mark({**body, "store": not chain_state.zero_retention}, breakpoint)
 
 
 def codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source, vision):
@@ -638,20 +641,21 @@ def stream_attempt(
     if tool_choice and schemas:
         body["tool_choice"] = ({"type": "function", "name": tool_choice["function"]["name"]}
                                if isinstance(tool_choice, dict) else tool_choice)
-    if prompt_cache_key:
-        body["prompt_cache_key"] = prompt_cache_key
     codex_route = route if route.api == codex_responses.API else None
+    breakpoint = None
     if codex_route:
         codex_turn = codex_turn or codex_responses.SessionIdentity(None).turn()
         body["model"] = (route.catalog_model or {}).get("requestModelId") or body["model"]
-        body.setdefault("prompt_cache_key", codex_turn.session.session_id)
+        body["prompt_cache_key"] = prompt_cache_key or codex_turn.session.session_id
+    else:
+        body, breakpoint = responses_cache.prepare(body, route, messages, prompt_cache_key)
     visible, thinking, tool_draft = [], [], False
     stream_tools = {}
     usage = reported_usage = None
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
                              live_source=live_source, effort_control=effort_control, http_chain=http_chain,
-                             prepare_resumed=prepare_resumed) as stream:
+                             prepare_resumed=prepare_resumed, breakpoint=breakpoint) as stream:
             for event in stream:
                 if cancel:
                     cancel()
@@ -765,6 +769,9 @@ def stream_attempt(
 
 async def recap(client, route, messages, effort, meter=None, *, effort_control=None):
     body, _ = request_body(route, route.model, messages, [], effort, max_tokens=512)
+    if route.api == "openai-responses":
+        body, breakpoint = responses_cache.prepare(body, route, messages)
+        body = responses_cache.mark(body, breakpoint)
     if effort_control:
         effort_control.apply(body)
     if meter:

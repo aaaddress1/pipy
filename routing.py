@@ -28,6 +28,7 @@ import codex_attestation
 import codex_responses
 from mcp_oauth import oauth_url
 import model_catalog
+import responses_cache
 from responses_chain import ResponsesChain, env_flag, stateful_enabled
 from responses_effort import EffortControl, supported as supports_effort_updates
 from model_secrets import CONFIG_KEY, KEYLESS, ConfigRequestAuth, ConfigSecrets, origin
@@ -78,6 +79,7 @@ class Route:
     prefer_websockets: bool = False
     stateful_responses: bool | None = None
     store_responses: bool = False
+    prompt_cache: responses_cache.PromptCache | None = None
 
     def endpoint(self):
         if self.api == "anthropic-messages":
@@ -149,7 +151,7 @@ def load_prices(name, value):
 
 def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, context_promotion=False,
                 allow_unmatched=False, configured_models=None, extended_context=False, allow_judge=False,
-                responses_websockets=False, codex_websockets=None, muse_store_responses=False):
+                responses_websockets=False, codex_websockets=None, muse_store_responses=False, responses_retention=None):
     registry = configured_models or model_catalog
     if path is None:
         if not model_catalog.select_routed(registry, primary):
@@ -164,7 +166,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
         if not isinstance(fields, dict) or set(fields) - {
             "model", "catalog", "context_window", "base_url", "api_key_env", "promote_to", "fallbacks", "reasoning_effort",
             "api", "auth", "max_output_tokens", "cache_retention", "native_compaction", "cache_prices",
-            "responses_compaction_v2", "prefer_websockets", "stateful_responses", "store_responses",
+            "responses_compaction_v2", "prefer_websockets", "stateful_responses", "store_responses", "prompt_cache",
             "vision", "image_max_edge", "image_count_budget", "image_byte_budget", "image_tokens", "image_detail",
             "image_read_results",
             "broker_provider", "broker_accounts", "broker_scope",
@@ -210,7 +212,11 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
         if api == "chat-completions" and catalog.get("omitMaxOutputTokens"):
             default_limit = None
         max_tokens = fields.get("max_output_tokens", default_limit)
-        cache_retention = fields.get("cache_retention", "none")
+        standard_responses = api == "openai-responses"
+        cache_retention = fields.get("cache_retention", responses_cache.resolve_retention(responses_retention)
+                                     if standard_responses else "none")
+        prompt_cache = (responses_cache.parse_policy(fields["prompt_cache"], compat, cache_retention)
+                        if standard_responses and "prompt_cache" in fields else None)
         remote = (catalog.get("remoteCompaction") or {}) if same_endpoint else {}
         remote_enabled = remote.get("enabled")
         responses_remote = api in model_catalog.RESPONSES_APIS and remote.get("api", api) == api
@@ -341,17 +347,17 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             or auth not in ("api-key", "bearer")
             or (not (max_tokens is None and catalog and api == "chat-completions")
                 and (type(max_tokens) is not int or max_tokens < 1))
-            or cache_retention not in ("none", "5m", "1h")
+            or cache_retention not in (responses_cache.RETENTIONS if standard_responses else ("none", "5m", "1h"))
             or type(native_compaction) is not bool
             or type(responses_compaction_v2) is not bool
             or type(prefer_websockets) is not bool
             or "stateful_responses" in fields and type(stateful_responses) is not bool
             or type(store_responses) is not bool
-            or api != "openai-responses" and {"stateful_responses", "store_responses"} & fields.keys()
+            or not standard_responses and {"stateful_responses", "store_responses", "prompt_cache"} & fields.keys()
             or "prefer_websockets" in fields and api not in model_catalog.RESPONSES_APIS
             or "responses_compaction_v2" in fields and api not in model_catalog.RESPONSES_APIS
             or responses_compaction_v2 and not native_compaction
-            or api != "anthropic-messages" and {"auth", "cache_retention"} & fields.keys()
+            or api != "anthropic-messages" and ("auth" in fields or not standard_responses and "cache_retention" in fields)
             or api == "chat-completions" and (
                 "native_compaction" in fields or "max_output_tokens" in fields and not catalog
             )
@@ -365,6 +371,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             provider, frozenset(accounts) if accounts is not None else None, scope, key_override,
             replay_unsigned, prefix_mismatch, fallback_credit, chain, catalog or None, connection=connection,
             prefer_websockets=prefer_websockets, stateful_responses=stateful_responses, store_responses=store_responses,
+            prompt_cache=prompt_cache,
             metadata_pins=frozenset(key for field_name, key in (
                 ("context_window", "contextWindow"), ("max_output_tokens", "maxTokens"), ("vision", "input"),
             ) if field_name in fields) | (
@@ -408,7 +415,7 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
                         None, target, None, anthropic_server_side_fallback=anthropic_server_side_fallback,
                         configured_models=configured_models, extended_context=extended_context,
                         responses_websockets=responses_websockets, codex_websockets=codex_websockets,
-                        muse_store_responses=muse_store_responses,
+                        muse_store_responses=muse_store_responses, responses_retention=responses_retention,
                     )[target]
             if matched and matched.window and matched.window > route.window and matched.name != name:
                 routes[matched.name] = matched

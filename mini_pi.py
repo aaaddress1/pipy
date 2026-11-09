@@ -1747,7 +1747,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             options = {"reasoning_effort": effort} if effort else {}
             if route.api == "anthropic-messages":
                 options["metadata"] = provider_metadata()
-            elif urlsplit(route.endpoint()).hostname == "api.openai.com":
+            elif (route.cache_retention != "none" if route.api == "openai-responses"
+                  else urlsplit(route.endpoint()).hostname == "api.openai.com"):
                 options["prompt_cache_key"] = session.request_cache_key
             return options
 
@@ -3864,6 +3865,7 @@ def main():
             args.fallback_on = "off"
         route_options = {
             "responses_websockets": dotted(settings, "providers.openaiResponsesWebsockets") is True,
+            "responses_retention": dotted(settings, "providers.cacheRetention"),
             "codex_websockets": dotted(settings, "providers.openaiWebsockets"),
             "muse_store_responses": dotted(settings, "providers.museCode.storeResponses") is True,
             "anthropic_server_side_fallback": dotted(settings, "providers.anthropic.serverSideFallback") is True,
