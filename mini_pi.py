@@ -77,7 +77,7 @@ import task_isolation
 from cache_warmer import CacheWarmer
 from cancellable_http import CancellableTransport, TransportLoop, active_turn, turn_scope
 from compaction_policy import CompactionPolicy, setting as layered_setting
-from goals import Goals, SCHEMA as GOAL_SCHEMA, describe as describe_goal
+from goals import Goals, GoalSteer, SCHEMA as GOAL_SCHEMA, describe as describe_goal, discard_stale_goal_steers
 from todos import Todos
 from cost_gate import CostCapError, CostGate, entry_usage, total_cost
 from maintenance_retry import MaintenanceRetry
@@ -142,6 +142,20 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         work = content if queued and (terminal_turn or isinstance(content, rpc_mode.Work)) else None
         if work:
             content = work.content
+        if isinstance(content, GoalSteer):
+            boundary = turn.admission(work) if work else turn.server.lock if turn else nullcontext()
+            with boundary:
+                messages = content.messages()
+                if messages:
+                    session.append(messages)
+            if admitted:
+                admitted()
+            for message in messages:
+                if turn:
+                    turn.publish(message)
+                if on_input and not message.get("_goal_message"):
+                    on_input(message["content"])
+            return bool(messages)
         message = content if isinstance(content, dict) else {"role": "user", "content": content}
         if work and work.live_steered:
             message["liveSteered"] = True
@@ -166,6 +180,13 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             if cancellation:
                 cancellation.check()
             on_input(message["content"] if message.get("liveSteered") else content)
+        return True
+
+    def append_steering(works):
+        delivered = False
+        for work in works:
+            delivered = append_input(work, queued=True) or delivered
+        return delivered
 
     def rule_notice(hits, kind):
         if turn and kind != "prose":
@@ -177,17 +198,22 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         append_input(rules.message(hits, kind), notification=True)
 
     force_todo = False
-    if todo and task is not None and todo.eager != "default" and (prelude := todo.prelude(task, session.batches, "todo" in tools())):
+    goal_steer = isinstance(task, GoalSteer)
+    if todo and task is not None and not goal_steer and todo.eager != "default" and (
+        prelude := todo.prelude(task, session.batches, "todo" in tools())
+    ):
         append_input(prelude)
         force_todo = todo.eager == "always" and not (isinstance(task, dict) and task.get("_goal_message"))
-    if goal and not (isinstance(task, dict) and task.get("_goal_message")) and (context := goal.context()):
-        if task is not None or session.can_continue():
-            append_input(context)
+    if goal and not goal_steer and not (isinstance(task, dict) and task.get("_goal_message")):
+        with turn.server.lock if turn else nullcontext():
+            if (task is not None or session.can_continue()) and (context := goal.context()):
+                append_input(context)
+    admitted_input = True
     if task is not None:
-        if todo:
+        if todo and not goal_steer:
             for warning in todo.take_errors():
                 append_input(warning)
-        append_input(task, background, admitted=on_admitted, metadata=initial_metadata, note=initial_note)
+        admitted_input = append_input(task, background, admitted=on_admitted, metadata=initial_metadata, note=initial_note)
     elif not session.can_continue():
         raise RuntimeError("This session has no unfinished turn to continue.")
     steps = range(max_steps) if max_steps else count()
@@ -198,7 +224,9 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
 
     if turn:
         for extra in turn.works[1:]:
-            append_input(extra if terminal_turn else extra.content, queued=True)
+            admitted_input = append_input(extra if terminal_turn else extra.content, queued=True) or admitted_input
+    if not admitted_input:
+        return None
     for _ in steps:
         if cancellation:
             cancellation.check()
@@ -288,22 +316,24 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         phase = "mid"
         if not calls:
             request = latest_request(session.batches) if stop_guard and stop_guard.mode == "smart" else None
+            notified = False
             if turn:
                 turn.server.event("turn_end", message=wire, toolResults=[])
                 steering = turn.steering()
                 if steering:
                     if matched and matched.prose_hits:
                         rule_notice(tuple(matched.prose_hits.values()), "prose")
-                    for content in steering:
-                        append_input(content, queued=True)
-                    phase = "pre"
-                    if stop_guard:
-                        stop_guard.retries = 0
-                    if rules:
-                        rules.age += 1
-                    continue
+                        notified = True
+                    if append_steering(steering):
+                        phase = "pre"
+                        if stop_guard:
+                            stop_guard.retries = 0
+                        if rules:
+                            rules.age += 1
+                        continue
             if matched and matched.prose_hits:
-                rule_notice(tuple(matched.prose_hits.values()), "prose")
+                if not notified:
+                    rule_notice(tuple(matched.prose_hits.values()), "prose")
                 rules.age += 1
                 continue
             if rules and (warning := rules.take_judgments(5, cancellation)):
@@ -372,10 +402,7 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         if rules:
             rules.age += 1
         if turn:
-            steering = turn.steering()
-            for content in steering:
-                append_input(content, queued=True)
-            if steering and stop_guard:
+            if append_steering(turn.steering()) and stop_guard:
                 stop_guard.retries = 0
         if child and child.submitted is not None:
             return assistant["content"]
@@ -1327,18 +1354,23 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 raise ValueError("Goal mode is disabled (goal.enabled).")
             return goal.command(op, objective, token_budget)
 
-        def goal_slash(arguments):
+        def goal_control(op, objective=None, token_budget=None, *, live=False, visible_objective=False):
+            if not goal:
+                return goal_operation(op, objective, token_budget), None
+            return goal.control(op, objective, token_budget, live=live, visible_objective=visible_objective)
+
+        def goal_slash(arguments, *, live=False):
             operation, _, argument = arguments.strip().partition(" ")
             operation = operation.lower()
             if operation == "budget":
                 budget = None if argument.lower() == "off" else int(argument)
-                return goal_operation(operation, token_budget=budget), "continue"
+                return goal_control(operation, token_budget=budget, live=live), "continue"
             if operation == "set":
-                return goal_operation("set", argument), "objective"
+                return goal_control("set", argument, live=live, visible_objective=True), "objective"
             if operation in ("pause", "resume", "drop", "show") or not operation:
                 op = "get" if operation in ("", "show") else operation
-                return goal_operation(op), "continue" if op == "resume" else None
-            return goal_operation("create", arguments), "objective"
+                return goal_control(op, live=live), "continue" if op == "resume" else None
+            return goal_control("create", arguments, live=live, visible_objective=True), "objective"
 
         def goal_status():
             if goal and (current := goal.snapshot()["goal"]):
@@ -1486,10 +1518,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 manager = current_mcp()
                 builtin = build_tools(active_turn(), manager)
             available = {**builtin, **external_tools()}
-            if goal and goal.tool_visible:
+            if goal and (goal_tool := goal.advertised_tool()):
                 available["goal"] = subagents.Tool(
                     "Read or manage the session goal. Complete it only after verifying every deliverable.",
-                    GOAL_SCHEMA, goal.tool,
+                    GOAL_SCHEMA, goal_tool,
                 )
             if isinstance(evaluate := available.get("eval"), EvalTool) and not evaluate.available():
                 available.pop("eval")
@@ -3215,7 +3247,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                                     return None
                     initial_memory = initial_note = None
                     backend = mnemopi or hindsight
-                    synthetic_goal = isinstance(task, dict) and bool(task.get("_goal_message"))
+                    synthetic_goal = isinstance(task, GoalSteer) or isinstance(task, dict) and bool(task.get("_goal_message"))
                     if backend and foreground and not synthetic_goal:
                         content = task.get("content") if isinstance(task, dict) else task
                         latest = session_jsonl.plain_text(content)
@@ -3427,10 +3459,19 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 op = command.get("op")
                 if op not in ("get", "create", "resume", "pause", "drop"):
                     raise ValueError(f"Unknown goal operation {op!r}.")
-                data = goal_operation(op, command.get("objective"), command.get("token_budget"))
-                if op in ("create", "resume") and goal and goal.active and args.mode in goal.modes:
-                    return rpc_mode.AfterResponse(data, partial(rpc.start_goal, next_goal))
-                return data
+                if op == "get":
+                    return goal_operation(op)
+                with rpc.lock:
+                    live = rpc.turn is not None
+                    if live and rpc.turn.is_cancelled():
+                        raise rpc_mode.RpcFailure("The turn is still aborting.", "session_busy")
+                    data, steer = goal_control(op, command.get("objective"), command.get("token_budget"), live=live)
+                    discard_stale_goal_steers(rpc.steering)
+                    if steer:
+                        rpc.steering.append(rpc_mode.Work({"type": "goal-steer"}, steer))
+                    if not live and op in ("create", "resume") and goal and goal.active and args.mode in goal.modes:
+                        return rpc_mode.AfterResponse(data, partial(rpc.start_goal, next_goal))
+                    return data
 
             def set_todos(command):
                 todo.edit(command.get("phases"))
@@ -3441,8 +3482,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
 
             return {
                 **binding.handlers(), "navigate_tree": (navigate, True), "fork": (fork, True),
-                "goal": (goal_rpc, lambda command: command.get("op") != "get"),
-                "get_state": (rpc_state, False), "set_todos": (set_todos, True),
+                "goal": (goal_rpc, False),
+                "get_state": (rpc_state, False), "set_todos": (set_todos, False),
                 "new_session": (new_session, True), "switch_session": (switch_session, True),
                 "compact": (compact, True), "handoff": (handoff_command, True),
                 "reset_context": (lambda _: {"droppedCount": clear_context()}, True),
@@ -3722,20 +3763,27 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if command[:1] == ["/goal"]:
                     try:
                         arguments = command[1] if len(command) > 1 else ""
-                        if lane and lane.busy() and arguments.strip().lower() not in ("", "show"):
-                            raise RuntimeError("Wait for the current response or abort it before changing the goal.")
-                        data, launch = goal_slash(arguments)
-                        print(describe_goal(data["goal"]))
-                        if launch == "objective":
-                            objective = data["goal"]["objective"]
+                        with lane.lock if lane else nullcontext():
+                            active = lane.turn if lane else None
+                            if active and active.is_cancelled() and arguments.strip().lower() not in ("", "show"):
+                                raise RuntimeError("The turn is still aborting.")
+                            (data, steer), launch = goal_slash(arguments, live=active is not None)
                             if lane:
-                                lane.submit(TerminalWork(objective, expand_prompt=False))
-                            else:
-                                console_run(objective, expand_prompt=False)
-                        elif launch == "continue":
-                            if lane:
+                                discard_stale_goal_steers(lane.steers)
+                                discard_stale_goal_steers(lane.followups)
+                            if steer:
+                                lane.submit(TerminalWork(steer, expand_prompt=False))
+                            elif lane and not active and launch == "objective":
+                                lane.submit(TerminalWork(data["goal"]["objective"], expand_prompt=False))
+                            elif lane and not active and launch == "continue":
                                 lane.schedule_goal(next_goal)
-                            elif continuation := next_goal():
+                            elif lane and arguments.lower().split()[:1] in (["pause"], ["drop"]):
+                                lane.cancel_goal()
+                        print(describe_goal(data["goal"]))
+                        if not lane:
+                            if launch == "objective":
+                                console_run(data["goal"]["objective"], expand_prompt=False)
+                            elif launch == "continue" and (continuation := next_goal()):
                                 console_run(continuation)
                     except (RuntimeError, OSError, ValueError) as error:
                         print(f"mini-pi: {error}", file=sys.stderr)

@@ -1,6 +1,8 @@
 """Durable goal state, usage accounting and continuation decisions."""
 
 import json
+from dataclasses import dataclass
+from functools import partial
 from hashlib import sha256
 from html import escape
 from threading import RLock
@@ -62,6 +64,43 @@ def valid_goal(value):
             and ("tokenBudget" not in value or type(value["tokenBudget"]) is int and value["tokenBudget"] > 0))
 
 
+@dataclass(frozen=True)
+class GoalSteer:
+    runtime: object
+    revision: int
+    objective: str | None = None
+    budget_revision: int | None = None
+
+    def current(self):
+        runtime = self.runtime
+        with runtime.lock:
+            if runtime.revision != self.revision or not runtime.goal:
+                return False
+            if self.budget_revision is not None:
+                return runtime.budget_revision == self.budget_revision and runtime.goal["status"] == "budget-limited"
+            return runtime.active
+
+    def messages(self):
+        runtime = self.runtime
+        with runtime.lock:
+            if not self.current():
+                return []
+            if self.budget_revision is not None:
+                return [runtime.budget_notice()]
+            context = runtime.context()
+            messages = [context] if context else []
+            if self.objective is not None:
+                messages.append({"role": "user", "content": self.objective})
+            return messages
+
+
+def discard_stale_goal_steers(queue):
+    keep = [work for work in queue if not isinstance(work.content, GoalSteer) or work.content.current()]
+    if len(keep) != len(queue):
+        queue.clear()
+        queue.extend(keep)
+
+
 class Goals:
     def __init__(self, session, modes, emit, *, todo_context=None):
         self.session, self.modes, self.emit = session, modes, emit
@@ -76,6 +115,8 @@ class Goals:
         self.previous = None
         self.stalled = False
         self.interview = self.attached = False
+        self.revision = self.budget_revision = 0
+        self.context_revision = None
 
     def restore(self, *, preserve=False):
         with self.lock:
@@ -83,6 +124,7 @@ class Goals:
             data = record.get("data")
             value = data.get("goal") if isinstance(data, dict) and record.get("mode") in ("goal", "goal_paused") else None
             self.goal = value if valid_goal(value) else None
+            self.revision += 1
             self.since = monotonic() if self.accounting else None
             self.previous, self.stalled = None, False
             self.interview = False
@@ -130,6 +172,7 @@ class Goals:
                 self.interview = True
             self.running = True
             self.pending = 0
+            self.context_revision = None
             continued = isinstance(task, dict) and task.get("_goal_message") == "goal-continuation"
             self.activity = sha256() if continued else None
             self.activity_seen = False
@@ -177,9 +220,7 @@ class Goals:
                     entry = (function["name"], args, result["content"], bool(result.get("_tool_error")))
                     self.activity.update(json.dumps(entry, sort_keys=True, ensure_ascii=True).encode() + b"\n")
             if self.flush() and any(call["function"]["name"] != "goal" for call in calls):
-                return goal_message("goal-budget-limit", self.prompt(
-                    "The goal token budget is exhausted. Stop substantive work and report progress and remaining work."
-                ))
+                return GoalSteer(self, self.revision, budget_revision=self.budget_revision)
         return None
 
     def finish_completion(self):
@@ -191,6 +232,11 @@ class Goals:
         )
         self.goal = None
         self.attached = False
+
+    def rearm(self):
+        self.previous, self.stalled = None, False
+        self.activity = None
+        self.activity_seen = False
 
     def end(self, *, interrupted=False):
         with self.lock:
@@ -224,6 +270,8 @@ class Goals:
         if self.goal and self.goal["status"] != "complete" and not replace:
             raise ValueError("This session already has a goal. Resume or drop it first.")
         self.flush()
+        if self.goal and self.goal["status"] == "complete":
+            self.finish_completion()
         now = timestamp()
         self.goal = {"id": str(uuid4()), "objective": objective.strip(), "status": "active", "tokensUsed": 0,
                      "timeUsedSeconds": 0, "createdAt": now, "updatedAt": now}
@@ -231,7 +279,8 @@ class Goals:
             self.goal["tokenBudget"] = budget
         self.since, self.pending = monotonic(), 0
         self.attached, self.interview = True, False
-        self.previous, self.stalled = None, False
+        self.revision += 1
+        self.rearm()
         self.persist()
 
     def pause(self):
@@ -241,6 +290,7 @@ class Goals:
         self.goal.update(status="paused", updatedAt=timestamp())
         self.since = None
         self.attached = False
+        self.revision += 1
         self.persist()
 
     def resume(self, *, paused_only=False):
@@ -251,7 +301,8 @@ class Goals:
         self.goal.update(status="active", updatedAt=timestamp())
         self.since, self.pending = monotonic(), 0
         self.attached = True
-        self.previous, self.stalled = None, False
+        self.revision += 1
+        self.rearm()
         self.persist()
 
     def change_budget(self, value):
@@ -259,12 +310,15 @@ class Goals:
         if not self.accounting:
             raise ValueError("No active goal.")
         self.flush()
+        previous = self.goal["status"]
         if value is None:
             self.goal.pop("tokenBudget", None)
         else:
             self.goal["tokenBudget"] = value
         self.goal.update(status="budget-limited" if remaining(self.goal) == 0 else "active", updatedAt=timestamp())
-        self.previous, self.stalled = None, False
+        if self.goal["status"] != previous:
+            self.budget_revision += 1
+        self.rearm()
         self.persist()
 
     def drop(self):
@@ -275,6 +329,7 @@ class Goals:
         self.session.record_metadata({"type": "mode_change", "mode": "none"})
         self.goal, self.since = None, None
         self.attached = False
+        self.revision += 1
         self.emit(goal=dropped, state={"enabled": False, "mode": "active", "goal": dropped})
         return dropped
 
@@ -296,17 +351,38 @@ class Goals:
                 raise ValueError(f"Unknown goal operation {op!r}.")
             return self.snapshot()
 
-    def tool(self, args):
+    def control(self, op, objective, token_budget, *, live=False, visible_objective=False):
+        with self.lock:
+            revision, was_active = self.revision, self.active
+            data = self.command(op, objective, token_budget)
+            steer = None
+            if live and self.active and self.revision != revision:
+                text = self.goal["objective"] if visible_objective else None
+                steer = GoalSteer(self, self.revision, objective=text)
+            elif live and op == "budget" and was_active and self.goal["status"] == "budget-limited":
+                steer = GoalSteer(self, self.revision, budget_revision=self.budget_revision)
+            return data, steer
+
+    def advertised_tool(self):
+        with self.lock:
+            if self.tool_visible:
+                return partial(self.tool, revision=self.revision)
+        return None
+
+    def tool(self, args, *, revision=None):
         with self.lock:
             if not isinstance(args, dict) or set(args) - SCHEMA["properties"].keys():
                 raise ValueError("Invalid goal tool arguments.")
             op = args.get("op")
+            if revision is not None and revision != self.revision and op != "get":
+                raise ValueError("The goal changed after this request started. Read its current state before updating it.")
             if op == "complete":
                 self.flush()
                 if not self.goal or self.goal["status"] == "complete":
                     raise ValueError("No unfinished goal to complete.")
                 self.goal.update(status="complete", updatedAt=timestamp())
                 self.since = None
+                self.revision += 1
                 self.persist()
                 goal = self.goal.copy()
             elif op == "drop":
@@ -342,9 +418,15 @@ class Goals:
 
     def context(self):
         with self.lock:
-            if self.active:
+            if self.active and self.context_revision != self.revision:
+                self.context_revision = self.revision
                 return self.with_todos("goal-mode-context", "Goal mode is active.")
         return None
+
+    def budget_notice(self):
+        return goal_message("goal-budget-limit", self.prompt(
+            "The goal token budget is exhausted. Stop substantive work and report progress and remaining work."
+        ))
 
     @staticmethod
     def guide(initial):

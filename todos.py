@@ -262,6 +262,11 @@ def notice(kind, text):
     return {"role": "developer", "content": text, "_todo_message": kind}
 
 
+def goal_label(text):
+    line = text.replace("\r\n", "\n").replace("\n", r"\n").replace("\r", r"\r").replace("\t", r"\t")
+    return escape(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]", " ", line), quote=False)
+
+
 OPTION = re.compile(r"^(?:[-*+]|\d+[.)])\s+\S")
 LABEL = re.compile(r"^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*", re.I)
 QUESTION = re.compile(
@@ -496,8 +501,8 @@ class Todos:
         closed = sum(task["status"] in CLOSED for task in items)
         lines = ["Use the persisted todos as the current plan. Reconcile stale items before substantial work.",
                  f"Overall: {closed}/{len(items)} done, {len(items) - closed} open."]
-        lines.extend(f"- {escape(phase['name'], quote=False)}\n" + "\n".join(
-            f"  - [{task['status']}] {escape(task['content'], quote=False)}" for task in phase["tasks"]
+        lines.extend(f"- {goal_label(phase['name'])}\n" + "\n".join(
+            f"  - [{task['status']}] {goal_label(task['content'])}" for task in phase["tasks"]
         ) for phase in phases if phase["tasks"])
         return "<todo_context>\n" + "\n".join(lines) + "\n</todo_context>"
 

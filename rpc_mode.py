@@ -186,6 +186,10 @@ class Work:
     def reports_result(self):
         return self.command["type"] in ("prompt", "abort_and_prompt", "continue")
 
+    @property
+    def goal_steer(self):
+        return self.command["type"] == "goal-steer"
+
     def restored(self):
         item = {"text": self.text}
         if self.command.get("images"):
@@ -376,7 +380,7 @@ class RpcServer:
         claimed = [*turn.claimed, *turn.live.accepted, *turn.live.deferred, *turn.live.pending] if turn else []
         queues = {"steering": [*claimed, *self.steering],
                   "followUp": self.follow_up}
-        payload = {key: [work.restored() for work in queue] for key, queue in queues.items()}
+        payload = {key: [work.restored() for work in queue if not work.goal_steer] for key, queue in queues.items()}
         limit = self.response_limit()
         empty = {"steering": [], "followUp": []}
 
@@ -596,7 +600,7 @@ class RpcServer:
                     self.response(work.command)
                 self.result(work, "aborted", not self.turn, invoked=False)
             if self.turn and not restore:
-                self.turn.withdrawn.extend(work for work in dropped if work.content is not None)
+                self.turn.withdrawn.extend(work for work in dropped if work.content is not None and not work.goal_steer)
             if command:
                 if self.turn:
                     self.turn.interrupt_responses.append((command, data))
@@ -606,7 +610,7 @@ class RpcServer:
     def queues(self):
         with self.lock:
             accepted = self.turn.live.accepted if self.turn else ()
-            return {"steering": [work.text for work in (*accepted, *self.steering)],
+            return {"steering": [work.text for work in (*accepted, *self.steering) if not work.goal_steer],
                     "followUp": [work.text for work in self.follow_up], "liveSteered": len(accepted)}
 
     def require_idle(self):
@@ -650,7 +654,7 @@ class RpcServer:
                     queue = {"steering": self.steering, "followUp": self.follow_up}.get(command.get("queue"))
                 if queue is None:
                     raise RpcFailure("Invalid queue.")
-                work = next((item for item in queue if item.text == command.get("message")), None)
+                work = next((item for item in queue if not item.goal_steer and item.text == command.get("message")), None)
                 if work:
                     queue.remove(work)
                     if kind == "promote_queued_message":
