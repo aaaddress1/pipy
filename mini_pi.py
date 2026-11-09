@@ -374,6 +374,7 @@ def stream_reply(
                         usage_observer=observer, tracker=tracker, on_text=on_text, speculation=speculation, websocket=websocket,
                         codex_turn=options.get("codex_turn"),
                         live_source=options.get("live_source"),
+                        effort_control=options.get("effort_control"),
                     )
                 else:
                     result = stream_attempt(client, model, messages, schemas, options, guard, show, tool_choice, cancel, turn,
@@ -1852,6 +1853,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 ) if speculation else None
                 schemas = tool_schemas(active_tools)
                 options = request_options()
+                effort_control = router.responses_effort()
                 live_source = None
                 if (turn and not turn.background and route.api == codex_responses.API
                     and compat.get("supportsSteering") is True
@@ -1868,7 +1870,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         transcript.append({"role": "user", "content": prompt})
                         with router.new_client(route, credential, timeout=15) as client:
                             result, _ = stream_reply(
-                                client, route.model, transcript, schemas, options, ("off", False), show=False,
+                                client, route.model, transcript, schemas,
+                                options | {"effort_control": effort_control.copy() if effort_control else None},
+                                ("off", False), show=False,
                                 native_route=route, tool_choice="none", cancel=signal.check,
                                 meter=cost_gate.meter(route, "title"),
                             )
@@ -1879,7 +1883,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
 
                 reply, usage = stream_reply(
                     router.client(), route.model, messages, schemas,
-                    options | {"codex_turn": router.codex_turn(), "live_source": live_source}, guard_options,
+                    options | {"codex_turn": router.codex_turn(), "live_source": live_source,
+                               "effort_control": effort_control}, guard_options,
                     native_route=route, cache_observer=observer, show=show and turn is None,
                     cancel=cancellation.check if cancellation else None, turn=turn, usage_observer=router.usage_observer(),
                     anthropic_replay=anthropic_replay(route), credit=credit, meter=meter, tool_choice=choice, rules=rules,
@@ -2220,7 +2225,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
 
         def context_changed():
             warmer.invalidate()
-            router.close_responses_sockets()
+            router.reset_responses_context()
 
         compaction = Compaction(
             session, router.route.window, args.compact_at, args.keep_recent,
@@ -2591,6 +2596,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
 
         async def idle_recap():
             route = router.route
+            effort_control = router.responses_effort(side=True)
             meter = cost_gate.meter(route, "idle-recap")
             messages, _ = live_messages(system_prompt(), route)
             messages.append({
@@ -2609,6 +2615,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     )
             if route.api == codex_responses.API:
                 credential, options = router.credential, request_options(route)
+                options["effort_control"] = effort_control
 
                 def recap():
                     with handoff.deadline(45, active_turn()) as limit, router.new_client(route, credential, timeout=45) as client:
@@ -2621,7 +2628,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             http_client = {"http_client": httpx.AsyncClient(timeout=45, **settings)} if settings else {}
             async with AsyncOpenAI(**router.client_settings(), timeout=45, **http_client) as client, asyncio.timeout(45):
                 if route.api == "openai-responses":
-                    return await openai_responses.recap(client, route, messages, request_options().get("reasoning_effort"), meter)
+                    return await openai_responses.recap(client, route, messages, request_options().get("reasoning_effort"),
+                                                       meter, effort_control=effort_control)
                 options = request_options()
                 wire = route.wire_model(options.get("reasoning_effort"))
                 if route.catalog_model:
@@ -2668,6 +2676,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             schemas = tool_schemas(configured_tools())
             options = request_options(route)
             replay = deepcopy(anthropic_replay(route))
+            options["effort_control"] = router.responses_effort(route, credential, side=True)
 
             def send(extra, signal, on_text=None):
                 signal.check()

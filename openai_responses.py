@@ -15,6 +15,7 @@ from openai import APIConnectionError, APIError, APIStatusError
 
 import model_catalog
 import codex_responses
+from responses_effort import supported as supports_effort_updates
 from cancellable_http import active_turn
 from cost_gate import CostCapError
 from handoff import deadline
@@ -31,6 +32,7 @@ CONTEXT_PREFIXES = (
 )
 GATEWAY_FIELDS = frozenset(("provider", "providerOptions", "caching", "cache_anchor_items", "cache_ttl"))
 V2_TIMEOUT = 300
+STABLE_REPLAY_PREFIX = "stable:"
 
 
 def sdk_body(body):
@@ -51,17 +53,36 @@ class Usage:
         return cls(usage.get("input_tokens") or 0, usage.get("output_tokens") or 0)
 
 
-def append_items(items, digest, added):
+def append_items(items, digests, added):
     for item in added:
-        digest.update(json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
+        encoded = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        for digest in digests:
+            digest.update(encoded)
         items.append(item)
+
+
+def replay_digest(instructions, tools, effort):
+    return sha256(json.dumps([instructions, tools, effort], ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
 
 def request_body(route, model, messages, schemas, effort, *, max_tokens=None, user_items=None):
     instructions = "\n\n".join(message["content"] for message in messages if message["role"] == "system")
     tools = [{"type": "function", "strict": False, **schema["function"]} for schema in schemas]
-    digest = sha256(json.dumps([instructions, tools, effort], ensure_ascii=False, sort_keys=True).encode("utf-8"))
     identity = route.identity() if route.model == model else None
+    stable = bool(identity and supports_effort_updates(route))
+    prefix_tag = STABLE_REPLAY_PREFIX if stable else ""
+    digest = replay_digest(instructions, tools, STABLE_REPLAY_PREFIX if stable else effort)
+    # Older sessions included the effort in the replay fingerprint. Preserve
+    # their native items only when the original instructions, tools and history still match.
+    legacy = ()
+    if stable and any(
+        (saved := message.get("_responses")) and saved.get("route") == identity
+        and isinstance(prefix := saved.get("prefix"), str) and not prefix.startswith(STABLE_REPLAY_PREFIX)
+        for message in messages
+    ):
+        levels = dict.fromkeys((effort, None, "auto", "off", "none", *model_catalog.EFFORTS))
+        legacy = tuple(replay_digest(instructions, tools, level) for level in levels)
+    digests = (digest, *legacy)
     items = []
     for message in messages:
         role = message["role"]
@@ -77,8 +98,9 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
             calls = message.get("tool_calls", [])
             saved = message.get("_responses")
             if (
-                identity and saved and saved["route"] == identity and saved["prefix"] == digest.hexdigest()
-                and saved["text"] == content and saved["calls"] == calls
+                identity and saved and saved["route"] == identity and saved["text"] == content and saved["calls"] == calls
+                and (saved["prefix"] == prefix_tag + digest.hexdigest()
+                     or any(saved["prefix"] == candidate.hexdigest() for candidate in legacy))
             ):
                 added = saved["items"]
             else:
@@ -95,7 +117,7 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
             added = [{"role": role, "content": responses_content(message.get("content") or "")}]
         if user_items is not None and authored:
             user_items.extend(item for item in added if item.get("role") == "user")
-        append_items(items, digest, added)
+        append_items(items, digests, added)
     body = {
         "model": route.wire_model(effort) if identity else model, "input": items,
         "store": False, "include": ["reasoning.encrypted_content"],
@@ -113,7 +135,7 @@ def request_body(route, model, messages, schemas, effort, *, max_tokens=None, us
         body["reasoning"] = {"summary": "auto"}
         if effort != "auto":
             body["reasoning"]["effort"] = effort
-    return body, digest.hexdigest()
+    return body, prefix_tag + digest.hexdigest()
 
 
 def compaction_summary(route, items):
@@ -469,16 +491,20 @@ def completed_message(response, route, model, fingerprint):
 
 
 @contextmanager
-def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None):
+def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None, effort_control=None):
     if codex_route:
         lite = codex_responses.lite_enabled(codex_route)
         codex_responses.request_shape(codex_route, body, lite=lite)
+        if effort_control:
+            effort_control.apply(body)
         headers = identity.decorate(body, lite=lite)
         endpoint = codex_responses.endpoint(codex_route.endpoint())
         with closing(codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source,
                                        codex_route.vision)) as stream:
             yield stream
         return
+    if effort_control:
+        effort_control.apply(body)
     if websocket is not None and websocket.open():
         with closing(websocket.events(body)) as stream:
             yield stream
@@ -553,7 +579,7 @@ def codex_events(frames, identity, transport):
 def stream_attempt(
     client, route, model, messages, schemas, effort, guard, show, *, tool_choice=None, cancel=None, prompt_cache_key=None,
     turn=None, usage_observer=None, tracker=None, on_text=None, speculation=None, websocket=None, codex_turn=None,
-    live_source=None,
+    live_source=None, effort_control=None,
 ):
     body, fingerprint = request_body(route, model, messages, schemas, effort)
     if tool_choice and schemas:
@@ -571,7 +597,7 @@ def stream_attempt(
     usage = reported_usage = None
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
-                             live_source=live_source) as stream:
+                             live_source=live_source, effort_control=effort_control) as stream:
             for event in stream:
                 if cancel:
                     cancel()
@@ -680,8 +706,10 @@ def stream_attempt(
     )
 
 
-async def recap(client, route, messages, effort, meter=None):
+async def recap(client, route, messages, effort, meter=None, *, effort_control=None):
     body, _ = request_body(route, route.model, messages, [], effort, max_tokens=512)
+    if effort_control:
+        effort_control.apply(body)
     if meter:
         meter.admit()
     result = await client.responses.create(**sdk_body(body))

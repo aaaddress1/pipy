@@ -243,6 +243,8 @@ Codex 模型可用 `--model openai-codex/gpt-6-sol` 選擇，憑證來自 `OPENA
 
 開啟 `providers.openaiLiveSteering: true` 後，終端 Enter 或 RPC `steer` 可將新指令送進支援 steering 的 Codex WebSocket 回應。伺服器接受後，程式會讀取自動開始的下一段回應，或等工具完成後只傳工具結果。拒絕或逾時的指令會回到佇列，等下一個可插入的邊界。此設定預設關閉。 [上游 steering 協定](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-codex/live-steering.ts)
 
+支援 `configuration_update` 的標準推理模型會沿用第一次送出的 `reasoning.effort`。切換強度時，Responses 和 Codex 會在新使用者訊息前或工具結果後加入更新，重送時保留原順序與加密推理。原生壓縮請求略過這些更新，工作階段重置後重新建立基準。相容代理可在模型設定中指定 `compat.supportsConfigurationUpdate: false`，直接使用請求層級的強度。 [OpenAI 推理強度切換](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation) · [上游基準管理](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/openai-configuration-update.ts)
+
 Apple Silicon macOS 上，正式 Codex OAuth 的 HTTP 請求和 WebSocket 升級會即時準備 DeviceCheck 證明。在圖形登入工作階段使用 Apple API 取得 token，並等待回呼最多一秒。其他平台和自訂 Codex 端點略過該標頭。在 macOS 手動安裝 Python 套件時，可安裝 `pyobjc-framework-DeviceCheck` 啟用此功能。 [上游證明格式](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/live/attestation.ts) · [Apple DeviceCheck](https://developer.apple.com/documentation/devicecheck/dcdevice)
 
 視覺路由可設定 `vision: true`，讓 Snapcompact 在本機把舊歷史排成依序重放的文字和 PNG。原文與圖框一併保存在 SQLite，再次壓縮時會重新排版。切換到文字路由或供應商拒絕圖像時，會改用同一份封存文字。`--snapcompact-shape` 預設 `auto`，也可指定版型。路由可用 `image_max_edge`、`image_count_budget`、`image_byte_budget`、`image_tokens` 和 `image_detail` 配合實際部署。字型採上游資產，Silver 的授權與作者資訊隨附。[上游 Snapcompact](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/compaction.md#snapcompact-method)

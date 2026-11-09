@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import time
+from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -27,6 +28,7 @@ import codex_attestation
 import codex_responses
 from mcp_oauth import oauth_url
 import model_catalog
+from responses_effort import EffortControl, supported as supports_effort_updates
 from model_secrets import CONFIG_KEY, KEYLESS, ConfigRequestAuth, ConfigSecrets, origin
 from responses_websocket import ResponsesSocket
 from models_config import Connection, model_target
@@ -508,6 +510,7 @@ class Router:
         self.fixed_primary = fixed_primary
         self.clients = {}
         self.responses_sockets = {}
+        self.responses_efforts = OrderedDict()
         self.codex_identity = None
         self.blocked = {}
         self.local_quota = {}
@@ -680,7 +683,7 @@ class Router:
         return self.clients[cache_key]
 
     def reset_provider_state(self):
-        count = len(self.clients) + self.close_responses_sockets()
+        count = len(self.clients) + self.reset_responses_context()
         self.clients.clear()
         self.codex_identity = None
         self.pins.clear()
@@ -694,6 +697,26 @@ class Router:
         for socket in sockets.values():
             socket.close()
         return count
+
+    def responses_effort(self, route=None, credential=None, *, side=False):
+        route, credential = (self.route, self.credential) if route is None else (route, credential)
+        if not supports_effort_updates(route):
+            return None
+        key = route.identity(), credential, self.session.transcript_id
+        if side:
+            state = self.responses_efforts.get(key)
+            return state.copy() if state else EffortControl()
+        state = self.responses_efforts.get(key)
+        if state is None:
+            state = self.responses_efforts[key] = EffortControl()
+        self.responses_efforts.move_to_end(key)
+        if len(self.responses_efforts) > 16:
+            self.responses_efforts.popitem(last=False)
+        return state
+
+    def reset_responses_context(self):
+        self.responses_efforts.clear()
+        return self.close_responses_sockets()
 
     def responses_socket(self, route=None, credential=None, *, lite=None, model=None):
         route, credential = (self.route, self.credential) if route is None else (route, credential)
