@@ -94,7 +94,7 @@ def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cance
                 signal.check()
                 if child and child.submitted is not None:
                     result["content"] = "Skipped after the task result was submitted."
-                elif turn and not turn.allow_tool(call):
+                elif turn and call["function"]["name"] in tools and not turn.allow_tool(call):
                     result["content"] = "Error: Tool execution was declined by the client."
                 else:
                     session.record_tool_start(call)

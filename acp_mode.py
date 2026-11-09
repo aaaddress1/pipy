@@ -26,6 +26,7 @@ from cancellable_http import turn_scope
 from cost_gate import CostCapError
 from mcp_oauth import OAuthVault
 from mcp_tools import McpSession, parse_servers
+from plan_mode import PlanMode
 from recovery import IncompleteTurn, StepLimitReached, StreamInterrupted
 from rpc_mode import MAX_LOGICAL, RpcOutput, RpcTurn, Work
 from runtime import database
@@ -34,6 +35,7 @@ from session_graph import SPECULATIVE_TASK_TREE
 
 PAGE_SIZE = 50
 DEFAULT_MODE = {"id": "default", "name": "Default", "description": "Standard ACP headless mode"}
+PLAN_MODE = {"id": "plan", "name": "Plan", "description": "Read-only planning with a session-local draft"}
 COMMANDS = [
     {"name": "clear", "description": "Clear conversation context in place"},
     {"name": "fresh", "description": "Reset provider stream state"},
@@ -234,30 +236,40 @@ class AcpTurn(RpcTurn):
                 self.claimed.remove(work)
 
     @property
-    def usage_confirmer(self):
+    def supports_forms(self):
         elicitation = self.record.server.capabilities.get("elicitation")
-        return self.confirm_usage if isinstance(elicitation, dict) and isinstance(elicitation.get("form"), dict) else None
+        return isinstance(elicitation, dict) and isinstance(elicitation.get("form"), dict)
 
-    def confirm_usage(self, source, target, remaining):
-        reserve = "inside the configured reserve margin" if remaining is None else f"{100 * remaining:.1f}% remaining"
+    @property
+    def usage_confirmer(self):
+        return self.confirm_usage if self.supports_forms else None
+
+    def elicit_value(self, message, schema):
         peer = self.record.handle.peer
         try:
             with peer.user_approval() if peer else nullcontext():
                 response = self.record.server.client_request(
                     "elicitation/create",
                     {"mode": "form", "sessionId": self.record.id,
-                     "message": f"Coding-plan reserve reached\n\n{source} has {reserve}. Switch to {target}? "
-                                "Choose No to keep using the current plan.",
-                     "requestedSchema": {"type": "object", "properties": {"value": {"type": "boolean"}},
+                     "message": message,
+                     "requestedSchema": {"type": "object", "properties": {"value": schema},
                                          "required": ["value"]}},
                     self, timeout=None,
                 )
         except OSError:
             if self.record.server.disconnected.is_set() or self.record.server.output.failure:
                 raise CancelledError("The ACP client disconnected.") from None
-            return False
+            return None
         content = response.get("content")
-        return response.get("action") == "accept" and isinstance(content, dict) and content.get("value") is True
+        return content.get("value") if response.get("action") == "accept" and isinstance(content, dict) else None
+
+    def confirm_usage(self, source, target, remaining):
+        reserve = "inside the configured reserve margin" if remaining is None else f"{100 * remaining:.1f}% remaining"
+        return self.elicit_value(
+            f"Coding-plan reserve reached\n\n{source} has {reserve}. Switch to {target}? "
+            "Choose No to keep using the current plan.",
+            {"type": "boolean"},
+        ) is True
 
     def allow_tool(self, call):
         self.check()
@@ -322,10 +334,13 @@ class AcpSession:
         self.reconfiguring = False
         self.background_suppressed = False
         self.usage_paused = False
+        self.plan = None
         self.context = server.open_session(identifier, cwd, self)
         self.handle = self.context.__enter__()
         if not keep_protocol_id:
             self.id = self.handle.session.id
+        if server.plan_enabled:
+            self.plan = PlanMode(self, autosave=server.plan_autosave, autosave_dir=server.plan_autosave_dir)
 
     @property
     def ready(self):
@@ -494,8 +509,9 @@ class AcpSession:
     def config(self):
         model = self.handle.route()
         return [
-            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": "default",
-             "options": [{"value": "default", "name": DEFAULT_MODE["name"], "description": DEFAULT_MODE["description"]}]},
+            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": self.current_mode(),
+             "options": [{"value": mode["id"], "name": mode["name"], "description": mode["description"]}
+                         for mode in self.available_modes()]},
             {"id": "model", "name": "Model", "category": "model", "type": "select",
              "currentValue": f"{model.name}/{model.model}",
              "options": [{"value": f"{route.name}/{route.model}", "name": route.name, "description": route.model}
@@ -510,14 +526,26 @@ class AcpSession:
         ]
 
     def state(self):
-        return {"configOptions": self.config(), "modes": {"availableModes": [DEFAULT_MODE], "currentModeId": "default"}}
+        return {"configOptions": self.config(),
+                "modes": {"availableModes": self.available_modes(), "currentModeId": self.current_mode()}}
+
+    def available_modes(self):
+        return [DEFAULT_MODE, PLAN_MODE] if self.plan else [DEFAULT_MODE]
+
+    def current_mode(self):
+        return "plan" if self.plan and self.plan.enabled else "default"
+
+    def mode_changed(self):
+        self.update("current_mode_update", currentModeId=self.current_mode())
+        self.update("config_option_update", configOptions=self.config())
 
     def set_config(self, name, value):
         with self.lock:
             self.require_idle()
-            if name == "mode" and value == "default":
-                self.update("current_mode_update", currentModeId="default")
-                self.update("config_option_update", configOptions=self.config())
+            if name == "mode" and any(mode["id"] == value for mode in self.available_modes()):
+                if self.plan:
+                    self.plan.set_mode(value == "plan")
+                self.mode_changed()
             elif name == "model":
                 route = next((route for route in self.server.routes.values() if f"{route.name}/{route.model}" == value), None)
                 if not route:
@@ -694,12 +722,14 @@ class AcpSession:
 
 class AcpServer:
     def __init__(self, state, open_session, fork_session, routes, loop, initial=None, *,
-                 mcp_notifications=False, mcp_debounce_ms=500, oauth_vault=None, budget=None):
+                 mcp_notifications=False, mcp_debounce_ms=500, oauth_vault=None, budget=None,
+                 plan_enabled=True, plan_autosave=False, plan_autosave_dir=None):
         self.path = state / "sessions.sqlite3"
         self.open_session, self.fork_session, self.routes = open_session, fork_session, routes
         self.initial = initial
         self.loop = loop
         self.budget = budget
+        self.plan_enabled, self.plan_autosave, self.plan_autosave_dir = plan_enabled, plan_autosave, plan_autosave_dir
         self.owns_oauth_vault = oauth_vault is None
         self.oauth_vault = oauth_vault or OAuthVault.configured(state / "mcp-oauth.sqlite3")
         self.mcp_notifications = mcp_notifications

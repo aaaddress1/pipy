@@ -78,7 +78,7 @@ def portable_message(message, thinking_route=None):
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
                "_todo_message", "_todo_snapshot", "_todo_entry_id", "_parent_assignment", "_compaction_continue",
                "_tool_pending", "_interrupt_blocks", "_live_interruption", "_retry_omit", "_interrupted_replay",
-               "_restored_jobs")
+               "_restored_jobs", "_plan_mode")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}

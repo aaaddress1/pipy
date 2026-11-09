@@ -143,7 +143,8 @@ AUTO_CONTINUE = ("Resume the user's latest intent. Review the retained messages 
 def run_agent(task, query, tools, max_steps, session, compaction, system_prompt, make_recovery, turn=None,
               take_updates=None, background=False, stop_guard=None, on_input=None, jobs=None, admit=None, child=None,
               rules=None, on_admitted=None, *, tool_workers, speculation=None, on_tools=None, initial_metadata=None,
-              initial_note=None, goal=None, todo=None, todo_stop=True, post_compaction=None, task_eager=False, check_usage=None):
+              initial_note=None, goal=None, todo=None, todo_stop=True, post_compaction=None, task_eager=False, check_usage=None,
+              replay_tools=None):
     """Ask the model, run its tools in order, and feed their results back."""
     cancellation = turn or active_turn()
     terminal_turn = turn and getattr(turn, "steering_at_boundary", False)
@@ -286,7 +287,10 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
         session.tool_replay = None
         if cancellation:
             cancellation.check()
-        active_tools = tools()
+        if batch[0].get("_plan_mode"):
+            active_tools = replay_tools() if replay_tools else {}
+        else:
+            active_tools = tools()
         run_tool_step(seq, batch, active_tools, False, turn.response(batch[0]) if turn else None)
         if child and child.submitted is not None:
             return batch[0]["content"]
@@ -1758,7 +1762,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             ),
         }
 
-        def configured_tools(builtin=None):
+        def configured_tools(builtin=None, *, force_planning=False):
             if builtin is None:
                 manager = current_mcp()
                 builtin = build_tools(active_turn(), manager)
@@ -1783,6 +1787,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 available = {name: tool for name, tool in available.items() if name in enabled}
             if child and child.task.eval_tools:
                 available.update(eval_child_tools(path, child.task))
+            if plan := getattr(rpc, "plan", None):
+                return plan.tools(available, builtin, force_planning=force_planning)
             return available
 
         loop_level_setting = args.loop_guard
@@ -3081,6 +3087,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
         memory_options = MemoryOptions.load(args.rule_config, args.memory_idle_hours)
         memory_job = None
         last_backend_context = ""
+        last_plan = ""
         if memory_files and not child:
             initial_route = router.route
 
@@ -3106,7 +3113,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             memory_job = workers.submit(copy_context().run, consolidate_memory)
 
         def system_prompt(wait=False):
-            nonlocal memory, memory_job, last_external, last_backend_context
+            nonlocal memory, memory_job, last_external, last_backend_context, last_plan
             instructions = external_instructions()
             current_mcp = (external_tools(), instructions)
             if current_mcp != last_external:
@@ -3151,6 +3158,14 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 system += "\n\nUse learn for a short, self-contained project lesson that helps later sessions."
             if instructions:
                 system += "\n\n## MCP Server Instructions\n" + instructions
+            plan = getattr(rpc, "plan", None)
+            plan_context = plan.instructions(router.route.window) if plan else ""
+            if plan_context != last_plan:
+                warmer.invalidate()
+                compaction.discard_pending()
+                last_plan = plan_context
+            if plan_context:
+                system += "\n\n" + plan_context
             return system
 
         def memory_command(argument):
@@ -3452,6 +3467,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             nonlocal first_local_turn
             cancellation = turn or run_budget or active_turn()
             foreground = not (background or turn and turn.background)
+            plan = getattr(rpc, "plan", None)
+            planning = bool(plan and plan.enabled)
             if turn:
                 turn.compaction_next = None
                 turn.compaction_blocked = False
@@ -3529,6 +3546,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 usage_ready = usage_credential = None
                 answer, usage = query(messages, active_tools, turn=turn, show=show, speculation=speculation,
                                       usage_credential=prepared, **options)
+                if plan and plan.enabled:
+                    answer["_plan_mode"] = True
                 if (pending := router.usage_fallback_pending) and pending[0] == router.route.identity() and (
                     answer.get("content") or answer.get("tool_calls") or answer.get("_thinking")
                 ):
@@ -3655,9 +3674,10 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         post_compaction=post_compaction,
                         task_eager=not child and layered_setting(maintenance_layers, "task.eager") == "always",
                         check_usage=check_usage if router.usage_aware else None,
+                        replay_tools=partial(configured_tools, active_tools, force_planning=True) if plan else None,
                     )
                     goal_succeeded = True
-                    if foreground and not (cancellation and cancellation.is_cancelled()):
+                    if foreground and not planning and not (cancellation and cancellation.is_cancelled()):
                         if backend:
                             backend.end_turn()
                         try:
@@ -4538,6 +4558,9 @@ def serve_sessions(args, state, session_id, workspace):
             state, partial(open_session, args, state), partial(fork_session, state=state),
             args.routes, args.transport_loop, initial=initial, mcp_notifications=args.mcp_notifications,
             mcp_debounce_ms=args.mcp_notification_debounce_ms, oauth_vault=args.model_vault, budget=args.run_budget,
+            plan_enabled=dotted(args.rule_config, "plan.enabled") is not False,
+            plan_autosave=dotted(args.rule_config, "plan.autosave") is True,
+            plan_autosave_dir=dotted(args.rule_config, "plan.autosaveDir"),
         ).serve()
         return
     rpc = rpc_mode.RpcServer(args.run_budget) if args.mode == "rpc" else None

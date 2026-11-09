@@ -371,7 +371,9 @@ uv run mini_pi.py --mode acp --route-config routes.json --model primary
 
 ACP 的轉向和追問會在寫入工作階段前留在該連線的佇列。配額預檢擋住續跑時，下一次可用的 `session/prompt` 會接手尚未寫入的項目，依序處理轉向和追問。已寫入的項目會保留在工作階段歷史。 [上游配額預檢與續跑](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/non-compaction-retry-policy.md)
 
-如果編輯器在 `initialize` 宣告了檔案或終端能力，對應工具會使用編輯器端的讀寫與終端。Shell 依 ACP 權限回覆執行，取消時會關閉等待中的權限對話。模型和推理設定以本機路由為準。ACP 目前支援預設模式與既有憑證，計畫審批和額外登入流程仍待移植。
+如果編輯器在 `initialize` 宣告了檔案或終端能力，對應工具會使用編輯器端的讀寫與終端。Shell 依 ACP 權限回覆執行，取消時會關閉等待中的權限對話。模型和推理設定以本機路由及既有憑證為準。
+
+ACP 可用 `session/set_mode` 切到 `plan`。代理用 `local://<slug>-plan.md` 保存草稿，再寫入 `xd://propose` 送審。支援表單的編輯器可以核准或退回修改。沒有表單能力時會自動核准。核准後，下一次模型請求會帶上核准內容並恢復執行工具。模式和核准內容會隨工作階段保存。設定 `plan.autosave: true` 可將核准內容另存到 `.omp/plans`。 [上游 ACP 計畫流程](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/acp/acp-agent.ts#L2320)
 
 ## MCP 工具
 
