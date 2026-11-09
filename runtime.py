@@ -17,6 +17,7 @@ from openai import APIStatusError
 
 import handoff
 import session_graph as graph
+from context_tokens import ContextCounter
 from service_runtime import SCHEMA as SERVICE_SCHEMA
 import snapcompact
 from cancellable_http import active_turn, turn_scope
@@ -41,8 +42,8 @@ def responses_replay_scope(route):
     return [route.api, route.provider(), route.endpoint(), route.auth, route.upstream]
 
 
-def responses_replacement_tokens(items):
-    return tokens([{key: value for key, value in item.items() if key != "encrypted_content"} for item in items])
+def responses_replacement_tokens(items, route=None):
+    return ContextCounter(route).responses(items)
 
 
 def native_provider(route):
@@ -945,7 +946,9 @@ def snap_summary(route, shape, threshold, payload):
 
 
 def archive_summary(archive, route, shape, threshold):
-    lead, _, cost = snapcompact.history(archive, route, shape, threshold)
+    lead, blocks, _ = snapcompact.history(archive, route, shape, threshold)
+    counter = ContextCounter(route)
+    cost = counter.text(lead) + counter.content(blocks)
     return CompactionSummary(lead, {"snapcompact": archive, "replacement_tokens": cost})
 
 
@@ -960,9 +963,9 @@ class Speculation:
 class Compaction:
     def __init__(
         self, session, window, percent, keep_recent, summarize, executor, methods=("native", "shake", "soft"),
-        native_compact=None, on_context_change=None, prepare_handoff=None, context_discount=None, disable_inline=None,
+        native_compact=None, on_context_change=None, prepare_handoff=None, context_projection=None, disable_inline=None,
         on_event=None, thinking_route=None, async_enabled=True, auto_enabled=True, mid_turn_enabled=True,
-        budget=None, context_windows=None, supersede_reads=True, drop_useless=True, pruning_route=None,
+        budget=None, context_windows=None, supersede_reads=True, drop_useless=True, pruning_route=None, tool_schemas=None,
     ):
         self.session = session
         self.window = window
@@ -980,7 +983,9 @@ class Compaction:
         self.methods = methods
         self.native_compact = native_compact
         self.prepare_handoff = prepare_handoff
-        self.context_discount = context_discount
+        self.context_projection = context_projection
+        self.tool_schemas = tool_schemas or (lambda: ())
+        self.counter = ContextCounter(session.archive_route)
         self.thinking_route = thinking_route or (lambda: None)
         self.disable_inline = disable_inline
         self.on_context_change = on_context_change or (lambda: None)
@@ -1008,6 +1013,7 @@ class Compaction:
         self.threshold = self.budget.trigger(window)
         self.summarize = summarize
         self.native_compact = native_compact
+        self.counter = ContextCounter(self.session.archive_route)
         self.reset_context()
 
     def reset_context(self):
@@ -1035,25 +1041,25 @@ class Compaction:
             context = getattr(usage, "total_tokens", None) or prompt + (getattr(usage, "completion_tokens", 0) or 0)
         self.provider_context = max(0, context)
 
-    def native_tokens(self):
-        archive = self.session.archive_view()
-        if archive:
-            return archive[2]
-        return (self.session.native_summary or {}).get("replacement_tokens", 0)
-
     def context_cost(self, messages, native_tokens=None):
         return self.context_sizes(messages, native_tokens)[0]
 
-    def context_sizes(self, messages, native_tokens):
-        stored = tokens(messages) + (self.native_tokens() if native_tokens is None else native_tokens)
-        discount = self.context_discount(messages) if native_tokens is None and self.context_discount else 0
-        return stored - discount, stored
+    def context_sizes(self, messages, native_tokens, schemas=None):
+        tools = self.counter.tools(self.tool_schemas() if schemas is None else schemas)
+        stored = self.counter.messages(messages) + tools + (native_tokens or 0)
+        if native_tokens is None and self.context_projection:
+            projected = self.context_projection(messages)
+            if projected is not messages:
+                return self.counter.messages(projected) + tools, stored
+        return stored, stored
 
     def messages(self, system, *args, **kwargs):
+        kwargs.setdefault("include_native", True)
+        kwargs.setdefault("include_archive", True)
         return self.session.messages(system, *args, thinking_route=self.thinking_route(), **kwargs)
 
-    def estimate(self, messages, native_tokens=None, *, floor_stored=False):
-        estimated, stored = self.context_sizes(messages, native_tokens)
+    def estimate(self, messages, native_tokens=None, *, floor_stored=False, schemas=None):
+        estimated, stored = self.context_sizes(messages, native_tokens, schemas)
         if self.measured:
             estimate_at_request, actual_at_request = self.measured
             estimated = max(estimated, actual_at_request + estimated - estimate_at_request)
@@ -1070,17 +1076,11 @@ class Compaction:
         if len(self.session.batches) < 2:
             return None
         budget = self.budget.recent_budget(self.window)
-        thinking_route = self.thinking_route()
         batches = self.session.batches
-        if self.measured:
-            stored = tokens([portable_message(message, thinking_route) for _, batch in batches for message in batch])
-            prompt = self.measured[1]
-            if prompt > stored:
-                budget = max(1, budget * stored // prompt)
         kept = 0
         cut = len(batches) - 1
         for index in range(cut, -1, -1):
-            kept += tokens([portable_message(message, thinking_route) for message in batches[index][1]])
+            kept += self.counter.messages(batches[index][1])
             if kept > budget:
                 break
             cut = index
@@ -1291,8 +1291,7 @@ class Compaction:
 
         def residual():
             messages = self.messages(system)
-            stored = self.context_sizes(messages, None)[1] + max(0, tokens(schemas) - tokens([]))
-            return max(stored, self.estimate(messages, floor_stored=True))
+            return self.estimate(messages, floor_stored=True, schemas=schemas)
 
         band = self.threshold * 80 // 100
         after = residual()
@@ -1513,7 +1512,7 @@ class Compaction:
         if method == "snapcompact":
             prefix = [msg for _, batch in archived for msg in batch]
             prefix.extend(msg for seq, batch in self.session.batches if seq < snapshot.first_kept for msg in batch)
-            fixed = tokens(self.messages(system, "", snapshot.first_kept))
+            fixed = self.context_cost(self.messages(system, "", snapshot.first_kept), 0)
             room = int(self.threshold * 0.6) - fixed if self.threshold else None
             return (
                 partial(snap_summary, self.session.archive_route, self.session.archive_shape, self.threshold),
@@ -1697,11 +1696,15 @@ class Compaction:
             with database(self.session.path) as db:
                 if not graph.intact_compaction_prefix(db, self.session.id, self.session.leaf, snapshot.leaf, cut):
                     return None
-        after = self.messages(system, summary.text, cut, method=native.get("method"))
-        extra_tokens = native.get("replacement_tokens", 0)
+        signed = self.counter.anthropic_snapshot(native) if "block" in native else None
+        external_history = "items" in native or "snapcompact" in native or signed is not None
+        after = self.messages(system, "" if external_history else summary.text, cut, method=native.get("method"))
+        extra_tokens = self.counter.responses(native["items"]) if "items" in native else (
+            signed if signed is not None else native.get("replacement_tokens", 0)
+        )
         estimated, stored = self.context_sizes(before, None)
         before_tokens = stored if armed else estimated
-        after_tokens = tokens(after) + extra_tokens
+        after_tokens = self.context_sizes(after, extra_tokens)[1]
         projected = after_tokens if armed else self.estimate(after, extra_tokens)
         if (require_reduction and after_tokens >= before_tokens) or (self.window and projected >= self.window):
             return None

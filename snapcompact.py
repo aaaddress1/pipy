@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 
 import regex
 
+import model_catalog
 from snapcompact_render import (
     DIM_OFF, DIM_ON, NEWLINE, SHAPES, Shape, bitmap_font, is_wide, paginate, render, silver_coverage,
 )
@@ -282,9 +283,31 @@ def deepseek_tokens(width, height):
     return span(math.ceil(math.floor(height * scale / 14) / 3), math.ceil(math.floor(width * scale / 14) / 3))
 
 
+def catalog_image_rule(route):
+    model = route.catalog_model if route else None
+    if not model or not all(key in model for key in ("api", "provider", "id")):
+        return None
+    policy = model_catalog.catalog_policy(model["provider"], model["id"], route.upstream)
+    return (policy or model_catalog.model_policy(model, route.upstream)).get("imageTokenization")
+
+
+def image_token_cost(rule, width, height, detail):
+    regime = rule["regime"]
+    if regime == "fixed":
+        return rule["tokens"]
+    if regime == "anthropic-patch":
+        return anthropic_tokens(width, height, rule["maxEdge"], rule["maxTokens"])
+    if regime == "deepseek-patch":
+        return deepseek_tokens(width, height)
+    sizing = rule[detail if detail in ("low", "high", "original") else rule["auto"]]
+    return openai_tokens(width, height, sizing["maxEdge"], sizing.get("patchBudget"), rule["multiplier"])
+
+
 def frame_tokens(route, width, height):
     if route and route.image_tokens:
         return route.image_tokens
+    if rule := catalog_image_rule(route):
+        return image_token_cost(rule, width, height, route.image_detail)
     model = route.model.lower() if route else ""
     if "gemini" in model:
         return 1120

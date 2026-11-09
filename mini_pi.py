@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=2,<3", "httpx>=0.28,<1", "botocore>=1.40,<2", "websockets>=15,<16", "filelock>=3,<4", "prompt-toolkit>=3,<4", "regex", "pillow", "fonttools", "mcp>=2.3,<3", "pyyaml>=6,<7", "cryptography", "xxhash", "jsonschema>=4,<5", "psutil>=7,<8", "ast-grep-py", "wcmatch", "pathspec>=0.12,<2", "resvg-py>=0.5,<1", "pywinpty>=3,<4; sys_platform == 'win32'", "pyobjc-framework-DeviceCheck>=11; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# dependencies = ["openai>=2,<3", "httpx>=0.28,<1", "botocore>=1.40,<2", "websockets>=15,<16", "filelock>=3,<4", "prompt-toolkit>=3,<4", "regex", "pillow", "fonttools", "tiktoken>=0.9,<1", "zstandard>=0.23,<1", "mcp>=2.3,<3", "pyyaml>=6,<7", "cryptography", "xxhash", "jsonschema>=4,<5", "psutil>=7,<8", "ast-grep-py", "wcmatch", "pathspec>=0.12,<2", "resvg-py>=0.5,<1", "pywinpty>=3,<4; sys_platform == 'win32'", "pyobjc-framework-DeviceCheck>=11; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # ///
 """A small Pi-style coding agent."""
 
@@ -2228,13 +2228,11 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 return
             router.update_runtime_metadata(metadata)
 
-        def context_discount(messages):
+        def context_projection(messages):
             route = router.route
             if not inline.enabled(route):
-                return 0
-            archive = session.archive_view()
-            _, savings = inline.transform(messages, route, archive_blocks=archive[1] if archive else ())
-            return savings
+                return messages
+            return inline.transform(messages, route)[0]
 
         def disable_inline():
             return bool(last_inline and inline.disable())
@@ -2682,7 +2680,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             session, router.route.window, budget.percent, budget.keep_recent,
             compaction_summarizer(), workers, args.compaction_methods, native_compactor(),
             on_context_change=context_changed, prepare_handoff=prepare_handoff,
-            context_discount=context_discount, disable_inline=disable_inline,
+            context_projection=context_projection, disable_inline=disable_inline,
+            tool_schemas=lambda: tool_schemas(configured_tools()),
             on_event=rpc.event if rpc else None,
             thinking_route=lambda: chat_thinking_scope(router.route),
             async_enabled=eval_setting(maintenance_layers, "compaction.asyncEnabled") is not False,

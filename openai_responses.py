@@ -24,6 +24,7 @@ from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
 from responses_websocket import generation_evidence
 from cancellable_http import active_turn, sse_frames
+from context_tokens import ContextCounter
 from cost_gate import CostCapError
 from handoff import deadline
 from recovery import (
@@ -40,6 +41,7 @@ CONTEXT_PREFIXES = (
     "<token_budget>", "<model_switch>", "[agent recovery]", "summary of earlier conversation.", "resume prior conversation.",
     "context replaced.", "branch-return summary:",
 )
+TRUNCATED_COMPACTION_OUTPUT = "Output: exceeded available model context → truncated."
 GATEWAY_FIELDS = frozenset(("provider", "providerOptions", "caching", "cache_anchor_items", "cache_ttl"))
 EXTRA_FIELDS = GATEWAY_FIELDS | {"prompt_cache_options", "cache_control"}
 V2_TIMEOUT = 300
@@ -191,7 +193,7 @@ def compaction_summary(route, items):
     return CompactionSummary(
         "[Earlier conversation compacted by the Responses provider.]",
         {"route": route.identity(), "scope": responses_replay_scope(route), "items": items,
-         "replacement_tokens": responses_replacement_tokens(items)},
+         "replacement_tokens": responses_replacement_tokens(items, route)},
     )
 
 
@@ -408,6 +410,57 @@ def remote_settings(route):
     return {}
 
 
+def trim_compaction_input(route, body, *, rewrite_outputs, include_tools):
+    if not route.window:
+        return body
+    counter = ContextCounter(route)
+    cancellation = active_turn()
+    request = {"input": body["input"], "instructions": body.get("instructions") or ""}
+    if include_tools and body.get("tools"):
+        request["tools"] = body["tools"]
+
+    def probe(items):
+        if cancellation:
+            cancellation.check()
+        fragments, images = counter.response_parts({**request, "input": items})
+        overhead = 256
+        bound = sum(len(text.encode("utf-8", "replace")) for text in fragments)
+        if bound + images + overhead <= route.window:
+            return True, True, bound + images + overhead
+        text = sum(map(counter.text, fragments)) + overhead
+        return text + images <= route.window, text <= route.window, text + images
+
+    original = body["input"]
+    fits, text_fits, size = probe(original)
+    if fits:
+        return body
+    if rewrite_outputs:
+        rewritten = list(original)
+        rewritten_text_fits = False
+        for index in range(len(original) - 1, -1, -1):
+            item = original[index]
+            kind = item.get("type")
+            if kind in ("function_call_output", "custom_tool_call_output"):
+                rewritten[index] = {**item, "output": TRUNCATED_COMPACTION_OUTPUT}
+            elif kind == "tool_search_output":
+                rewritten[index] = {**item, "tools": []}
+            elif item.get("role") == "user" and isinstance(content := item.get("content"), list) and (
+                any(part.get("text") == "Attached image(s) from tool result:" for part in content)
+                and any(part.get("type") == "input_image" for part in content)
+            ):
+                continue
+            else:
+                break
+            fits, rewritten_text_fits, size = probe(rewritten)
+            if fits:
+                return {**body, "input": rewritten}
+        if not text_fits and rewritten_text_fits:
+            return {**body, "input": rewritten}
+    if text_fits:
+        return body
+    raise ContextWindowExceeded(f"Responses compaction input exceeds the context window ({size} > {route.window}).")
+
+
 def compact(client, route, messages, schemas, effort, instructions, *, retry=True, meter=None, prefix=None,
             session_id=None, prompt_cache_key=None, v2_enabled=True, retained_budget=64_000,
             codex_session=None, automatic=False, websocket=None):
@@ -424,14 +477,19 @@ def compact(client, route, messages, schemas, effort, instructions, *, retry=Tru
 
     whole = prepare(messages)
 
-    def whole_then_prefix(send):
+    def whole_then_prefix(send, *, include_tools=False):
+        body, users = whole
+        distinct_prefix = prefix is not None and len(prefix[1]) < len(messages)
         try:
-            return send(*whole)
-        except APIStatusError as error:
-            if prefix is None or not context_overflow(error):
+            return send(trim_compaction_input(route, body, rewrite_outputs=not distinct_prefix,
+                                              include_tools=include_tools), users)
+        except (APIStatusError, ContextWindowExceeded) as error:
+            if not distinct_prefix or isinstance(error, APIStatusError) and not context_overflow(error):
                 raise
-            covered, messages = prefix
-            return send(*prepare(messages)).through(covered)
+            covered, prefix_messages = prefix
+            body, users = prepare(prefix_messages)
+            return send(trim_compaction_input(route, body, rewrite_outputs=True, include_tools=include_tools),
+                        users).through(covered)
 
     if v2_enabled and route.responses_compaction_v2:
         try:
@@ -439,7 +497,7 @@ def compact(client, route, messages, schemas, effort, instructions, *, retry=Tru
                 client, route, body, users, retry=retry, meter=meter, session_id=session_id,
                 prompt_cache_key=prompt_cache_key, retained_budget=retained_budget, identity=identity, operation=operation,
                 websocket=websocket,
-            ))
+            ), include_tools=True)
         except CostCapError:
             raise
         except (APIError, RuntimeError, ValueError, KeyError, TypeError, *TRANSPORT_ERRORS) as error:
@@ -540,6 +598,9 @@ def completed_message(response, route, model, fingerprint):
             "route": route.identity(), "prefix": fingerprint, "text": message["content"],
             "calls": calls, "items": replay,
         }
+        details = (response.get("usage") or {}).get("output_tokens_details") or {}
+        if type(reasoning := details.get("reasoning_tokens")) is int and reasoning > 0:
+            message["_responses"]["reasoning_tokens"] = reasoning
     return message
 
 
