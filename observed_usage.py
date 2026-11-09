@@ -71,7 +71,7 @@ def anthropic_counters(raw, retention):
 def normalize_usage(api, provider, raw, prices, retention, cached_tokens_header=None, *, cost_detail=None):
     if raw is None:
         return None
-    if api == "anthropic-messages":
+    if api in ("anthropic-messages", "bedrock-converse-stream"):
         iterations = field(raw, "iterations")
         if isinstance(iterations, list) and any(field(item, "type") == "compaction" for item in iterations):
             prompt, output, read, written, write_1h = map(sum, zip(*(

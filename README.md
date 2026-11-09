@@ -324,6 +324,8 @@ Muse Code 可設定 `providers.museCode.storeResponses: true`，或用 `PI_MUSE_
 
 Anthropic Messages 的原生壓縮匯入會保留簽章、舊版加密狀態和工具變更，並按原時間點插入檔案紀錄。相容路由可重播保留回合的推理區塊，其他路由會讀取文字摘要。舊版 pipy 已匯入的工作階段需要從原 JSONL 重新匯入，才能取回先前未儲存的簽章。 [上游 Anthropic 壓縮](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/agent/src/compaction/anthropic.ts)
 
+Bedrock 路由可選 `amazon-bedrock/<模型 ID>`，也可在路由設定中使用 `bedrock-converse-stream`。認證可用 `AWS_BEARER_TOKEN_BEDROCK` 或標準 AWS 憑證鏈。一般 Converse 回合使用可讀摘要，支援原生壓縮的模型會在 InvokeModelWithResponseStream 壓縮時重播同供應商的簽章與工具變更。 [上游 Bedrock 路由](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/ai/src/providers/amazon-bedrock.ts) · [AWS 壓縮介面](https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-compaction.html)
+
 `/fresh` 會關閉已快取的模型 HTTP 連線、清除帳號釘選並換一個暫時的供應商識別碼，同一份工作階段逐字稿會繼續用於模型請求。JSONL RPC 可用 `fresh_session` 取得本次刷新資訊。 [上游供應商工作階段刷新](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/docs/session-operations-export-share-fork-resume.md)
 
 `/clear` 在同一工作階段新增重置邊界，保留工作階段 ID、標題和完整逐字稿。模型回放、原生壓縮狀態與自動回憶查詢從新邊界重新開始。Hindsight 和 Mnemopi 會用新的逐字稿識別碼保存後續對話。互動終端會清除畫面與捲動區，仍可透過 `/tree` 回到較早的分支。JSONL 匯出包含重置前的歷史與 `reset_boundary`。CLI 與 ACP 支援 `/clear`，JSONL RPC 也可直接呼叫 `reset_context`。 [上游工作階段重置](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/agent-session.ts#L6864)

@@ -22,7 +22,7 @@ import snapcompact
 from cancellable_http import active_turn, turn_scope
 from compaction_policy import Budget
 from context_windows import BOUNDARY, NOTE_LIMIT, NOTE_TYPE, REMINDER, ROLLOVER, note_message, render_message, render_metadata
-from model_catalog import RESPONSES_APIS
+from model_catalog import ANTHROPIC_COMPACTION_APIS, RESPONSES_APIS
 from recovery import StreamInterrupted, TRANSPORT_ERRORS
 from shake import AUTO, RESCUE, artifact_id, plan
 from session_artifacts import read_numbered
@@ -1106,7 +1106,7 @@ class Compaction:
             return
         route = self.pruning_route()
         model = (route.catalog_model or {}) if route else {}
-        anthropic = route and route.api == "anthropic-messages"
+        anthropic = route and route.api in ANTHROPIC_COMPACTION_APIS
         lookback = model.get("promptCacheLookback") or (20 if anthropic else None)
         if type(lookback) is not int or lookback <= 0:
             lookback = None
@@ -1515,7 +1515,7 @@ class Compaction:
         route = self.session.archive_route
         batches = self.session.batches
         cut = snapshot.first_kept
-        anthropic = route and route.api == "anthropic-messages"
+        anthropic = route and route.api in ANTHROPIC_COMPACTION_APIS
         files_due_before = float("inf")
         if anthropic:
             # Anthropic merges adjacent messages on the same side of a turn.

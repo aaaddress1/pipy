@@ -25,12 +25,14 @@ MAX_LOGICAL = 64 * MAX_FRAME
 CHUNK_BYTES = 720 * 1024
 MAX_QUEUE = 256
 API_NAMES = {"chat-completions": "openai-completions", "openai-responses": "openai-responses",
-             "anthropic-messages": "anthropic-messages", "openai-codex-responses": "openai-codex-responses"}
+             "anthropic-messages": "anthropic-messages", "openai-codex-responses": "openai-codex-responses",
+             "bedrock-converse-stream": "bedrock-converse-stream"}
 
 
 def model_metadata(route, usage):
     model = getattr(usage, "served_model", None) or route.model
-    metadata = {"api": API_NAMES[route.api], "provider": route.name, "model": model,
+    provider = (route.catalog_model or {}).get("provider") or route.provider() if route.api == "bedrock-converse-stream" else route.name
+    metadata = {"api": API_NAMES[route.api], "provider": provider, "model": model,
                 "timestamp": int(time() * 1000)}
     if usage:
         inputs = getattr(usage, "prompt_tokens", 0) or 0

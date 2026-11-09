@@ -141,6 +141,8 @@ def credit_wait(delay, cancel):
 
 
 def thinking_key(block):
+    if not isinstance(block, dict):
+        return None
     if block["type"] == "thinking" and isinstance(signature := block.get("signature"), str) and signature.strip():
         return "thinking", signature
     if block["type"] == "redacted_thinking" and isinstance(data := block.get("data"), str) and data.strip():
@@ -226,7 +228,7 @@ class ThinkingRepair:
                 content = message["content"]
                 if message["role"] == "assistant":
                     keys.update(key for block in content if (key := thinking_key(block)))
-                elif not content or any(block["type"] != "tool_result" for block in content):
+                elif not isinstance(content, list) or not content or any(block["type"] != "tool_result" for block in content):
                     break
             if not keys:
                 return False
@@ -442,7 +444,7 @@ def apply_thinking(body, catalog, effort):
 
 
 def request_body(route, model, messages, schemas, effort, *, stream=True, max_tokens=None, repair=None, metadata=None,
-                 compacting=False, files_due_before=float("inf")):
+                 compacting=False, files_due_before=float("inf"), native_history=False):
     identity = route.identity() if model == route.model else None
     repair = repair or ThinkingRepair()
     fallbacks = route.server_side_fallbacks if stream and identity else ()
@@ -459,7 +461,7 @@ def request_body(route, model, messages, schemas, effort, *, stream=True, max_to
     ]
     history = WireHistory(system, tools, effort)
     pending_files, legacy_files, tool_images = [], None, []
-    preserved = False
+    preserved = native_history
     rewrite_at = float("-inf")
     legacy_replay = False
     provider = native_provider(route) if identity and route.native_compaction else None
@@ -498,12 +500,16 @@ def request_body(route, model, messages, schemas, effort, *, stream=True, max_to
             legacy_files = None
         if role == "assistant":
             blocks = imported_assistant_content(message, provider, keep_thinking=when > rewrite_at) if preserved else None
+            if native_history and blocks is None and (saved := message.get("_anthropic")) and (
+                saved.get("route") == identity and saved.get("text") == message.get("content")
+            ):
+                blocks = saved["blocks"]
             if blocks is None:
                 blocks = assistant_content(message, identity, history.fingerprint())
             if not replay_handoff:
                 blocks = fallback.collapse_segments(blocks)
             wire = fallback.tool_calls_last(list(replay_content(blocks, repair, unsigned, model)))
-            if preserved and wire and (last := history.messages[-1])["role"] == "assistant":
+            if preserved and wire and history.messages and (last := history.messages[-1])["role"] == "assistant":
                 if len(last["content"]) != 1 or last["content"][0]["type"] != "compaction":
                     history.add("user", "Continue.", merge=False)
             history.add(role, wire)
@@ -541,7 +547,7 @@ def request_body(route, model, messages, schemas, effort, *, stream=True, max_to
     flush_files(files_due_before)
     if not compacting and legacy_files and legacy_files.strip():
         history.add("user", legacy_files, merge=False)
-    if preserved and not compacting and history.messages[-1]["role"] == "assistant":
+    if preserved and not compacting and history.messages and history.messages[-1]["role"] == "assistant":
         history.add("user", "Continue.", merge=False)
     body = {
         "model": route.wire_model(effort) if identity else model,

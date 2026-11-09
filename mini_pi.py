@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=2,<3", "httpx>=0.28,<1", "websockets>=15,<16", "filelock>=3,<4", "prompt-toolkit>=3,<4", "regex", "pillow", "fonttools", "mcp>=2.3,<3", "pyyaml>=6,<7", "cryptography", "xxhash", "jsonschema>=4,<5", "psutil>=7,<8", "ast-grep-py", "wcmatch", "pathspec>=0.12,<2", "resvg-py>=0.5,<1", "pywinpty>=3,<4; sys_platform == 'win32'", "pyobjc-framework-DeviceCheck>=11; sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# dependencies = ["openai>=2,<3", "httpx>=0.28,<1", "botocore>=1.40,<2", "websockets>=15,<16", "filelock>=3,<4", "prompt-toolkit>=3,<4", "regex", "pillow", "fonttools", "mcp>=2.3,<3", "pyyaml>=6,<7", "cryptography", "xxhash", "jsonschema>=4,<5", "psutil>=7,<8", "ast-grep-py", "wcmatch", "pathspec>=0.12,<2", "resvg-py>=0.5,<1", "pywinpty>=3,<4; sys_platform == 'win32'", "pyobjc-framework-DeviceCheck>=11; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # ///
 """A small Pi-style coding agent."""
 
@@ -36,6 +36,7 @@ from filelock import Timeout
 from openai import AsyncOpenAI, OpenAIError
 
 import anthropic_messages
+import bedrock_runtime
 import codex_responses
 import chat_stream
 import stream_watchdog
@@ -510,6 +511,12 @@ def stream_reply(
                         live_source=options.get("live_source"),
                         effort_control=options.get("effort_control"),
                         http_chain=options.get("http_chain"),
+                    )
+                elif native_route and native_route.api == bedrock_runtime.API:
+                    result = bedrock_runtime.stream_attempt(
+                        client, native_route, model, messages, schemas, options.get("reasoning_effort"), guard, show,
+                        tool_choice=tool_choice, cancel=cancel, turn=turn, usage_observer=observer,
+                        tracker=tracker, on_text=on_text, speculation=speculation,
                     )
                 else:
                     chat_options = {key: value for key, value in options.items()
@@ -2621,7 +2628,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 cancellation = active_turn() or handoff.Cancellation()
                 schemas = tool_schemas(configured_tools())
                 instructions = SUMMARY_INSTRUCTIONS
-                if candidates[0].api == "anthropic-messages":
+                if candidates[0].api in model_catalog.ANTHROPIC_COMPACTION_APIS:
                     if (backend := mnemopi or hindsight) and not child:
                         with turn_scope(cancellation):
                             if context := backend.compaction_context(conversation_messages(messages)):
@@ -2630,7 +2637,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         instructions += "\n\n" + snapshot
 
                 def send(route, credential):
-                    adapter = openai_responses if route.api in model_catalog.RESPONSES_APIS else anthropic_messages
+                    adapter = {bedrock_runtime.API: bedrock_runtime, "anthropic-messages": anthropic_messages}.get(
+                        route.api, openai_responses,
+                    )
                     def prepare(batch):
                         return inline.transform(batch if route.vision else session_jsonl.text_only(batch), route)[0]
 
@@ -3072,7 +3081,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         client, route, messages, request_options().get("reasoning_effort"), replay=anthropic_replay(route),
                         meter=meter, metadata=provider_metadata(),
                     )
-            if route.api == codex_responses.API:
+            if route.api in (codex_responses.API, bedrock_runtime.API):
                 credential, options = router.credential, request_options(route)
                 options["effort_control"] = effort_control
 

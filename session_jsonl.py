@@ -173,6 +173,20 @@ def valid_elision(edit):
     )
 
 
+def source_anthropic_turn(message):
+    if message.get("api") not in ("anthropic-messages", "bedrock-converse-stream"):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list) or not all(isinstance(item, dict) for item in content) or not all(
+        isinstance(message.get(field), str) for field in ("provider", "model")
+    ):
+        return None
+    saved = {key: message[key] for key in ("provider", "model", "content", "api")}
+    if isinstance(stop := message.get("stopReason"), str):
+        saved["stopReason"] = stop
+    return saved
+
+
 def import_message(entry):
     kind = entry["type"]
     if kind == "branch_summary":
@@ -220,6 +234,8 @@ def import_message(entry):
     role = message.get("role")
     expected = "tool" if role == "toolResult" else role
     if isinstance(local, dict) and local.get("role") == expected:
+        if role == "assistant" and "_anthropic_import" not in local and (native := source_anthropic_turn(message)):
+            local = {**local, "_anthropic_import": native}
         if role == "toolResult" and message.get("toolName") == "todo" and not message.get("isError"):
             details = local.get("_tool_details")
             if isinstance(details, dict) and details.get("op") != "view" and isinstance(details.get("phases"), list):
@@ -267,12 +283,8 @@ def import_message(entry):
             result["tool_calls"] = calls
         if reasoning:
             result["_thinking"] = "\n".join(reasoning)
-        if message.get("api") == "anthropic-messages" and isinstance(content, list) and all(
-            isinstance(item, dict) for item in content
-        ) and all(isinstance(message.get(field), str) for field in ("provider", "model")):
-            result["_anthropic_import"] = {key: message[key] for key in ("provider", "model", "content")}
-            if isinstance(stop := message.get("stopReason"), str):
-                result["_anthropic_import"]["stopReason"] = stop
+        if native := source_anthropic_turn(message):
+            result["_anthropic_import"] = native
         if not calls and message.get("stopReason") == "stop" and mapping(message.get("stopDetails")).get("type") == "pause_turn":
             result["_stop_details"] = {"type": "pause_turn"}
         if isinstance(message.get("inputTransformations"), list):
@@ -760,7 +772,7 @@ def export_message(message, call_names):
             content.append({"type": "toolCall", "id": call["id"], "name": function["name"], "arguments": arguments})
         native = message.get("_anthropic", {})
         native_blocks = native.get("blocks", ()) if native.get("text") == message.get("content") else ()
-        if any(block["type"] == "fallback" for block in native_blocks):
+        if native_blocks:
             calls = {item["id"]: item for item in content if item["type"] == "toolCall"}
             content = []
             for block in native_blocks:
@@ -787,7 +799,7 @@ def export_message(message, call_names):
                       "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
         }
         if imported := message.get("_anthropic_import"):
-            result.update(api="anthropic-messages", **imported)
+            result.update({"api": "anthropic-messages", **imported})
     else:
         result = {"role": role, "content": content, "timestamp": now}
         if role == "user" and message.get("liveSteered") is True:

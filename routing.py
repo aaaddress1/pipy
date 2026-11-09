@@ -26,6 +26,7 @@ from cache_warmer import Prices
 from cancellable_http import CancellableTransport, active_turn
 import codex_attestation
 import codex_responses
+import bedrock_runtime
 from mcp_oauth import oauth_url
 import model_catalog
 import responses_cache
@@ -82,6 +83,8 @@ class Route:
     prompt_cache: responses_cache.PromptCache | None = None
 
     def endpoint(self):
+        if self.api == bedrock_runtime.API:
+            return bedrock_runtime.base_url(self.model, self.base_url)
         if self.api == "anthropic-messages":
             return (self.base_url or os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
         if self.api == codex_responses.API:
@@ -104,7 +107,7 @@ class Route:
         return quota_scope(self.broker_provider, self.model, self.broker_scope)
 
     def provider(self):
-        return self.broker_provider or self.endpoint()
+        return self.broker_provider or ("amazon-bedrock" if self.api == bedrock_runtime.API else self.endpoint())
 
     def context_tiers(self):
         model = self.catalog_model or {}
@@ -242,9 +245,12 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
         native_anthropic = api == "anthropic-messages" and compat.get("supportsServerCompaction") is True and (
             isinstance(endpoint, str) and official_endpoint(endpoint)
         )
+        native_bedrock = api == bedrock_runtime.API and bedrock_runtime.supports_compaction(
+            catalog, endpoint, override=remote_enabled,
+        )
         native_responses = responses_remote and (remote_enabled is True or remote.get("v2StreamingEnabled") is True)
         native_compaction = fields.get("native_compaction", remote_enabled is not False and (
-            native_anthropic or native_responses
+            native_anthropic or native_responses or native_bedrock
         ))
         responses_compaction_v2 = fields.get("responses_compaction_v2", native_compaction and responses_remote
                                             and remote.get("v2StreamingEnabled") is True)
@@ -289,6 +295,8 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
         if catalog_envs and api == "anthropic-messages" and auth == "bearer" and official_endpoint(endpoint):
             catalog_envs = [default_env]
         key_envs = fields.get("api_key_env", catalog_envs or ([default_env] if endpoint is None else []))
+        if api == bedrock_runtime.API and "api_key_env" not in fields:
+            key_envs = list(bedrock_runtime.TOKEN_ENVS)
         promote_to = fields.get("promote_to")
         fallbacks = fields.get("fallbacks", [])
         effort = fields.get("reasoning_effort")
@@ -376,7 +384,8 @@ def load_routes(path, primary, window, *, anthropic_server_side_fallback=False, 
             or "prefer_websockets" in fields and api not in model_catalog.RESPONSES_APIS
             or "responses_compaction_v2" in fields and api not in model_catalog.RESPONSES_APIS
             or responses_compaction_v2 and not native_compaction
-            or api != "anthropic-messages" and ("auth" in fields or not standard_responses and "cache_retention" in fields)
+            or api != "anthropic-messages" and "auth" in fields
+            or api not in model_catalog.ANTHROPIC_COMPACTION_APIS and not standard_responses and "cache_retention" in fields
             or api == "chat-completions" and (
                 "native_compaction" in fields or "max_output_tokens" in fields and not catalog
             )
@@ -632,6 +641,10 @@ class Router:
                 route, KEYLESS, now, wall,
             ):
                 env = KEYLESS
+        if route.api == bedrock_runtime.API and not env and not route.key_override:
+            chain = bedrock_runtime.AWS_CHAIN
+            if chain not in excluded and not self.locally_blocked(route, chain, now, wall) and bedrock_runtime.ambient_credentials():
+                env = chain
         if not route.broker_provider or not self.broker or route.key_override:
             return env
         try:
@@ -828,6 +841,18 @@ class Router:
 
     def new_client(self, route, credential, timeout=120):
         transport = {"transport": CancellableTransport(self.transport_loop)} if self.transport_loop else {}
+        if route.api == bedrock_runtime.API:
+            if credential == bedrock_runtime.AWS_CHAIN:
+                auth = bedrock_runtime.BedrockAuth(bedrock_runtime.region_for(route.model),
+                                                  credentials=bedrock_runtime.ambient_credentials())
+            elif type(credential) is int:
+                return httpx.Client(timeout=timeout, **transport, **self.request_settings(route, credential))
+            elif credential == KEYLESS:
+                auth = None
+            else:
+                token = self.secrets.resolve(route.connection.key) if credential == CONFIG_KEY else os.getenv(credential)
+                auth = bedrock_runtime.BedrockAuth(bedrock_runtime.region_for(route.model), token=token)
+            return httpx.Client(auth=auth, timeout=timeout, follow_redirects=False, **transport)
         http_settings = self.request_settings(route, credential)
         if route.api == "anthropic-messages":
             return httpx.Client(headers=self.native_headers(route, credential), timeout=timeout, **transport, **http_settings)

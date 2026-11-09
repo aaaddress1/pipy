@@ -16,8 +16,10 @@ from cache_warmer import Prices
 REVISION = "24439066040e006eb08da7b204f0ac41c79d2de9"
 DATA = Path(__file__).with_name("catalog")
 APIS = {"openai-completions": "chat-completions", "openai-responses": "openai-responses",
-        "anthropic-messages": "anthropic-messages", "openai-codex-responses": "openai-codex-responses"}
+        "anthropic-messages": "anthropic-messages", "openai-codex-responses": "openai-codex-responses",
+        "bedrock-converse-stream": "bedrock-converse-stream"}
 RESPONSES_APIS = frozenset(("openai-responses", "openai-codex-responses"))
+ANTHROPIC_COMPACTION_APIS = frozenset(("anthropic-messages", "bedrock-converse-stream"))
 JUDGE_APIS = frozenset(("typesafe", "openrouter-decisions", "openai-decisions", "workers-ai-systemone"))
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 OPS = {"=": operator.eq, ">": operator.gt, "<": operator.lt, ">=": operator.ge, "<=": operator.le}
