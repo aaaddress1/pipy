@@ -4,7 +4,8 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 from concurrent.futures import CancelledError, TimeoutError
-from threading import Thread
+from itertools import chain
+from threading import Lock, Thread, current_thread
 
 import httpx
 
@@ -14,6 +15,19 @@ _turn = ContextVar("active_http_turn", default=None)
 
 def active_turn():
     return _turn.get()
+
+
+def sse_frames(lines):
+    name, data = None, []
+    for line in chain(lines, ("",)):
+        if line.startswith("event:"):
+            name = line[6:].strip()
+        elif line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+        elif not line:
+            if data:
+                yield name, "\n".join(data)
+            name, data = None, []
 
 
 @contextmanager
@@ -96,6 +110,21 @@ class CancellableTransport(httpx.BaseTransport):
     def __init__(self, loop):
         self.loop = loop
         self.client = httpx.AsyncClient()
+        self.tail_lock = Lock()
+        self.tails = set()
+
+    def drain_tail(self, drain):
+        def run():
+            try:
+                drain()
+            finally:
+                with self.tail_lock:
+                    self.tails.discard(current_thread())
+
+        thread = Thread(target=run, name="mini-pi-http-tail", daemon=True)
+        with self.tail_lock:
+            self.tails.add(thread)
+            thread.start()
 
     def handle_request(self, request):
         turn = _turn.get()
@@ -108,8 +137,13 @@ class CancellableTransport(httpx.BaseTransport):
         response = self.loop.call(self.client.send(outbound, stream=True), turn)
         return httpx.Response(
             response.status_code, headers=response.headers.raw, stream=ResponseBody(self.loop, response, turn),
-            extensions={key: value for key, value in response.extensions.items() if key != "network_stream"},
+            extensions={**{key: value for key, value in response.extensions.items() if key != "network_stream"},
+                        "pipy_transport": self},
         )
 
     def close(self):
+        with self.tail_lock:
+            tails = tuple(self.tails)
+        for tail in tails:
+            tail.join()
         self.loop.call(self.client.aclose())

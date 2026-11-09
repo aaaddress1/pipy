@@ -8,7 +8,6 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from hashlib import sha256
-from itertools import chain
 from urllib.parse import urlsplit
 
 import httpx
@@ -22,7 +21,7 @@ from responses_tools import ITEM_EVENTS, TOOL_EVENTS, TOOL_ITEMS, StreamedTools
 from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
 from responses_websocket import generation_evidence
-from cancellable_http import active_turn
+from cancellable_http import active_turn, sse_frames
 from cost_gate import CostCapError
 from handoff import deadline
 from recovery import ContextWindowExceeded, EmptyTurn, IncompleteTurn, StreamInterrupted, TRANSPORT_ERRORS, context_overflow
@@ -210,22 +209,16 @@ def retained_users(items, budget=64_000):
 
 
 def compaction_sse(lines):
-    name, data = None, []
-    for line in chain(lines, ("",)):
-        if line.startswith("event:"):
-            name = line[6:].strip()
-        elif line.startswith("data:"):
-            data.append(line[5:].lstrip())
-        elif not line:
-            if data and data != ["[DONE]"]:
-                try:
-                    event = json.loads("\n".join(data))
-                except ValueError as error:
-                    raise StreamInterrupted("Responses V2 stream parse failed.") from error
-                if not isinstance(event, dict):
-                    raise StreamInterrupted("Responses V2 stream event must be an object.")
-                yield event.get("type") or name, event
-            name, data = None, []
+    for name, data in sse_frames(lines):
+        if data.strip() == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except ValueError as error:
+            raise StreamInterrupted("Responses V2 stream parse failed.") from error
+        if not isinstance(event, dict):
+            raise StreamInterrupted("Responses V2 stream event must be an object.")
+        yield event.get("type") or name, event
 
 
 @contextmanager

@@ -37,6 +37,7 @@ from openai import AsyncOpenAI, OpenAIError
 
 import anthropic_messages
 import codex_responses
+import chat_stream
 from async_jobs import AsyncJobs, tool_result
 from services import Services, normalize_readiness
 from service_runtime import NAME as SERVICE_NAME
@@ -467,6 +468,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                    *, usage_observer=None, tracker=None, on_text=None, speculation=None, heal_dsml=False):
     text, thinking, calls, finish, usage = [], [], {}, None, None
     cached_tokens_header = upstream_provider = None
+    native_failure = None
     buffer = dsml.TextBuffer() if heal_dsml else None
     visible, leaked = None, False
     tool_options = {"tools": schemas} if schemas else {}
@@ -488,7 +490,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
 
     def finish_markup():
         nonlocal visible, finish, leaked
-        if not buffer:
+        if not buffer or visible is not None:
             return
         visible, tail, recovered, leaked = buffer.finish()
         if finish in ("stop", "tool_calls") and not calls and schemas and tool_choice not in ("none", "auto") and recovered:
@@ -497,21 +499,15 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                 raw = call["function"]["arguments"]
                 if tracker and tracker.rules.stream_tools:
                     tracker.tool(index, name, raw, call["id"], final=True)
-                if speculation:
-                    speculation.observe(index, name, call["id"], raw, final=True)
-        if finish == "stop" and calls:
-            finish = "tool_calls"
         if tail:
             guard.push(None, tail, bool(calls))
             emit_text(tail)
 
+    stream = chat_stream.ChatStream(client, model=model, messages=chat_tool_images(messages),
+                                    stream_options={"include_usage": True}, **tool_options, **options)
     try:
-        with client.chat.completions.create(
-            model=model, messages=chat_tool_images(messages), stream=True,
-            stream_options={"include_usage": True}, **tool_options, **options,
-        ) as stream:
-            if usage_observer and (response := getattr(stream, "response", None)) is not None:
-                cached_tokens_header = response.headers.get("fireworks-cached-prompt-tokens")
+        with stream:
+            cached_tokens_header = stream.response.headers.get("fireworks-cached-prompt-tokens")
             for chunk in stream:
                 if chunk.usage:
                     usage = chunk.usage
@@ -521,13 +517,21 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                         upstream_provider = upstream
                 if cancel:
                     cancel()
-                for choice in chunk.choices:
-                    delta = choice.delta
-                    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                    piece = delta.content or delta.refusal
+                choices = getattr(chunk, "choices", None) or ()
+                for choice in choices:
+                    if not chunk.usage and (reported := chat_stream.choice_usage(choice)):
+                        usage = reported
+                    delta = getattr(choice, "delta", None)
+                    reasoning = (getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                                 or getattr(delta, "reasoning_text", None))
+                    piece = getattr(delta, "content", None) or getattr(delta, "refusal", None)
+                    parts = getattr(delta, "tool_calls", None) or ()
+                    if not parts and (function := getattr(delta, "function_call", None)):
+                        call_id = "call_" + uuid4().hex[:24] if 0 not in calls else None
+                        parts = (SimpleNamespace(index=0, id=call_id, function=function),)
                     if buffer and piece:
                         piece = buffer.feed(piece)
-                    guard.push(reasoning if isinstance(reasoning, str) else None, piece, bool(delta.tool_calls))
+                    guard.push(reasoning if isinstance(reasoning, str) else None, piece, bool(parts))
                     if turn:
                         turn.delta("thinking", reasoning if isinstance(reasoning, str) else None)
                     if isinstance(reasoning, str) and reasoning:
@@ -535,7 +539,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                     if tracker:
                         tracker.text("thinking", reasoning if isinstance(reasoning, str) else None)
                     emit_text(piece)
-                    for part in delta.tool_calls or []:
+                    for part in parts:
                         call = calls.setdefault(part.index, {
                             "id": "", "type": "function", "function": {"name": "", "arguments": ""},
                         })
@@ -549,15 +553,28 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                         if speculation:
                             func = call["function"]
                             speculation.observe(part.index, func["name"], call["id"], func["arguments"])
-                    if choice.finish_reason:
-                        finish = choice.finish_reason
-                        if speculation and finish == "tool_calls":
-                            for index, call in sorted(calls.items()):
-                                func = call["function"]
-                                speculation.observe(index, func["name"], call["id"], func["arguments"], final=True)
+                    native_failure = native_failure or chat_stream.native_error(choice)
+                    if native_failure:
+                        finish = "native_error"
+                    elif reason := chat_stream.finish_reason(getattr(choice, "finish_reason", None)):
+                        finish = reason
+                if finish:
+                    stream.mark_finished()
+                    if usage and (not choices or chat_stream.has_cache_details(usage)):
+                        stream.detach()
+                        break
+            if stream.done and finish is None:
+                finish = "stop"
             finish_markup()
             if finish:
                 guard.finish()
+    except CancelledError:
+        if stream.parent:
+            stream.parent.check()
+        if not finish or not stream.signal.event.is_set():
+            raise
+        finish_markup()
+        guard.finish()
     except TRANSPORT_ERRORS as error:
         if not finish:
             raise StreamInterrupted(
@@ -572,11 +589,18 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
         if show and text:
             print()
     visible = "".join(text) if visible is None else visible
+    if finish == "stop" and calls:
+        finish = "tool_calls"
+    if native_failure or finish in chat_stream.TRANSIENT_FINISH:
+        reason = f"native_finish_reason: {native_failure}" if native_failure else f"finish_reason: {finish}"
+        raise StreamInterrupted(f"Provider returned an error ({reason}).", text=visible, tool_draft=bool(calls), usage=usage)
     if finish == "length":
         raise IncompleteTurn(
             "Model reached its generation limit.", text=visible, tool_draft=bool(calls), usage=usage,
         )
-    if finish is None or (finish in ("stop", "tool_calls") and bool(calls) != (finish == "tool_calls")):
+    if finish is None and not (visible or calls or thinking or leaked or (buffer and buffer.parts)):
+        raise EmptyTurn("Chat Completions ended without output.", usage=usage)
+    if finish is None or (finish == "tool_calls" and not calls):
         raise StreamInterrupted(
             "Model stream ended without a complete turn.",
             text=visible, tool_draft=bool(calls) or finish == "tool_calls", usage=usage,
@@ -601,6 +625,10 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
         ids = {call["id"] for call in ordered}
         if "" in ids or len(ids) != len(ordered) or any(not call["function"]["name"] for call in ordered):
             raise StreamInterrupted("Model returned incomplete or duplicate tool calls.", tool_draft=True)
+        if speculation:
+            for index, call in sorted(calls.items()):
+                func = call["function"]
+                speculation.observe(index, func["name"], call["id"], func["arguments"], final=True)
         message["tool_calls"] = ordered
     return message, usage
 
