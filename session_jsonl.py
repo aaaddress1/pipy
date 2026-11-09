@@ -13,7 +13,7 @@ from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
 import session_graph as graph
-from runtime import database, initialize, pack
+from runtime import database, initialize, pack, responses_replacement_tokens
 from session_artifacts import PIPY_ARTIFACT, copy_sidecar, install_sidecar, sidecar, stored_artifacts
 from session_blobs import hydrate_images
 from shake import artifact_id, block_ranges, tool_text
@@ -300,14 +300,97 @@ def source_metadata(entry):
     return record
 
 
-def import_compaction(db, session, parent, entry, batches):
+RESPONSES_PRESERVE_KEYS = ("openaiRemoteCompaction", "openaiCompactionV2")
+
+
+def compaction_diagnostics(entry):
+    result = {key: entry[key] for key in ("tokensBefore", "tokensAfter")
+              if type(entry.get(key)) is int and entry[key] >= 0}
+    if isinstance(warning := entry.get("warning"), str) and warning.strip():
+        result["warning"] = warning
+    return result
+
+
+def covered_batch(db, session, parent, replay_node):
+    if replay_node is None:
+        return None
+    path = graph.nodes(db, session, parent)
+    if not any(node == replay_node for node, _, _, _, _ in path):
+        return None
+    start = graph.transcript_boundary(db, session, parent)[1]
+    covered = max((seq for node, _, kind, seq, _ in path if node <= replay_node and kind == "batch"), default=0)
+    if not covered or covered < start:
+        return None
+    # A single pipy batch includes the assistant's calls and all their results.
+    if any(node > replay_node and kind == "tool_update" and json.loads(raw)[0] <= covered
+           for node, _, kind, _, raw in path):
+        return None
+    return covered
+
+
+def upstream_responses_compaction(db, session, parent, entry, mapped):
+    source = mapping(entry.get("preserveData"))
+    saved = mapping(next((source[key] for key in RESPONSES_PRESERVE_KEYS if key in source), None))
+    provider, items = saved.get("provider"), saved.get("replacementHistory")
+    if not isinstance(provider, str) or not provider or not isinstance(items, list) or not all(
+        isinstance(item, dict) for item in items
+    ):
+        return None
+    anchor = entry.get("providerReplayThroughEntryId")
+    replay_node = mapped.get(anchor) if isinstance(anchor, str) else parent if anchor is None else None
+    if not (covered := covered_batch(db, session, parent, replay_node)):
+        return None
+    portable_cut, portable_summary, previous = graph.checkpoint(db, session, parent)
+    previous = previous or {}
+    native = {
+        "items": items, "provider": provider, "replay_through": covered,
+        "replacement_tokens": responses_replacement_tokens(items),
+        "portable_first_kept": previous.get("portable_first_kept", portable_cut),
+        "portable_summary": previous.get("portable_summary", portable_summary),
+        "source_fields": {key: value for key, value in saved.items() if key not in ("provider", "replacementHistory")},
+        **compaction_diagnostics(entry),
+    }
+    first = entry.get("firstKeptEntryId")
+    if isinstance(first, str) and (first_node := mapped.get(first)):
+        row = db.execute("SELECT batch FROM session_nodes WHERE id=? AND session=? AND kind='batch'",
+                         (first_node, session)).fetchone()
+        if row and graph.first_batch_at(db, session, parent, row[0]) == row[0]:
+            native["display_first_kept"] = row[0]
+    if archive := previous.get("portable_archive") or previous.get("snapcompact"):
+        native["portable_archive"] = archive
+    if handoff := previous.get("portable_handoff") or (
+        previous if previous.get("method") in ("handoff", "experimental-context-rollover") else None
+    ):
+        native["portable_handoff"] = handoff
+    return [covered + 1, str(entry.get("summary") or ""), native]
+
+
+def upgrade_responses_compactions(db, session):
+    rows = db.execute("""
+        SELECT id,parent,payload FROM session_nodes WHERE session=? AND kind='foreign'
+        AND json_extract(payload,'$.type')='compaction'
+        AND (json_type(payload,'$.preserveData.openaiRemoteCompaction')='object'
+             OR json_type(payload,'$.preserveData.openaiCompactionV2')='object') ORDER BY id
+    """, (session,)).fetchall()
+    if not rows:
+        return False
+    mapped = dict(db.execute("SELECT source_id,node FROM session_entry_sources WHERE session=?", (session,)))
+    upgraded = False
+    for identifier, parent, raw in rows:
+        if payload := upstream_responses_compaction(db, session, parent, json.loads(raw), mapped):
+            db.execute("UPDATE session_nodes SET kind='compact',payload=? WHERE session=? AND id=?",
+                       (pack(payload), session, identifier))
+            upgraded = True
+    return upgraded
+
+
+def import_compaction(db, session, parent, entry, batches, mapped):
     metadata = mapping(entry.get("miniPi"))
     source = mapping(entry.get("preserveData"))
     native = mapping(metadata.get("native")) or None
-    if not metadata and (
-        "openaiRemoteCompaction" in source or "openaiCompactionV2" in source
-    ):
-        return graph.append(db, session, parent, "foreign", payload=entry)
+    if not metadata and any(key in source for key in RESPONSES_PRESERVE_KEYS):
+        payload = upstream_responses_compaction(db, session, parent, entry, mapped)
+        return graph.append(db, session, parent, "compact" if payload else "foreign", payload=payload or entry)
     first = metadata.get("cut", entry.get("firstKeptEntryId"))
     cut = batches.get(first) if isinstance(first, str) else None
     if cut is None or (cut and graph.first_batch_at(db, session, parent, cut) != cut):
@@ -315,10 +398,34 @@ def import_compaction(db, session, parent, entry, batches):
     summary = str(metadata.get("summary", entry.get("summary")) or "")
     if native and "portable_first_kept" in native:
         portable = native["portable_first_kept"]
-        native = {**native, "portable_first_kept": batches.get(portable, 0) if isinstance(portable, str) else 0}
+        start = graph.transcript_boundary(db, session, parent)[1]
+        seq = batches.get(portable, start) if isinstance(portable, str) else start
+        if seq < start or graph.first_batch_at(db, session, parent, seq) != seq:
+            seq = start
+        native = {**native, "portable_first_kept": seq}
+    if native and native.get("provider") and "items" not in native:
+        source_payload = mapping(source.get(RESPONSES_PRESERVE_KEYS[0]))
+        items = source_payload.get("replacementHistory")
+        if (source_payload.get("provider") == native["provider"] and isinstance(items, list)
+                and all(isinstance(item, dict) for item in items)):
+            native = {**native, "items": items, "source_fields": {
+                key: value for key, value in source_payload.items() if key not in ("provider", "replacementHistory")
+            }}
+        else:
+            native = {key: value for key, value in native.items() if key != "provider"}
+            native["replay_through"] = None
+    if native and "display_first_kept" in native:
+        first = native["display_first_kept"]
+        display = batches.get(first) if isinstance(first, str) else None
+        if display and graph.first_batch_at(db, session, parent, display) == display:
+            native = {**native, "display_first_kept": display}
+        else:
+            native.pop("display_first_kept")
     if native and "replay_through" in native:
         anchor = native["replay_through"]
-        covered = batches.get(anchor) if isinstance(anchor, str) else None
+        covered = None
+        if isinstance(anchor, str):
+            covered = covered_batch(db, session, parent, mapped.get(anchor)) if native.get("provider") else batches.get(anchor)
         if covered and graph.first_batch_at(db, session, parent, covered) == covered:
             native = {**native, "replay_through": covered}
             cut = covered + 1
@@ -336,11 +443,7 @@ def import_compaction(db, session, parent, entry, batches):
         text = archive.get("text") or "\n".join(archive.get(key) or "" for key in ("textHead", "textTail"))
         if text.strip():
             summary += "\n\n" + text.replace("█", "\n").replace("\x0e", "").replace("\x0f", "")
-    diagnostics = {key: entry[key] for key in ("tokensBefore", "tokensAfter")
-                   if type(entry.get(key)) is int and entry[key] >= 0}
-    if isinstance(warning := entry.get("warning"), str) and warning.strip():
-        diagnostics["warning"] = warning
-    if diagnostics:
+    if diagnostics := compaction_diagnostics(entry):
         native = {**(native or {}), **diagnostics}
     return graph.append(db, session, parent, "compact", payload=[cut, summary, native])
 
@@ -433,7 +536,7 @@ def import_journal(db_path, workspace, source, *, session_id=None, replace=False
                 if message["role"] in ("assistant", "user"):
                     calls = {call["id"]: (last, index) for index, call in enumerate(tool_calls, 1)}
             elif kind == "compaction":
-                node = import_compaction(db, session, parent, entry, batches)
+                node = import_compaction(db, session, parent, entry, batches, mapped)
             elif kind == "reset_boundary":
                 node = graph.append(db, session, parent, "reset", payload=last)
                 calls = {}
@@ -660,6 +763,12 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
     def anchor(cut, parent):
         return anchors.get(cut) if cut in anchors else anchors.get(graph.first_batch_at(db, session, parent, cut))
 
+    def replay_anchor(seq, parent):
+        for node, _, kind, batch, data in reversed(graph.nodes(db, session, parent)):
+            if (kind == "batch" and batch == seq) or (kind == "tool_update" and json.loads(data)[0] == seq):
+                return mapped[node]
+        return None
+
     attempts = {}
     for identifier, parent, data in db.execute(
         "SELECT id,parent,payload FROM session_usage_attempts WHERE session = ? ORDER BY id", (session,),
@@ -705,11 +814,17 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
             if kind == "compact":
                 cut, summary, native = payload
                 portable_cut, portable_summary = cut, summary
+                preserve = None
                 if native and "portable_first_kept" in native:
                     portable_cut, portable_summary = native["portable_first_kept"], native["portable_summary"]
                     native = {**native, "portable_first_kept": anchor(portable_cut, parent)}
                 if native and "replay_through" in native:
-                    native = {**native, "replay_through": anchor(native["replay_through"], parent)}
+                    native = {**native, "replay_through": replay_anchor(native["replay_through"], parent)}
+                if native and native.get("provider") and "items" in native:
+                    preserve = {**native.pop("source_fields", {}), "provider": native["provider"],
+                                "replacementHistory": native.pop("items")}
+                    if "display_first_kept" in native:
+                        native["display_first_kept"] = anchor(native["display_first_kept"], parent)
                 if native and "snapcompact" in native:
                     portable_summary += "\n\n" + native["snapcompact"]["text"].replace("█", "\n").replace("\x0e", "").replace("\x0f", "")
                 elif native and "portable_archive" in native:
@@ -717,6 +832,10 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                 record = {"type": "compaction", "summary": portable_summary,
                           "firstKeptEntryId": anchor(portable_cut, parent) or "", "tokensBefore": 0,
                           "miniPi": {"native": native, "cut": anchor(cut, parent), "summary": summary}}
+                if preserve is not None:
+                    record.update(summary=summary, firstKeptEntryId=native.get("display_first_kept") or "",
+                                  providerReplayThroughEntryId=native["replay_through"],
+                                  preserveData={RESPONSES_PRESERVE_KEYS[0]: preserve})
                 if native:
                     record.update({key: native[key] for key in ("tokensBefore", "tokensAfter", "warning") if key in native})
                 if native and native.get("method") == "handoff":

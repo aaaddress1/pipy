@@ -312,6 +312,14 @@ def checkpoint(db, session, leaf):
     return (json.loads(payload) + 1, "", None) if kind == "reset" else json.loads(payload)
 
 
+def has_late_tool_results(db, session, leaf, covered):
+    return db.execute(ANCESTORS + """
+        , path AS (SELECT n.id,n.kind,n.payload FROM ancestry a JOIN session_nodes n ON n.id=a.id)
+        SELECT 1 FROM path WHERE kind='tool_update' AND json_extract(payload,'$[0]')<=?
+        AND id > (SELECT max(id) FROM path WHERE kind='compact') LIMIT 1
+    """, (leaf, session, session, covered)).fetchone() is not None
+
+
 def transcript_boundary(db, session, leaf):
     row = db.execute(ANCESTORS + """
         SELECT n.id,n.payload FROM ancestry a JOIN session_nodes n ON n.id=a.id
@@ -370,7 +378,8 @@ def fork(db, source, target, leaf, workspace, timestamp, *, whole):
     def translate(cut, parent):
         if cut in batches:
             return batches[cut]
-        return batches[first_batch_at(db, source, parent, cut)]
+        first = first_batch_at(db, source, parent, cut)
+        return batches[first] if first is not None else batches[last_batch(db, source, parent)] + 1
 
     for identifier, parent, kind, seq, data in entries:
         payload = json.loads(data) if data else None
@@ -382,6 +391,8 @@ def fork(db, source, target, leaf, workspace, timestamp, *, whole):
             cut, summary, native = payload
             if native and "portable_first_kept" in native:
                 native["portable_first_kept"] = translate(native["portable_first_kept"], parent)
+            if native and "display_first_kept" in native:
+                native["display_first_kept"] = batches[native["display_first_kept"]]
             if native and "replay_through" in native:
                 native["replay_through"] = batches[native["replay_through"]]
                 cut = native["replay_through"] + 1

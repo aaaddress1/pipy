@@ -41,12 +41,25 @@ def responses_replay_scope(route):
     return [route.api, route.provider(), route.endpoint(), route.auth, route.upstream]
 
 
+def responses_replacement_tokens(items):
+    return tokens([{key: value for key, value in item.items() if key != "encrypted_content"} for item in items])
+
+
 def responses_replay_matches(native, route):
     if isinstance(route, str):
         return native.get("route") == route
-    return native.get("route") == route.identity() or (
-        route.api in RESPONSES_APIS and native.get("scope") == responses_replay_scope(route)
-    )
+    if route.api not in RESPONSES_APIS:
+        return False
+    if native.get("route") == route.identity() or native.get("scope") == responses_replay_scope(route):
+        return True
+    if not (provider := native.get("provider")):
+        return False
+    named_provider = route.broker_provider or (route.catalog_model or {}).get("provider")
+    if not named_provider:
+        named_provider = {"https://api.openai.com/v1": "openai", "https://chatgpt.com/backend-api": "openai-codex"}.get(
+            route.endpoint(), route.provider(),
+        )
+    return provider == named_provider
 
 
 def paused_turn(message):
@@ -187,6 +200,11 @@ class Session:
             native = db.execute("SELECT payload FROM native_compactions WHERE session = ?", (session_id,)).fetchone()
             self.native_summary = json.loads(native[0]) if native else None
             self.leaf = graph.initialize_session(db, session_id, self.first_kept, self.summary, self.native_summary)
+            from session_jsonl import upgrade_responses_compactions
+
+            if upgrade_responses_compactions(db, session_id):
+                self.first_kept, self.summary, self.native_summary = graph.checkpoint(db, session_id, self.leaf)
+                graph.projection(db, session_id, self.first_kept, self.summary, self.native_summary)
             self.reset_node, self.transcript_start = graph.transcript_boundary(db, session_id, self.leaf)
             self.prompt_cache_key = graph.cache_key(db, session_id, self.reset_node)
             self.batches = self.read_batches(db, self.first_kept)
@@ -312,14 +330,24 @@ class Session:
         with database(self.path) as db:
             return summary, start, self.read_batches(db, start, self.first_kept)
 
+    @session_write
     def restore_portable(self, route):
-        native = self.native_summary
-        if native and "items" in native and not responses_replay_matches(native, route):
-            summary, start, archived = self.archived_responses_prefix()
-            archive = native.get("portable_archive")
-            metadata = {"snapcompact": archive} if archive else native.get("portable_handoff")
-            self.compact(start, summary, metadata)
-            self.batches[:0] = archived
+        # Route selection changes the model's view of the checkpoint, not the journal.
+        with database(self.path) as db:
+            cut, summary, native = graph.checkpoint(db, self.id, self.leaf)
+            if not native or "items" not in native:
+                return
+            split_tool = native.get("provider") and graph.has_late_tool_results(db, self.id, self.leaf, cut - 1)
+            if split_tool or not responses_replay_matches(native, route):
+                cut, summary = native["portable_first_kept"], native["portable_summary"]
+                archive = native.get("portable_archive")
+                native = {"snapcompact": archive} if archive else native.get("portable_handoff")
+            if (cut, summary, native) == (self.first_kept, self.summary, self.native_summary):
+                return
+            self.batches = self.read_batches(db, cut)
+        self.first_kept, self.summary, self.native_summary = cut, summary, native
+        self._archive_view = None
+        self._rollover_request = UNREAD
 
     def configure_archive(self, route, shape, threshold):
         self.archive_route = route
@@ -774,7 +802,7 @@ class Session:
             if not any(part["type"] == "image_url" for part in blocks):
                 content = "\n".join(part["text"] for part in content)
             head.append({"role": "user", "content": content})
-        elif summary:
+        elif summary or native and ("items" in native or "block" in native):
             context = summary if method == ROLLOVER else handoff.CONTEXT.replace("{{summary}}", summary) if method == "handoff" else (
                 "Summary of earlier conversation. Build on prior work without repeating it. "
                 "Follow the latest user request and carry forward constraints on unfinished work. "

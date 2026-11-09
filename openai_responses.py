@@ -30,7 +30,7 @@ from recovery import (
     ContextWindowExceeded, EmptyTurn, IncompleteTurn, ResponsesBodyReadTimeout, StreamInterrupted, TRANSPORT_ERRORS,
     context_overflow, retry_after,
 )
-from runtime import CompactionSummary, responses_replay_matches, responses_replay_scope, tokens
+from runtime import CompactionSummary, responses_replacement_tokens, responses_replay_matches, responses_replay_scope
 from snapcompact import responses_content
 from snapcompact_inline import stb_messages
 
@@ -188,11 +188,10 @@ def compaction_summary(route, items):
         for item in items
     ):
         raise RuntimeError("Responses did not return a compaction item.")
-    replacement_tokens = tokens([{key: value for key, value in item.items() if key != "encrypted_content"} for item in items])
     return CompactionSummary(
         "[Earlier conversation compacted by the Responses provider.]",
         {"route": route.identity(), "scope": responses_replay_scope(route), "items": items,
-         "replacement_tokens": replacement_tokens},
+         "replacement_tokens": responses_replacement_tokens(items)},
     )
 
 
