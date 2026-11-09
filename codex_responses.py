@@ -284,10 +284,10 @@ class CodexSocket(ResponsesSocket):
         self.accepted_steers = []
         self.steer_frames = deque()
 
-    async def disconnect(self):
+    async def disconnect(self, *, abort=False):
         self.accepted_steers.clear()
         self.steer_frames.clear()
-        await super().disconnect()
+        await super().disconnect(abort=abort)
 
     async def upgrade_headers(self, headers):
         return await codex_attestation.upgrade_headers(headers, self.http_url)
@@ -318,7 +318,7 @@ class CodexSocket(ResponsesSocket):
             self.models_etag = value
 
     @contextmanager
-    def exchange(self, body, headers, identity, *, lite=False, compaction=False, live_source=None, vision=True):
+    def exchange(self, body, headers, identity, *, lite=False, compaction=False, live_source=None, vision=True, watch=None):
         if self.sse_only or not self.lock.acquire(blocking=False):
             yield None
             return
@@ -337,7 +337,7 @@ class CodexSocket(ResponsesSocket):
                 upgrade[MODELS_ETAG] = self.models_etag
             connection = self.connection
             for attempt in range(self.connect_failure_limit):
-                if self.open(headers=list(upgrade.items()), connection_key=credentials):
+                if self.open(headers=list(upgrade.items()), connection_key=credentials, watch=watch):
                     break
                 if self.sse_only:
                     yield None
@@ -356,13 +356,13 @@ class CodexSocket(ResponsesSocket):
             wire = {**body, "stream": True, "client_metadata": metadata}
 
             def reopen():
-                if not self.open(headers=list(upgrade.items()), connection_key=credentials):
+                if not self.open(headers=list(upgrade.items()), connection_key=credentials, watch=watch):
                     raise httpx.RemoteProtocolError("Could not reopen the Codex steering socket.")
 
             steering = (SteerExchange(self, live_source, lite, vision, reopen)
                         if live_source is not None or self.accepted_steers else None)
             with closing(self.events(wire, normalize=OutputItems().normalize, retain_baseline=not compaction,
-                                     steering=steering)) as stream:
+                                     steering=steering, watch=watch)) as stream:
                 yield stream
         finally:
             self.lock.release()

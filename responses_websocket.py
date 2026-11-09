@@ -13,6 +13,7 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.protocol import State
 
 from cancellable_http import active_turn
+from stream_watchdog import RESPONSES_PROGRESS, StreamDeadline
 
 
 UNSUPPORTED_UPGRADE = frozenset((404, 405, 426, 501))
@@ -87,17 +88,19 @@ class ResponsesSocket:
         self.connect_failures = self.stale_anchors = 0
         self.sse_only = False
 
-    async def disconnect(self):
+    async def disconnect(self, *, abort=False):
         if self.timer:
             self.timer.cancel()
             self.timer = None
         connection, self.connection = self.connection, None
         self.connected_headers = self.baseline = None
-        if connection:
+        if connection and abort:
+            connection.transport.abort()
+        elif connection:
             await connection.close()
 
-    def close(self):
-        self.loop.call(self.disconnect())
+    def close(self, *, abort=False):
+        self.loop.call(self.disconnect(abort=abort))
 
     async def connect(self, headers, connection_key):
         if self.timer:
@@ -120,22 +123,24 @@ class ResponsesSocket:
         response = httpx.Response(status, headers=headers, request=httpx.Request("POST", self.http_url))
         return APIStatusError(body.get("message") or f"Responses WebSocket HTTP {status}.", response=response, body=body)
 
-    def open(self, *, headers=None, connection_key=None):
+    def open(self, *, headers=None, connection_key=None, watch=None):
         if self.sse_only:
             return False
         if headers is None:
             headers = self.headers()
         if connection_key is None:
             connection_key = headers
+        if watch:
+            watch.arm("first", watch.first)
         try:
-            self.loop.call(self.connect(headers, connection_key), active_turn())
+            self.loop.call(self.connect(headers, connection_key), watch or active_turn())
         except InvalidStatus as error:
             status = error.response.status_code
             if status not in UNSUPPORTED_UPGRADE:
                 raise self.status_error(status, headers=list(error.response.headers.raw_items())) from None
             self.sse_only = True
             return False
-        except (OSError, TimeoutError, WebSocketException):
+        except (OSError, TimeoutError, WebSocketException, StreamDeadline):
             self.connect_failures += 1
             self.sse_only = self.connect_failures >= self.connect_failure_limit
             return False
@@ -169,13 +174,14 @@ class ResponsesSocket:
             raise httpx.RemoteProtocolError("Responses WebSocket sent an invalid event.")
         return event
 
-    def events(self, body, *, normalize=None, retain_baseline=True, steering=None):
-        turn = active_turn()
+    def events(self, body, *, normalize=None, retain_baseline=True, steering=None, watch=None):
+        turn = watch or active_turn()
+        timeout = None if watch else self.receive_seconds
         request = {**body, "type": "response.create"}
         baseline, self.baseline = self.baseline, None
         delta = self.append_input(baseline, request) if self.chain and self.stale_anchors < self.stale_anchor_limit else None
         wire = {**request, "previous_response_id": baseline[0], "input": delta} if delta is not None else request
-        ended = False
+        ended = expired = False
         try:
             if steering:
                 wire, delta = steering.start(request, wire, delta)
@@ -183,7 +189,9 @@ class ResponsesSocket:
                 self.send(wire, turn)
             first = True
             while True:
-                event = steering.receive(turn) if steering else self.receive(turn, self.receive_seconds)
+                event = steering.receive(turn, timeout) if steering else self.receive(turn, timeout)
+                if watch:
+                    watch.observe(event["type"] in RESPONSES_PROGRESS)
                 if steering and steering.control(event):
                     continue
                 if normalize:
@@ -229,6 +237,9 @@ class ResponsesSocket:
                     yield event
                     return
                 yield event
+        except StreamDeadline:
+            expired = True
+            raise
         except (OSError, TimeoutError, WebSocketException) as error:
             raise httpx.RemoteProtocolError("Responses WebSocket closed before completion.") from error
         finally:
@@ -239,4 +250,4 @@ class ResponsesSocket:
                 if ended:
                     self.loop.call(self.arm_idle())
                 else:
-                    self.close()
+                    self.close(abort=expired)

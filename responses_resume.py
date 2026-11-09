@@ -5,6 +5,7 @@ import time
 from concurrent.futures import CancelledError
 
 import httpx
+from stream_watchdog import RESPONSES_PROGRESS
 from openai import APIConnectionError, APIError, APIStatusError
 
 from cancellable_http import active_turn
@@ -104,15 +105,16 @@ def replay(response, message):
            "_resumed_message": message, "_resumed_thinking": "\n".join(thoughts)}
 
 
-def events(client, stream, prepare):
+def events(client, stream, prepare, watch):
     identifier = None
     thinking, unsafe, terminal = False, False, False
     failure = None
     try:
-        with stream:
+        with stream, watch.reading():
             for incoming in stream:
                 event = incoming.to_dict()
                 kind = event["type"]
+                watch.observe(kind in RESPONSES_PROGRESS)
                 if kind == "response.created":
                     identifier = event["response"].get("id")
                 elif kind in TERMINAL:

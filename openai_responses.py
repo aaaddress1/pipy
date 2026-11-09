@@ -4,7 +4,7 @@ import json
 import sys
 import time
 from concurrent.futures import CancelledError
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from hashlib import sha256
@@ -17,6 +17,7 @@ import model_catalog
 import codex_responses
 import responses_cache
 import responses_resume
+import stream_watchdog
 from responses_tools import ITEM_EVENTS, TOOL_EVENTS, TOOL_ITEMS, StreamedTools
 from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
@@ -222,9 +223,12 @@ def compaction_sse(lines):
 
 
 @contextmanager
-def raw_response(client, body, endpoint, headers):
-    response = client.post(endpoint, body={**body, "stream": True}, options={"headers": headers},
-                           cast_to=httpx.Response, stream=True)
+def raw_response(client, body, endpoint, headers, watch=None):
+    if watch:
+        client = watch.client(client)
+    with watch.opening() if watch else nullcontext():
+        response = client.post(endpoint, body={**body, "stream": True}, options={"headers": headers},
+                               cast_to=httpx.Response, stream=True)
     with closing(response):
         yield response
 
@@ -507,7 +511,7 @@ def completed_message(response, route, model, fingerprint):
 
 @contextmanager
 def response_events(client, body, websocket, *, codex_route=None, identity=None, live_source=None, effort_control=None,
-                    http_chain=None, prepare_resumed=None, breakpoint=None):
+                    http_chain=None, prepare_resumed=None, breakpoint=None, route=None):
     if codex_route:
         lite = codex_responses.lite_enabled(codex_route)
         codex_responses.request_shape(codex_route, body, lite=lite)
@@ -516,31 +520,43 @@ def response_events(client, body, websocket, *, codex_route=None, identity=None,
         headers = identity.decorate(body, lite=lite)
         endpoint = codex_responses.endpoint(codex_route.endpoint())
         with closing(codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source,
-                                       codex_route.vision)) as stream:
+                                       codex_route.vision, codex_route)) as stream:
             yield stream
         return
     if effort_control:
         effort_control.apply(body)
     if websocket is not None and not websocket.sse_only and http_chain:
         http_chain.reset()
-    if websocket is not None and websocket.open():
-        with closing(websocket.events(responses_cache.mark(body, breakpoint))) as stream:
+    limits = stream_watchdog.timing(route)
+    watch = stream_watchdog.Watchdog("Responses WebSocket", limits)
+    if websocket is not None and websocket.open(watch=watch):
+        with closing(websocket.events(responses_cache.mark(body, breakpoint), watch=watch)) as stream:
             yield stream
     elif http_chain:
-        with closing(chained_http_events(client, body, http_chain, prepare_resumed, breakpoint)) as stream:
+        with closing(chained_http_events(client, body, http_chain, prepare_resumed, breakpoint, limits)) as stream:
             yield stream
     else:
-        with closing(http_events(client, responses_cache.mark(body, breakpoint), prepare_resumed)) as stream:
+        with closing(http_events(client, responses_cache.mark(body, breakpoint), prepare_resumed, limits)) as stream:
             yield stream
 
 
-def http_events(client, body, prepare_resumed):
-    stream = client.responses.create(**sdk_body(body), stream=True)
+def http_events(client, body, prepare_resumed, limits):
+    watch = stream_watchdog.Watchdog("Responses stream", limits)
+    client = watch.client(client)
+    with watch.opening():
+        stream = client.responses.create(**sdk_body(body), stream=True)
     if prepare_resumed and body.get("store") is True:
-        yield from responses_resume.events(client, stream, prepare_resumed)
-    else:
-        with stream:
-            yield from (event.to_dict() for event in stream)
+        yield from responses_resume.events(client, stream, prepare_resumed, watch)
+        return
+    with stream:
+        yield from timed_response_events((event.to_dict() for event in stream), watch)
+
+
+def timed_response_events(events, watch):
+    with watch.reading():
+        for event in events:
+            watch.observe(event.get("type") in stream_watchdog.RESPONSES_PROGRESS)
+            yield event
 
 
 def event_type(event):
@@ -552,12 +568,12 @@ def event_type(event):
     return kind
 
 
-def chained_http_events(client, body, chain_state, prepare_resumed=None, breakpoint=None):
+def chained_http_events(client, body, chain_state, prepare_resumed=None, breakpoint=None, limits=(300, 300)):
     full, wire = chain_state.request(body, breakpoint)
     for attempt in range(2):
         first = True
         try:
-            with closing(http_events(client, wire, prepare_resumed)) as stream:
+            with closing(http_events(client, wire, prepare_resumed, limits)) as stream:
                 for event in stream:
                     kind = event_type(event)
                     response = event.get("response") or {}
@@ -582,13 +598,15 @@ def chained_http_events(client, body, chain_state, prepare_resumed=None, breakpo
         full = wire = responses_cache.mark({**body, "store": not chain_state.zero_retention}, breakpoint)
 
 
-def codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source, vision):
+def codex_live_events(client, body, endpoint, headers, identity, websocket, lite, live_source, vision, route=None):
     if websocket:
         saved = identity.state, websocket.models_etag
         for attempt in range(codex_responses.WEBSOCKET_RETRIES + 1):
             exposed = False
             try:
-                with websocket.exchange(body, headers, identity, lite=lite, live_source=live_source, vision=vision) as stream:
+                watch = stream_watchdog.Watchdog("Codex WebSocket", stream_watchdog.timing(route, codex_socket=True))
+                with websocket.exchange(body, headers, identity, lite=lite, live_source=live_source,
+                                        vision=vision, watch=watch) as stream:
                     if stream is None:
                         break
                     for event in stream:
@@ -602,7 +620,7 @@ def codex_live_events(client, body, endpoint, headers, identity, websocket, lite
                         )
                         yield event
                 return
-            except (httpx.RemoteProtocolError, APIStatusError) as error:
+            except (httpx.RemoteProtocolError, APIStatusError, stream_watchdog.StreamDeadline) as error:
                 code = getattr(error, "code", None)
                 native_lane = code == "unsupported_native_inflight_message"
                 if isinstance(error, APIStatusError) and not native_lane and code != "websocket_connection_limit_reached":
@@ -611,6 +629,8 @@ def codex_live_events(client, body, endpoint, headers, identity, websocket, lite
                     websocket.steering_unsupported = True
                 if exposed:
                     websocket.sse_only = True
+                    if isinstance(error, stream_watchdog.StreamDeadline):
+                        raise
                     raise httpx.RemoteProtocolError("Codex WebSocket interrupted streamed output.") from error
                 if native_lane:
                     saved = None, None
@@ -620,9 +640,10 @@ def codex_live_events(client, body, endpoint, headers, identity, websocket, lite
                     websocket.sse_only = True
                     break
                 codex_responses.websocket_backoff(attempt + 1)
-    with raw_response(client, body, endpoint, headers) as response:
+    watch = stream_watchdog.Watchdog("Codex SSE stream", stream_watchdog.timing(route))
+    with raw_response(client, body, endpoint, headers, watch) as response:
         identity.observe(response.headers)
-        yield from codex_events(compaction_sse(response.iter_lines()), identity, response)
+        yield from timed_response_events(codex_events(compaction_sse(response.iter_lines()), identity, response), watch)
 
 
 def codex_events(frames, identity, transport):
@@ -672,7 +693,7 @@ def stream_attempt(
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
                              live_source=live_source, effort_control=effort_control, http_chain=http_chain,
-                             prepare_resumed=prepare_resumed, breakpoint=breakpoint) as stream:
+                             prepare_resumed=prepare_resumed, breakpoint=breakpoint, route=route) as stream:
             for event in stream:
                 if cancel:
                     cancel()
@@ -782,7 +803,8 @@ def stream_attempt(
                 "Responses context window exceeded.", text="".join(visible), tool_draft=tool_draft, usage=usage,
             ) from error
         raise StreamInterrupted(
-            f"Responses stream interrupted ({type(error).__name__}).",
+            str(error) if isinstance(error, stream_watchdog.StreamDeadline)
+            else f"Responses stream interrupted ({type(error).__name__}).",
             text="".join(visible), tool_draft=tool_draft, usage=usage,
         ) from error
     finally:

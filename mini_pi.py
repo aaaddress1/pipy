@@ -38,6 +38,7 @@ from openai import AsyncOpenAI, OpenAIError
 import anthropic_messages
 import codex_responses
 import chat_stream
+import stream_watchdog
 from async_jobs import AsyncJobs, tool_result
 from services import Services, normalize_readiness
 from service_runtime import NAME as SERVICE_NAME
@@ -417,7 +418,7 @@ def stream_reply(
                                     if key not in ("codex_turn", "live_source", "effort_control", "http_chain")}
                     result = stream_attempt(client, model, messages, schemas, chat_options, guard, show, tool_choice, cancel, turn,
                                             usage_observer=observer, tracker=tracker, on_text=on_text, speculation=speculation,
-                                            heal_dsml=heal_dsml)
+                                            heal_dsml=heal_dsml, limits=stream_watchdog.timing(native_route))
             if heal_dsml and dsml.clean_message(result[0]):
                 if not result[0].get("tool_calls") and not result[0].get("_stop_details") and tool_choice not in ("none", "auto"):
                     result[0]["_dsml_leak"] = True
@@ -465,7 +466,7 @@ def stream_reply(
 
 
 def stream_attempt(client, model, messages, schemas, options, guard, show, tool_choice=None, cancel=None, turn=None,
-                   *, usage_observer=None, tracker=None, on_text=None, speculation=None, heal_dsml=False):
+                   *, usage_observer=None, tracker=None, on_text=None, speculation=None, heal_dsml=False, limits=(300, 300)):
     text, thinking, calls, finish, usage = [], [], {}, None, None
     cached_tokens_header = upstream_provider = None
     native_failure = None
@@ -503,7 +504,7 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
             guard.push(None, tail, bool(calls))
             emit_text(tail)
 
-    stream = chat_stream.ChatStream(client, model=model, messages=chat_tool_images(messages),
+    stream = chat_stream.ChatStream(client, limits, model=model, messages=chat_tool_images(messages),
                                     stream_options={"include_usage": True}, **tool_options, **options)
     try:
         with stream:
@@ -568,17 +569,11 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
             finish_markup()
             if finish:
                 guard.finish()
-    except CancelledError:
-        if stream.parent:
-            stream.parent.check()
-        if not finish or not stream.signal.event.is_set():
-            raise
-        finish_markup()
-        guard.finish()
     except TRANSPORT_ERRORS as error:
         if not finish:
             raise StreamInterrupted(
-                f"Provider stream interrupted ({type(error).__name__}).",
+                str(error) if isinstance(error, stream_watchdog.StreamDeadline)
+                else f"Provider stream interrupted ({type(error).__name__}).",
                 text="".join(text), tool_draft=bool(calls), usage=usage,
             ) from error
         finish_markup()

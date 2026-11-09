@@ -2,17 +2,16 @@
 
 import json
 from concurrent.futures import CancelledError
-from threading import Timer
 
 import httpx
 from openai import APIError
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
 
-from cancellable_http import active_turn, sse_frames, turn_scope
-from handoff import Cancellation
+from cancellable_http import sse_frames
 from observed_usage import field
 from recovery import TRANSPORT_ERRORS
+from stream_watchdog import Watchdog
 
 
 TERMINAL_GRACE = 2.5
@@ -48,26 +47,35 @@ def choice_usage(choice):
     return None
 
 
+def progress(data):
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    delta = choice.get("delta")
+    native = choice.get("native_finish_reason")
+    return (data.get("usage") is not None or choice.get("usage") is not None
+            or bool(choice.get("finish_reason")) or isinstance(native, str) and native.upper() in NATIVE_FAILURES
+            or isinstance(delta, dict) and any(delta.get(key) for key in (
+                "content", "refusal", "reasoning", "reasoning_content", "reasoning_text", "tool_calls", "function_call",
+            )))
+
+
 class ChatStream:
-    def __init__(self, client, **request):
+    def __init__(self, client, limits, **request):
         self.client, self.request = client, request
-        self.parent = active_turn()
-        self.signal = Cancellation(self.parent, reason="Chat Completions terminal grace elapsed.")
-        self.timer = None
+        self.signal = Watchdog("Chat Completions stream", limits)
         self.done = self.detached = False
 
     def __enter__(self):
-        with turn_scope(self.signal):
-            self.stream = self.client.chat.completions.create(stream=True, **self.request)
+        client = self.signal.client(self.client)
+        with self.signal.opening():
+            self.stream = client.chat.completions.create(stream=True, **self.request)
         self.response = self.stream.response
         self.frames = sse_frames(self.response.iter_lines())
         return self
 
     def mark_finished(self):
-        if self.timer is None:
-            self.timer = Timer(TERMINAL_GRACE, self.signal.cancel)
-            self.timer.daemon = True
-            self.timer.start()
+        if self.signal.phase != "terminal":
+            self.signal.arm("terminal", TERMINAL_GRACE)
 
     def __iter__(self):
         for name, payload in self.frames:
@@ -78,6 +86,7 @@ class ChatStream:
             data = json.loads(payload)
             if not isinstance(data, dict):
                 raise ValueError("Chat Completions SSE event must be an object.")
+            self.signal.observe(progress(data))
             if name == "error" or data.get("error"):
                 error = data.get("error") or data
                 message = error.get("message") if isinstance(error, dict) else None
@@ -106,9 +115,6 @@ class ChatStream:
             self.close()
 
     def close(self):
-        if self.timer:
-            self.timer.cancel()
-            self.timer.join()
         self.stream.close()
 
     def __exit__(self, *_):

@@ -60,11 +60,28 @@ class TransportLoop:
         return self
 
     def call(self, coroutine, turn=None):
+        budget = getattr(turn, "network_budget", None)
+        if budget is not None:
+            try:
+                turn.check()
+            except BaseException:
+                coroutine.close()
+                raise
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
         try:
             if turn:
                 with turn.network_call(future):
-                    return future.result()
+                    if budget is None:
+                        return future.result()
+                    try:
+                        return future.result(timeout=budget())
+                    except TimeoutError as error:
+                        if not future.done():
+                            future.cancel()
+                            turn.check()
+                            raise turn.deadline_error() from error
+                        turn.check()
+                        raise
             return future.result()
         except KeyboardInterrupt:
             future.cancel()
@@ -130,6 +147,8 @@ class CancellableTransport(httpx.BaseTransport):
         turn = _turn.get()
         if turn:
             turn.check()
+            if start := getattr(turn, "start_request", None):
+                start()
         outbound = httpx.Request(
             request.method, request.url, headers=request.headers.raw, content=request.read(),
             extensions=request.extensions.copy(),

@@ -144,19 +144,20 @@ class SteerExchange:
         self.stopped = True
         self.uncertain |= uncertain
 
-    def receive(self, turn):
-        deadline = monotonic() + self.socket.receive_seconds
+    def receive(self, turn, timeout):
+        deadline = monotonic() + timeout if timeout is not None else None
         while True:
             self.submit(turn)
             if self.socket.steer_frames:
                 return self.socket.steer_frames.popleft()
-            remaining = deadline - monotonic()
-            if remaining <= 0:
+            remaining = deadline - monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
                 raise TimeoutError("Codex response timed out.")
             polling = self.pending is not None or (self.source is not None and self.response_id is not None
                                                     and not self.stopped and not self.socket.steering_unsupported)
             try:
-                return self.socket.receive(turn, min(0.1, remaining) if polling else remaining)
+                wait = (min(0.1, remaining) if remaining is not None else 0.1) if polling else remaining
+                return self.socket.receive(turn, wait)
             except TimeoutError:
                 if not polling:
                     raise
