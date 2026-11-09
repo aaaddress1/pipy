@@ -3511,6 +3511,7 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
             from btw_panel import BtwPanel
             from omfg_panel import OmfgPanel
             from terminal_turn import TerminalLane
+            from todo_hud import TodoHUD
 
             editor = PromptSession()
             editor.app.min_redraw_interval = .04
@@ -3532,8 +3533,12 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="mini-pi-terminal") as main_worker,
                 ThreadPoolExecutor(max_workers=2, thread_name_prefix="mini-pi-omfg") as side_workers,
             ):
+                delay = layered_setting(maintenance_layers, "tasks.todoClearDelay", 60)
+                hud = TodoHUD(todo, delay if number(delay) else 60, editor.app.invalidate)
                 terminal_lane = TerminalLane(editor, main_worker, run_task, run_budget, flow_settings,
-                                             jobs.notify if jobs else None, goal_status=goal_status)
+                                             jobs.notify if jobs else None, goal_status=goal_status, todo_hud=hud)
+                if tasks:
+                    tasks.observer = hud.observe
                 panel = OmfgPanel(
                     editor, side_workers, workspace, args.task_user_dir.parent, run_budget, prepare_rule_request,
                     lambda: (partial(rule_outputs, session.leaf), partial(judge_rule_output, mode=rules.judge_mode)),
@@ -3547,6 +3552,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         terminal_lane.submit(TerminalWork(args.goal.strip(), expand_prompt=False))
                     return interactive_loop(editor, panel, side)
                 finally:
+                    if tasks:
+                        tasks.observer = None
+                    hud.close()
                     terminal_lane.abort()
                     panel.cancel()
 
@@ -3730,6 +3738,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 if command[:1] == ["/todo"]:
                     try:
                         arguments = command[1] if len(command) > 1 else ""
+                        if lane and arguments.strip().lower() in ("expand", "collapse"):
+                            lane.todo_hud.expand(arguments.strip().lower() == "expand")
+                            continue
                         if lane and arguments.strip().lower() not in ("", "view", "copy", "help", "?"):
                             with lane.lock:
                                 if lane.busy():

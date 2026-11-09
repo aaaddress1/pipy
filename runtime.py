@@ -57,7 +57,7 @@ def portable_message(message, thinking_route=None):
                "_mcp_notification", "_input_transformations", "_chat_thinking_route", "_irc_messages", "_service_runs",
                "_ttsr_rules", "_ttsr_kind", "_ttsr_aborted", "_tool_stop", "_stop_details", "_pause_exhausted", "_dsml_leak",
                "_thinking_loop_redirect", "_tool_pruned_at", "_tool_useless", "_session_transfer", "_goal_message",
-               "_todo_message", "_todo_snapshot")
+               "_todo_message", "_todo_snapshot", "_todo_entry_id")
     if thinking_route and message.get("_chat_thinking_route") == thinking_route and message.get("_thinking"):
         return {**{key: value for key, value in message.items() if key not in private},
                 "reasoning_content": message["_thinking"]}
@@ -455,6 +455,10 @@ class Session:
         return json.loads(row[0]) if row else {}
 
     def todo_snapshots(self):
+        for _, _, _, phases in self.todo_records():
+            yield phases
+
+    def todo_records(self):
         with database(self.path) as db:
             rows = db.execute(graph.ANCESTORS + """
                 , tool_results(node, position, message) AS (
@@ -466,23 +470,58 @@ class Session:
                     UNION ALL
                     SELECT n.id, 0, json_extract(n.payload, '$[2]')
                     FROM ancestry a JOIN session_nodes n ON n.id = a.id WHERE n.kind = 'tool_update'
-                ), snapshots(node, position, phases) AS (
-                    SELECT node, position, json_extract(message, '$._tool_details.phases') FROM tool_results
+                ), snapshots(node, position, entry, phases) AS (
+                    SELECT node, position, json_extract(message, '$._todo_entry_id'),
+                           json_extract(message, '$._tool_details.phases') FROM tool_results
                     WHERE json_extract(message, '$._todo_snapshot') = 1
                     UNION ALL
-                    SELECT n.id, 0, json_extract(n.payload, '$.data.phases')
+                    SELECT n.id, 0, json_extract(n.payload, '$.id'), json_extract(n.payload, '$.data.phases')
                     FROM ancestry a JOIN session_nodes n ON n.id = a.id
                     WHERE n.kind = 'foreign' AND json_extract(n.payload, '$.type') = 'custom'
                       AND json_extract(n.payload, '$.customType') = 'user_todo_edit'
                 )
-                SELECT phases FROM snapshots WHERE phases IS NOT NULL ORDER BY node DESC, position DESC
-            """, (self.leaf, self.id, self.id))
-            for phases, in rows:
+                SELECT t.node, t.position, COALESCE(s.source_id, t.entry), t.phases FROM snapshots t
+                LEFT JOIN session_entry_sources s ON s.node = t.node AND s.session = ?
+                WHERE t.phases IS NOT NULL ORDER BY t.node DESC, t.position DESC
+            """, (self.leaf, self.id, self.id, self.id))
+            for node, position, entry, phases in rows:
                 if isinstance(phases, str):
                     try:
-                        yield json.loads(phases)
+                        yield node, position, entry, json.loads(phases)
                     except ValueError:
                         continue
+
+    @session_write
+    def identify_todo(self, node, position):
+        entry = uuid4().hex
+        with database(self.path) as db:
+            kind, seq = db.execute("SELECT kind,batch FROM session_nodes WHERE session = ? AND id = ?",
+                                   (self.id, node)).fetchone()
+            if kind == "batch":
+                db.execute("UPDATE batches SET messages=json_set(messages, ?, ?) WHERE session=? AND seq=?",
+                           (f"$[{position}]._todo_entry_id", entry, self.id, seq))
+            else:
+                key = "$[2]._todo_entry_id" if kind == "tool_update" else "$.id"
+                db.execute("UPDATE session_nodes SET payload=json_set(payload, ?, ?) WHERE session=? AND id=?",
+                           (key, entry, self.id, node))
+        return entry
+
+    def todo_hud_visibility(self, entry, fingerprint):
+        with database(self.path) as db:
+            row = db.execute(graph.ANCESTORS + """
+                SELECT json_extract(n.payload, '$.data.visibility')
+                FROM ancestry a JOIN session_nodes n ON n.id = a.id
+                WHERE n.kind = 'foreign' AND json_extract(n.payload, '$.customType') = 'todo_hud_state'
+                  AND json_extract(n.payload, '$.data.sourceEntryId') = ?
+                  AND json_extract(n.payload, '$.data.fingerprint') = ?
+                  AND json_extract(n.payload, '$.data.visibility') IN ('revealed','dismissed')
+                ORDER BY n.id DESC LIMIT 1
+            """, (self.leaf, self.id, self.id, entry, fingerprint)).fetchone()
+        return row[0] if row else None
+
+    def ancestor_ids(self):
+        with database(self.path) as db:
+            return graph.ancestor_ids(db, self.id, self.leaf)
 
     def last_thinking_change(self):
         with database(self.path) as db:

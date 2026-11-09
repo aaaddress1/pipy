@@ -3,6 +3,7 @@
 import json
 from concurrent.futures import CancelledError, as_completed, wait
 from contextvars import copy_context
+from uuid import uuid4
 
 from cancellable_http import turn_scope
 from handoff import Cancellation
@@ -118,6 +119,7 @@ def execute(session, seq, batch, tools, executor, call_tool, *, turn=None, cance
         if (call["function"]["name"] == "todo" and isinstance(tools.get("todo"), Todos) and not result.get("_tool_error")
                 and committed_phases(result.get("_tool_details")) is not None):
             result["_todo_snapshot"] = True
+            result["_todo_entry_id"] = uuid4().hex
         try:
             session.update_tool_result(seq, index + 1, result)
         finally:

@@ -65,6 +65,10 @@ class PrelaunchedTask:
             return self.tasks.complete(self.task, result, data)
         except KeyboardInterrupt:
             self.cancel.cancel()
+            self.tasks.observe(self.task, "failed")
+            raise
+        except Exception:
+            self.tasks.observe(self.task, "failed")
             raise
 
     def discard(self):
@@ -468,6 +472,7 @@ class Tasks:
         self.dispatch_lock = Lock()
         self.resume_eval = None
         self.eval_tools = None
+        self.observer = None
 
     def tool(self, turn):
         string = {"type": "string"}
@@ -670,6 +675,15 @@ class Tasks:
             db.executemany("DELETE FROM speculative_task_roots WHERE session = ?", ((identifier,) for identifier in adopted))
         if self.peer:
             self.peer.bus.mark(*(task.sid for task in tasks))
+        for task in tasks:
+            self.observe(task, "running")
+
+    def observe(self, task, status):
+        if observer := self.observer:
+            try:
+                observer(task, status)
+            except (OSError, SQLiteError):
+                logger.exception("Unable to update the task display for %s", task.name)
 
     def revive(self, target):
         if not self.jobs or self.jobs.closed:
@@ -751,7 +765,13 @@ class Tasks:
         return task
 
     def execute(self, task, cancel, *, revived=False):
-        result, data = self.run_task(task, cancel, revived)
+        if revived:
+            self.observe(task, "running")
+        try:
+            result, data = self.run_task(task, cancel, revived)
+        except BaseException:
+            self.observe(task, "failed")
+            raise
         return self.complete(task, result, data)
 
     def complete(self, task, result, data):
@@ -760,6 +780,7 @@ class Tasks:
             with database(self.session.path) as db:
                 db.execute("UPDATE subagent_links SET result = ? WHERE child = ?", (pack({**result, "data": data}), task.sid))
             completed = result["status"] == "completed"
+            self.observe(task, result["status"])
             return result
         finally:
             if self.peer:

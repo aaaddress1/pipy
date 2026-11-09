@@ -124,6 +124,8 @@ uv run mini_pi.py ttsr scan src --json
 
 模型收尾時若還有可執行的待辦，系統會送出有限次提醒。等待使用者或背景工作的回合會延後提醒。`todo.reminders: false` 可關閉提醒，`todo.remindersMax` 可調整收尾提醒的上限。`todo.eager` 可設為 `preferred` 建議首次先建清單，或設為 `always` 在支援指定工具的模型上要求先呼叫 `todo`。 [上游待辦提醒](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/todo-tracker.ts)
 
+互動終端在輸入區上方顯示待辦 HUD。收合時保留目前階段、最近一項已結束工作和後續摘要。`/todo expand` 展開全部，`/todo collapse` 恢復摘要。低於 18 列的終端改用單行進度。相符的子代理工作會標為進行中，成功結束時會更新對應待辦。全部結束後，HUD 預設 60 秒後隱藏，清單仍可用 `/todo` 查看。可用 `tasks.todoClearDelay` 調整延遲，`-1` 表示持續顯示。隱藏和重新顯示都記在該筆待辦的分支日誌。 [上游 HUD 與自動隱藏](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/modes/interactive-mode.ts#L5163)
+
 ## 側對話 `/btw`
 
 輸入 `/btw <問題>` 可在目前上下文中開啟側對話。終端會串流顯示答案，也可同時編輯或提交主對話。單獨輸入 `/btw` 開啟歷史，用方向鍵和 `Enter` 瀏覽，`f` 追問，`c` 複製答案。`Esc` 可取消進行中的請求，並保留已收到的答案。歷史按工作階段保存在 `artifacts/<session>/btw-history/`。 [上游側回合生命週期](https://github.com/can1357/oh-my-pi/blob/24439066040e006eb08da7b204f0ac41c79d2de9/packages/coding-agent/src/session/btw-turn.ts)

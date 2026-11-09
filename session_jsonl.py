@@ -613,7 +613,7 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
         )
     }
 
-    def make(record, parent, source=None):
+    def make(record, parent, source=None, *, todo_entry=None):
         nonlocal index
         if source:
             identifier, metadata = source
@@ -621,6 +621,9 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
             if wire and isinstance(record.get("message"), dict):
                 record["message"].update(wire)
             record.update({key: value for key, value in metadata.items() if key != "message"})
+        elif todo_entry and todo_entry not in used_ids:
+            identifier = todo_entry
+            used_ids.add(identifier)
         else:
             while True:
                 index += 1
@@ -665,7 +668,8 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                     record["timestamp"] = payload["timestamp"]
                 if record["type"] == "branch_summary":
                     record["fromId"] = mapped.get(message.get("_branch_from_node")) or base or ""
-                entry = make(record, base, sources.get(identifier) if number == 0 else None)
+                entry = make(record, base, sources.get(identifier) if number == 0 else None,
+                             todo_entry=message.get("_todo_entry_id"))
                 base = entry["id"]
                 if number == 0:
                     anchors[seq] = base
@@ -701,7 +705,12 @@ def journal_entries(db, session, workspace, leaf, node_ids=None, *, header_id=No
                 record = {key: value for key, value in payload.items() if key != "activeLeafId"}
             else:
                 record = {"type": "custom", "customType": "mini-pi.route", "data": payload}
-            entry = make(record, base, sources.get(identifier))
+            todo_entry = None
+            if kind == "tool_update":
+                todo_entry = payload[2].get("_todo_entry_id")
+            elif kind == "foreign" and record.get("customType") == "user_todo_edit":
+                todo_entry = record.get("id")
+            entry = make(record, base, sources.get(identifier), todo_entry=todo_entry)
             base = entry["id"]
             if node_ids is not None:
                 node_ids[base] = identifier

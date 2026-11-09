@@ -13,12 +13,14 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.vt100 import Vt100_Output
+from prompt_toolkit.utils import get_cwidth
 
 from btw import ANSI
 from cost_gate import usd
 from handoff import Cancellation
 from live_steering import LiveQueue
 from thinking_loop import ThinkingLoop
+from todo_hud import COMPACT_ROWS, truncate as truncate_cells
 
 
 def clear_terminal(editor):
@@ -169,10 +171,11 @@ class TerminalTurn(Cancellation):
 
 
 class TerminalLane:
-    def __init__(self, editor, executor, run_task, budget, settings, notify_jobs, *, goal_status=None):
+    def __init__(self, editor, executor, run_task, budget, settings, notify_jobs, *, goal_status=None, todo_hud=None):
         self.editor, self.executor, self.run_task, self.budget = editor, executor, run_task, budget
         self.notify_jobs = notify_jobs
         self.goal_status = goal_status
+        self.todo_hud = todo_hud
         self.steering_mode = settings.get("steeringMode", "one-at-a-time")
         self.followup_mode = settings.get("followUpMode", "one-at-a-time")
         self.interrupt_mode = settings.get("interruptMode", "immediate")
@@ -396,6 +399,12 @@ class TerminalLane:
         size = self.editor.app.output.get_size()
         width = max(12, size.columns - 3)
         progress = []
+        compact_todo = ""
+        if self.todo_hud:
+            if size.rows < COMPACT_ROWS:
+                compact_todo = self.todo_hud.short(width if not turn else max(10, int(width * .45)))
+            else:
+                progress.extend(self.todo_hud.full(width))
         if self.goal_status and (status := self.goal_status()):
             progress.append(("dim", status + "\n"))
         for batch in batches:
@@ -407,12 +416,21 @@ class TerminalLane:
                 row += " · " + usd(batch["cost"])
             progress.append(("dim", row[:width] + "\n"))
         if not turn:
+            if compact_todo:
+                progress.append(("fg:ansicyan", " " * max(0, width - get_cwidth(compact_todo)) + compact_todo + "\n"))
             return [*progress, *to_formatted_text(prompt)] if progress else prompt
         draft = ANSI.sub("", turn.preview)
         tail = "\n".join(draft.splitlines()[-max(1, min(8, size.rows // 4)):])
         status = "Interrupting…" if turn.is_cancelled() else "Compacting context…" if turn.compacting else "Working…"
+        status += "  Enter steer · Ctrl+Q follow-up · Esc stop"
+        status_row = [("dim", status + "\n")]
+        if compact_todo:
+            room = max(0, width - get_cwidth(compact_todo) - 2)
+            left = truncate_cells(status, room)
+            gap = " " * max(1, width - get_cwidth(left) - get_cwidth(compact_todo))
+            status_row = [("dim", left + gap), ("fg:ansicyan", compact_todo + "\n")]
         labels = [f"{mode} · {item.content}" for mode, queue in (("Steer", steers), ("Follow-up", followups))
                   for item in queue if isinstance(item.content, str)]
         rows = [ANSI.sub("", label).replace("\n", " ")[:width] for label in labels[-4:]]
-        return [("", tail + "\n" if tail else ""), ("dim", status + "  Enter steer · Ctrl+Q follow-up · Esc stop\n"),
+        return [("", tail + "\n" if tail else ""), *status_row,
                 *progress, *[("dim", row + "\n") for row in rows], *to_formatted_text(prompt)]

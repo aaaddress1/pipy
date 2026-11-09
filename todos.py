@@ -7,6 +7,7 @@ from copy import deepcopy
 from html import escape
 from pathlib import Path
 from threading import RLock
+from uuid import uuid4
 
 from jsonschema import Draft202012Validator
 
@@ -392,12 +393,19 @@ class Todos:
         self.session, self.enabled, self.reminders, self.eager, self.emit = session, enabled, reminders, eager, emit
         self.mid_reminders = mid_reminders
         self.lock = RLock()
+        self.changed = None
         self.sync()
 
     def sync(self):
-        self.phases = next((phases for phases in self.session.todo_snapshots() if valid_phases(phases)), [])
+        node, position, entry, self.phases = next(
+            (row for row in self.session.todo_records() if valid_phases(row[3])), (None, 0, None, [])
+        )
+        self.source = (node, position) if node is not None else None
+        self.entry = entry
         self.failures = []
         self.begin()
+        if self.changed:
+            self.changed()
 
     def begin(self):
         self.reminded, self.mutations, self.nudges = 0, 0, 0
@@ -406,16 +414,25 @@ class Todos:
     def snapshot(self):
         return deepcopy(self.phases)
 
-    def set(self, phases):
+    def set(self, phases, entry):
         self.phases = deepcopy(phases)
+        self.source, self.entry = None, entry
         self.nudges = 0
+        if self.changed:
+            self.changed()
+
+    def identify(self):
+        if self.entry is None and self.source:
+            self.entry = self.session.identify_todo(*self.source)
+        return self.entry
 
     def edit(self, phases):
         if not valid_phases(phases):
             raise ValueError("Expected a list of phases with valid todo tasks.")
         with self.lock:
-            self.session.record_metadata({"type": "custom", "customType": EDIT, "data": {"phases": phases}})
-            self.set(phases)
+            entry = uuid4().hex
+            self.session.record_metadata({"id": entry, "type": "custom", "customType": EDIT, "data": {"phases": phases}})
+            self.set(phases, entry)
 
     def execute(self, raw, *, nested=False):
         with self.lock:
@@ -452,7 +469,7 @@ class Todos:
         if name == "todo":
             self.mutations = 0
             if result.get("_todo_snapshot"):
-                self.set(result["_tool_details"]["phases"])
+                self.set(result["_tool_details"]["phases"], result["_todo_entry_id"])
             self.reconcile_error(call, result)
         elif name in MUTATING and not result.get("_tool_error"):
             self.mutations += 1
@@ -543,7 +560,9 @@ class Todos:
             return markdown(self.phases).rstrip() if self.phases else "No todos."
         op, rest = args[0].lower(), args[1] if len(args) == 2 else ""
         if op in ("help", "?"):
-            return "/todo [view|copy|edit|export|import|append|start|done|drop|rm|block|unblock]"
+            return "/todo [view|copy|edit|export|import|append|start|done|drop|rm|block|unblock|expand|collapse]"
+        if op in ("expand", "collapse"):
+            raise ValueError(f"/todo {op} requires an interactive terminal.")
         if op == "edit":
             if not editor:
                 raise ValueError("/todo edit requires an interactive editor. Use /todo export and /todo import.")
