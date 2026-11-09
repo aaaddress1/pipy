@@ -1,10 +1,11 @@
 """Read Chat Completions SSE without losing the provider's terminal marker."""
 
 import json
+import re
 from concurrent.futures import CancelledError
 
 import httpx
-from openai import APIError
+from openai import APIError, APIStatusError
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
 
@@ -21,6 +22,36 @@ TRANSIENT_FINISH = frozenset(("error", "network_error", "insufficient_system_res
 NATIVE_FAILURES = frozenset(("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "NETWORK_ERROR"))
 REPETITION_REASONS = frozenset(("repetition", "repetition_detected"))
 USAGE_DEFAULTS = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+STREAM_STATUS = {"SERVICE_UNAVAILABLE": 503, "TOO_MANY_REQUESTS": 429, "REQUEST_TIMEOUT": 408}
+STREAM_CLOSED = re.compile(
+    r"stream (?:stall|incomplete|closed|reset)|premature (?:close|end)|unexpected (?:socket close|eof)"
+    r"|nghttp2_(?:internal_error|refused_stream)|socket hang up", re.I,
+)
+TRANSIENT_ERROR = re.compile(r"overloaded|temporar(?:y|ily)|unavailable|server.error|retry your request|timed? out", re.I)
+
+
+class StreamError(APIError):
+    def __init__(self, data, response):
+        body = data.get("error") or data
+        detail = body.get("message") if isinstance(body, dict) else body
+        super().__init__(str(detail or "Chat Completions stream reported an error."), request=response.request, body=body)
+        labels = {str(value).strip().upper() for value in (self.type, self.code)}
+        code = str(self.code).strip()
+        self.status = (int(code) if code.isascii() and code.isdecimal() and len(code) == 3
+                       else STREAM_STATUS.get(str(self.type).strip().upper()))
+        self.transport = bool(labels & {"STREAM_INCOMPLETE", "STREAM_STALL", "NETWORK_ERROR"}
+                              or STREAM_CLOSED.search(self.message))
+        self.malformed = "MALFORMED_FUNCTION_CALL" in labels or "malformed_function_call" in self.message.lower()
+        self.retryable = (self.transport or self.malformed
+                          or bool(self.status and (self.status in (408, 409, 429) or 500 <= self.status <= 599))
+                          or self.status is None and bool(TRANSIENT_ERROR.search(self.message)))
+        self.headers = response.headers
+
+    def status_error(self):
+        if self.status and 400 <= self.status <= 599:
+            response = httpx.Response(self.status, headers=self.headers, request=self.request)
+            return APIStatusError(self.message, response=response, body=self.body)
+        return None
 
 
 def finish_reason(reason):
@@ -101,11 +132,8 @@ class ChatStream:
             if not isinstance(data, dict):
                 raise ValueError("Chat Completions SSE event must be an object.")
             self.signal.observe(progress(data))
-            if name == "error" or data.get("error"):
-                error = data.get("error") or data
-                message = error.get("message") if isinstance(error, dict) else None
-                raise APIError(str(message or "Chat Completions stream reported an error."),
-                               request=self.response.request, body=error)
+            if name == "error" or data.get("error") or isinstance(data.get("message"), str) and not data.get("choices"):
+                raise StreamError(data, self.response)
             if isinstance(usage := data.get("usage"), dict):
                 data["usage"] = USAGE_DEFAULTS | usage
             yield ChatCompletionChunk.construct(**data)

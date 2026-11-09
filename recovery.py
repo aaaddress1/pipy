@@ -32,6 +32,13 @@ class IncompleteTurn(RuntimeError):
 class StreamInterrupted(IncompleteTurn):
     unexecuted_turn = None
 
+    def __init__(self, message, *, transport=False, malformed=False, retryable=True, **details):
+        super().__init__(message, **details)
+        self.transport = transport
+        self.malformed = malformed
+        self.retryable = retryable
+        self.committed = False
+
 
 class ClassifierRefusal(IncompleteTurn):
     def __init__(self, message, *, safe, credit, unexecuted_turn=None, refused_model=None):
@@ -362,28 +369,38 @@ class TurnRecovery:
             return None
 
         if isinstance(error, StreamInterrupted):
-            if error.unexecuted_turn:
+            committed = error.committed and bool(error.text.strip())
+            if error.retryable and error.unexecuted_turn and (error.transport or not committed):
                 if self.retry_enabled and self.retry_or_fallback("stream interrupted", retry_first=True):
                     self.remember_unexecuted(error)
                     return "retry"
                 return None
-            if not self.retry_enabled:
-                return None
-            if not error.text.strip() or error.tool_draft:
-                return self.retry_or_fallback("stream interrupted")
-            attempt = self.take("visible stream interruption")
-            if attempt:
+            if self.retry_enabled and error.retryable and not committed:
+                if retry := self.retry_or_fallback("stream interrupted"):
+                    return retry
+            if error.malformed:
+                attempt = self.take("malformed function call")
+                if not attempt:
+                    return None
                 self.remind(
-                    "The provider interrupted the previous response. The user already saw its text. "
-                    "Continue exactly where it stopped without repeating it.",
+                    "<system-injection>\nThe previous function call was malformed and never ran. "
+                    "Reissue it through the native function-calling interface with a JSON object matching the tool schema. "
+                    f"Send the tool call directly.\nAttempt #{attempt}/{MAX_RECOVERIES}\n</system-injection>",
+                    text=error.text if committed else "",
+                )
+                return "retry"
+            if self.retry_enabled and error.transport and committed and not error.tool_draft:
+                attempt = self.take("visible stream interruption")
+                if not attempt:
+                    return None
+                self.remind(
+                    "<system-injection>\nThe provider connection dropped mid-response. The user already saw the text above. "
+                    "Continue exactly where it stopped without repeating or summarizing it.\n"
+                    f"Attempt #{attempt}/{MAX_RECOVERIES}\n</system-injection>",
                     text=error.text,
                 )
                 print(f"[stream interrupted after visible text; continuing {attempt}/{MAX_RECOVERIES}]", file=sys.stderr)
                 return "retry"
-            self.remind(
-                "The previous response was interrupted. Continue where its visible text stopped.",
-                text=error.text,
-            )
             return None
 
         if isinstance(error, EmptyTurn):

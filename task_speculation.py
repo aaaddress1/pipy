@@ -254,6 +254,13 @@ class StreamSpeculation:
     def take_eval(self, call):
         return self.shadow.take(call) if self.shadow in self.active else None
 
+    def task_may_have_side_effects(self):
+        return self.task in self.active and any(
+            run.task.repo_root is None
+            for _, call in self.task.pending.values()
+            for run in call.runs
+        )
+
     def discard(self):
         for stream in (self.read, self.shadow):
             if stream in self.active:

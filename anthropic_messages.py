@@ -717,12 +717,15 @@ class MessageStream:
     def unfinished(self):
         return bool(self.open_blocks & fallback.retained(self.blocks).keys())
 
-    def interrupted(self, message):
-        return StreamInterrupted(
-            message, text="".join(self.text),
-            tool_draft=any(block["type"] == "tool_use" for block in fallback.retained(self.blocks).values()),
+    def interrupted(self, message, *, transport=False):
+        blocks = fallback.retained(self.blocks).values()
+        error = StreamInterrupted(
+            message, text="".join(self.text), transport=transport,
+            tool_draft=any(block["type"] == "tool_use" for block in blocks),
             usage=Usage.from_wire(self.usage),
         )
+        error.replay_unsafe = any(map(server_tool_block, blocks))
+        return error
 
     def interruption_snapshot(self, route, fingerprint):
         displayed, native = [], []
@@ -785,8 +788,8 @@ class MessageStream:
                 "overloaded_error": 529, "api_error": 500, "rate_limit_error": 429,
                 "authentication_error": 401, "permission_error": 403,
             }.get(error.get("type"), 400)
-            if status >= 500 and self.text:
-                raise self.interrupted(str(error.get("message", "Anthropic stream error.")))
+            if status >= 500 and self.started:
+                raise self.interrupted(str(error.get("message", "Anthropic stream error.")), transport=True)
             raise status_error(httpx.Response(status, headers=response.headers, request=response.request), event)
         if kind == "message_start":
             if self.started:
@@ -941,8 +944,8 @@ class MessageStream:
             message["_input_transformations"] = list(self.transformations.values())
         return message
 
-    def replayable_tool_turn(self, route, model, fingerprint):
-        if self.unfinished() or "".join(self.text).strip() or any(
+    def replayable_tool_turn(self, route, model, fingerprint, *, allow_text=False):
+        if self.unfinished() or not allow_text and "".join(self.text).strip() or any(
             block["type"] not in ("text", "thinking", "redacted_thinking", "tool_use", "fallback")
             for block in fallback.retained(self.blocks).values()
         ):
@@ -1045,6 +1048,11 @@ def stream_attempt(
                 error.message = error.message.replace(credit.token, "[redacted]")
                 error.args = (error.message,)
             if message.blocks:
+                if (message.show or message.turn) and "".join(message.text).strip() or any(
+                    map(server_tool_block, fallback.retained(message.blocks).values())
+                ):
+                    error.replay_unsafe = True
+                    error.text = "".join(message.text)
                 raise
             if redemption:
                 if decision := redemption.rejected(error):
@@ -1099,9 +1107,7 @@ def stream_once(client, route, model, body, fingerprint, message, cache_observer
         if message.reason and not message.unfinished():
             message.stopped = True
         if not message.stopped and tool_choice is None:
-            error = message.interrupted("Anthropic stream ended without a complete turn.")
-            error.unexecuted_turn = message.replayable_tool_turn(route, model, fingerprint)
-            raise error
+            raise message.interrupted("Anthropic stream ended without a complete turn.", transport=True)
         if message.started and message.stopped and not message.unfinished() and message.reason in ("refusal", "sensitive"):
             raise message.refusal(route, model, body, fingerprint, response.request.headers.get("anthropic-beta"))
         if continuation:
@@ -1113,10 +1119,14 @@ def stream_once(client, route, model, body, fingerprint, message, cache_observer
         completed = True
         return result
     except TRANSPORT_ERRORS as error:
-        interrupted = message.interrupted(f"Anthropic stream interrupted ({type(error).__name__}).")
+        interrupted = message.interrupted(f"Anthropic stream interrupted ({type(error).__name__}).", transport=True)
         if tool_choice is None:
-            interrupted.unexecuted_turn = message.replayable_tool_turn(route, model, fingerprint)
+            interrupted.unexecuted_turn = message.replayable_tool_turn(route, model, fingerprint, allow_text=True)
         raise interrupted from error
+    except StreamInterrupted as error:
+        if error.transport and tool_choice is None:
+            error.unexecuted_turn = message.replayable_tool_turn(route, model, fingerprint, allow_text=True)
+        raise
     except (ValueError, KeyError, TypeError) as error:
         raise message.interrupted(f"Anthropic stream interrupted ({type(error).__name__}).") from error
     finally:

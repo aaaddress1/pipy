@@ -53,6 +53,7 @@ from auth_broker_cache import config_root, number
 import handoff
 from judgment import Judge, UnexpectedStop, latest_request
 import openai_responses
+from responses_tools import complete_arguments
 from peer_messages import Endpoint, PeerBus
 import project_context
 from ttsr import Attempt as RuleAttempt, RuleInterrupt, Rules, assistant_outputs, judge_question
@@ -576,6 +577,8 @@ def stream_reply(
             return result
         except ThinkingLoop as error:
             if speculation:
+                if speculation.task_may_have_side_effects():
+                    error.replay_unsafe = True
                 speculation.discard()
             if meter:
                 meter.finish("error")
@@ -598,6 +601,9 @@ def stream_reply(
                 time.sleep(delay)
         except BaseException as error:
             if speculation:
+                if isinstance(error, StreamInterrupted) and speculation.task_may_have_side_effects():
+                    error.replay_unsafe = True
+                    error.unexecuted_turn = None
                 speculation.discard()
             if meter and isinstance(error, Exception):
                 meter.finish({CancelledError: "aborted", RuleInterrupt: "aborted", IncompleteTurn: "length"}.get(type(error), "error"))
@@ -647,6 +653,18 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
         if tail:
             guard.push(None, tail, bool(calls))
             emit_text(tail)
+
+    def stream_failure(message, *, transport=False, malformed=False, retryable=True, tool_draft=False):
+        error = StreamInterrupted(message, text="".join(text), tool_draft=bool(calls) or tool_draft, usage=usage,
+                                  transport=transport, malformed=malformed, retryable=retryable)
+        if retryable and not malformed and calls and tool_choice not in ("none", "auto"):
+            ordered = [calls[index] for index in sorted(calls)]
+            identifiers = {call["id"] for call in ordered}
+            if "" not in identifiers and len(identifiers) == len(ordered) and all(
+                call["function"]["name"] and complete_arguments(call["function"]["arguments"]) for call in ordered
+            ):
+                error.unexecuted_turn = {"role": "assistant", "content": error.text or None, "tool_calls": ordered}
+        return error
 
     stream = chat_stream.ChatStream(client, limits, model=model, messages=chat_tool_images(messages),
                                     stream_options={"include_usage": True}, **tool_options, **options)
@@ -721,12 +739,22 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
                 finish_markup()
             if finish and not repetition:
                 guard.finish()
+    except chat_stream.StreamError as error:
+        if not finish:
+            if not error.malformed and not calls and (not (show or turn) or not "".join(text).strip()) and (
+                status := error.status_error()
+            ):
+                raise status from error
+            raise stream_failure(error.message, transport=error.transport, malformed=error.malformed,
+                                 retryable=error.retryable) from error
+        if not repetition:
+            finish_markup()
+            guard.finish()
     except TRANSPORT_ERRORS as error:
         if not finish:
-            raise StreamInterrupted(
+            raise stream_failure(
                 str(error) if isinstance(error, stream_watchdog.StreamDeadline)
-                else f"Provider stream interrupted ({type(error).__name__}).",
-                text="".join(text), tool_draft=bool(calls), usage=usage,
+                else f"Provider stream interrupted ({type(error).__name__}).", transport=True,
             ) from error
         if not repetition:
             finish_markup()
@@ -743,7 +771,9 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
         finish = "tool_calls"
     if native_failure or finish in chat_stream.TRANSIENT_FINISH:
         reason = f"native_finish_reason: {native_failure}" if native_failure else f"finish_reason: {finish}"
-        raise StreamInterrupted(f"Provider returned an error ({reason}).", text=visible, tool_draft=bool(calls), usage=usage)
+        raise stream_failure(f"Provider returned an error ({reason}).",
+                             malformed=(native_failure or "").upper() == "MALFORMED_FUNCTION_CALL",
+                             transport=finish == "network_error" or (native_failure or "").upper() == "NETWORK_ERROR")
     if finish == "length":
         raise IncompleteTurn(
             "Model reached its generation limit.", text=visible, tool_draft=bool(calls), usage=usage,
@@ -751,12 +781,10 @@ def stream_attempt(client, model, messages, schemas, options, guard, show, tool_
     if finish is None and not (visible or calls or thinking or leaked or (buffer and buffer.parts)):
         raise EmptyTurn("Chat Completions ended without output.", usage=usage)
     if finish is None or (finish == "tool_calls" and not calls):
-        raise StreamInterrupted(
-            "Model stream ended without a complete turn.",
-            text=visible, tool_draft=bool(calls) or finish == "tool_calls", usage=usage,
-        )
+        raise stream_failure("Model stream ended without a complete turn.", transport=finish is None,
+                             tool_draft=finish == "tool_calls")
     if finish != ("tool_calls" if calls else "stop"):
-        raise RuntimeError(f"Model stream ended without a complete turn (finish: {finish!r}).")
+        raise stream_failure(f"Model stream ended without a complete turn (finish: {finish!r}).", retryable=False)
     message = {"role": "assistant", "content": visible or None}
     if upstream_provider:
         message["_served_upstream"] = upstream_provider
@@ -2427,6 +2455,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                         turn.live.rollback()
                 raise
             except Exception as error:
+                if isinstance(error, StreamInterrupted):
+                    error.committed = bool(show or turn)
                 if turn:
                     if hasattr(turn, "live"):
                         turn.live.rollback()

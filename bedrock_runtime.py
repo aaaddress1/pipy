@@ -376,6 +376,13 @@ def stream_attempt(client, route, model, messages, schemas, effort, guard, show,
     message = anthropic.MessageStream(guard, show, turn, tracker=tracker, on_text=on_text, speculation=speculation)
     if turn:
         turn.interrupt_snapshot = lambda: message.interruption_snapshot(route, "bedrock")
+
+    def interrupted(label, *, transport=False):
+        error = message.interrupted(label, transport=transport)
+        if transport and tool_choice is None:
+            error.unexecuted_turn = message.replayable_tool_turn(route, model, "bedrock", allow_text=True)
+        return error
+
     try:
         for attempt in range(2):
             try:
@@ -394,12 +401,20 @@ def stream_attempt(client, route, model, messages, schemas, effort, guard, show,
                 body["messages"] = [{**item, "content": content} for item in body["messages"]
                                     if (content := [part for part in item["content"] if "reasoningContent" not in part])]
         if not message.stopped:
-            raise message.interrupted("Bedrock ConverseStream ended before messageStop.")
+            raise interrupted("Bedrock ConverseStream ended before messageStop.", transport=True)
         if message.reason == "sensitive":
             raise message.refusal(route, model, body, "bedrock", None)
         return message.result(route, model, "bedrock", text_only=tool_choice in ("none", "auto"))
+    except APIStatusError as error:
+        if (show or turn) and (text := "".join(message.text)).strip():
+            error.replay_unsafe = True
+            error.text = text
+        raise
     except (httpx.TransportError, KeyError, TypeError, StreamInterrupted) as error:
-        raise message.interrupted(f"Bedrock ConverseStream interrupted ({type(error).__name__}).") from error
+        if isinstance(error, StreamInterrupted) and error.transport:
+            raise
+        raise interrupted(f"Bedrock ConverseStream interrupted ({type(error).__name__}).",
+                          transport=isinstance(error, httpx.TransportError)) from error
     finally:
         if usage_observer and message.usage:
             usage_observer(message.usage)

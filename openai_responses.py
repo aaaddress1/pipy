@@ -20,7 +20,7 @@ import codex_responses
 import responses_cache
 import responses_resume
 import stream_watchdog
-from responses_tools import ITEM_EVENTS, TOOL_EVENTS, TOOL_ITEMS, StreamedTools
+from responses_tools import ITEM_EVENTS, TOOL_EVENTS, TOOL_ITEMS, StreamedTools, complete_arguments
 from responses_effort import supported as supports_effort_updates
 from responses_chain import stored_host
 from responses_websocket import generation_evidence
@@ -815,7 +815,27 @@ def stream_attempt(
 
         turn.interrupt_snapshot = snapshot
     stream_tools = StreamedTools(codex=codex_route is not None)
+    hosted_tool = False
     usage = reported_usage = None
+
+    def is_hosted_tool(item):
+        kind = item.get("type") or ""
+        return kind != "function_call" and kind.endswith("_call")
+
+    def interrupted(message, *, transport=False):
+        text = "".join(visible)
+        error = StreamInterrupted(message, text=text, tool_draft=tool_draft, usage=usage, transport=transport)
+        error.replay_unsafe = hosted_tool or stream_tools.unsafe
+        if transport and not error.replay_unsafe and stream_tools.calls and tool_choice not in ("none", "auto"):
+            drafts = sorted(stream_tools.calls.values(), key=lambda item: (item.index is None, item.index or 0))
+            if all(complete_arguments(item.raw) for item in drafts):
+                error.unexecuted_turn = {"role": "assistant", "content": text or None, "tool_calls": [
+                    {"id": item.item["call_id"], "type": "function",
+                     "function": {"name": item.item["name"], "arguments": item.raw}}
+                    for item in drafts
+                ]}
+        return error
+
     try:
         with response_events(client, body, websocket, codex_route=codex_route, identity=codex_turn,
                              live_source=live_source, effort_control=effort_control, http_chain=http_chain,
@@ -858,6 +878,7 @@ def stream_attempt(
                 elif kind in TOOL_EVENTS or kind in ITEM_EVENTS:
                     tool = stream_tools.observe(event)
                     item = event.get("item") or {}
+                    hosted_tool |= is_hosted_tool(item)
                     if draft and kind == "response.output_item.done" and item.get("type") == "reasoning":
                         index = event.get("output_index", 0)
                         draft.signatures[index] = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
@@ -896,7 +917,9 @@ def stream_attempt(
                             raise IncompleteTurn("Responses reached the generation limit.", **details)
                         response, truncated = recovered, True
                     elif kind != "response.completed" or response.get("status") != "completed":
-                        raise StreamInterrupted("Responses did not complete the turn.", **details)
+                        hosted_tool |= any(map(is_hosted_tool, response.get("output") or ()))
+                        raise interrupted("Responses did not complete the turn.",
+                                          transport=error.get("code") in ("stream_incomplete", "network_error"))
                     if not truncated:
                         output = stream_tools.completed_output(response.get("output"))
                         if details["text"] and not any(item["type"] == "message" and item.get("content") for item in output):
@@ -933,26 +956,29 @@ def stream_attempt(
     except ResponsesBodyReadTimeout as error:
         error.replay_prefixes = replay_prefixes
         raise
-    except APIStatusError:
+    except APIStatusError as error:
+        if error.code in ("stream_incomplete", "network_error"):
+            raise interrupted(str(error), transport=True) from error
+        if hosted_tool or stream_tools.unsafe or (show or turn) and "".join(visible).strip():
+            error.replay_unsafe = True
+            error.text = "".join(visible)
         raise
     except (APIError, ValueError, KeyError, TypeError, *TRANSPORT_ERRORS) as error:
         if getattr(error, "code", None) in ("context_length_exceeded", "context_window_exceeded"):
             raise ContextWindowExceeded(
                 "Responses context window exceeded.", text="".join(visible), tool_draft=tool_draft, usage=usage,
             ) from error
-        raise StreamInterrupted(
+        raise interrupted(
             str(error) if isinstance(error, stream_watchdog.StreamDeadline)
             else f"Responses stream interrupted ({type(error).__name__}).",
-            text="".join(visible), tool_draft=tool_draft, usage=usage,
+            transport=isinstance(error, TRANSPORT_ERRORS),
         ) from error
     finally:
         if usage_observer and reported_usage is not None:
             usage_observer(reported_usage)
         if show and visible:
             print()
-    raise StreamInterrupted(
-        "Responses stream ended before completion.", text="".join(visible), tool_draft=tool_draft, usage=usage,
-    )
+    raise interrupted("Responses stream ended before completion.", transport=True)
 
 
 async def recap(client, route, messages, effort, meter=None, *, effort_control=None):
