@@ -227,7 +227,7 @@ class AgentBridge:
                        "taskPreview": task.assignment.split("\n", 1)[0][:120]}
             if runtime.model:
                 details["model"] = runtime.model
-            tasks.jobs.progress(job_id or task.name, {"progress": details}, f"Running agent {task.name}...")
+            tasks.jobs.progress(job_id or task.job_id, {"progress": details}, f"Running agent {task.name}...")
 
         result, value = tasks.run_task(task, cancellation, revived, progress=progress, restore_plan=restore_plan)
         return self.finish(task, result, value, owner, delivery_owner=owner if restore_plan is not None else None)

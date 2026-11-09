@@ -263,17 +263,25 @@ class WorkPool:
             identifier = f"{batch.id}-{suffix}"
             suffix += 1
         peer = self.tasks.peer
+        keys = tuple(item.id for item in items)
+        schema = {"type": "object", "properties": dict.fromkeys(keys, {}), "required": list(keys), "additionalProperties": False}
+        task = replace(worker.task, assignment=batch_message(self.name, batch), structured=True, schema=schema,
+                       schema_mode="strict", eval_schema_source="caller")
 
         def reserve():
+            nonlocal task
             if first:
-                self.tasks.reserve([worker.task])
+                task = self.tasks.record_pool_batch(task, identifier, keys, False, first=worker.task)
             elif peer:
                 with peer.bus.lock:
                     if peer.bus.active(worker.task.sid):
                         raise WorkerBusy()
+                    task = self.tasks.record_pool_batch(task, identifier, keys, True)
                     peer.bus.mark(worker.task.sid)
+            else:
+                task = self.tasks.record_pool_batch(task, identifier, keys, True)
 
-        self.jobs.spawn([(identifier, identifier, worker.task.sid, lambda cancel: self.run_batch(batch, cancel))],
+        self.jobs.spawn([(identifier, identifier, worker.task.sid, lambda cancel: self.run_batch(batch, task, cancel))],
                         reserve, suppress_delivery=True)
         batch.job = self.jobs.jobs[identifier]
         for item in items:
@@ -284,23 +292,19 @@ class WorkPool:
         if worker.turns:
             self.card("batch", worker.task.name, batch_message(self.name, batch))
 
-    def run_batch(self, batch, signal):
+    def run_batch(self, batch, task, signal):
         worker = batch.worker
-        keys = tuple(item.id for item in batch.items)
-        schema = {"type": "object", "properties": dict.fromkeys(keys, {}), "required": list(keys), "additionalProperties": False}
-        message = batch_message(self.name, batch)
-        task = replace(worker.task, assignment=message, structured=True, schema=schema, schema_mode="strict", eval_schema_source="caller")
 
         def progress(runtime):
             with self.condition:
                 worker.tokens, worker.window = runtime.context_tokens, runtime.context_window
-                self.jobs.progress(batch.job.id, {
+                self.jobs.progress(task.job_id, {
                     "totalDurationMs": round((monotonic() - batch.started) * 1000),
                     "progress": [{"id": task.name, "agent": task.agent.name, "requests": runtime.count,
                                   "contextTokens": worker.tokens, "contextWindow": worker.window}],
                 }, f"Running agent {task.name}...")
 
-        result, value = self.tasks.run_task(task, signal, False, progress=progress, pool_items=keys, pool_followup=bool(worker.turns))
+        result, value = self.tasks.run_task(task, signal, False, progress=progress)
         result = self.bridge.finish(task, result, value)
         text = (result.get("evalResult", {}).get("text") or result.get("error") or "(no output)")
         report = self.render_batch(batch, result, text)

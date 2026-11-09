@@ -23,7 +23,7 @@ from auth_broker import dotted
 from cancellable_http import active_turn
 from handoff import Cancellation, deadline
 from runtime import Session, database, pack
-from session_graph import delete_task_subtree, task_subtree
+from session_graph import delete_task_subtree, last_batch, task_subtree
 from session_jsonl import journal_entries, plain_text, text_and_images
 from session_leases import upstream_lease
 from session_transfer import archive_session_id, lease
@@ -260,6 +260,14 @@ class TaskOptions:
 
 
 @dataclass(frozen=True)
+class PoolBatch:
+    job: str
+    keys: tuple[str, ...]
+    after: int
+    followup: bool
+
+
+@dataclass(frozen=True)
 class Task:
     name: str
     sid: str
@@ -286,6 +294,11 @@ class Task:
     eval_tool_owner: str | None = None
     eval_tools: tuple = ()
     workpool: bool = False
+    pool_batch: PoolBatch | None = None
+
+    @property
+    def job_id(self):
+        return self.pool_batch.job if self.pool_batch else self.name
 
     def spec(self):
         data = asdict(self)
@@ -297,6 +310,8 @@ class Task:
         data["agent"] = Agent(**data["agent"])
         if data.get("repo_root"):
             data["repo_root"] = Path(data["repo_root"])
+        if batch := data.get("pool_batch"):
+            data["pool_batch"] = PoolBatch(**{**batch, "keys": tuple(batch["keys"])})
         return cls(**data)
 
 
@@ -305,7 +320,7 @@ class TaskLimitReached(RuntimeError):
 
 
 class TaskRun:
-    def __init__(self, task, options, *, provisional=False, progress=None, pool_items=(), pool_followup=False, restore_plan=None):
+    def __init__(self, task, options, *, provisional=False, progress=None, restore_plan=None):
         self.task = task
         self.provisional = provisional
         self.restore_plan = restore_plan
@@ -318,7 +333,9 @@ class TaskRun:
         self.warned = False
         self.budget_wrap = False
         self.submitted = self.parked_yield = None
-        self.yields = YieldState(task.schema, task.schema_mode) if task.structured and not pool_items else None
+        self.pool_items = task.pool_batch.keys if task.pool_batch else ()
+        self.pool_followup = bool(task.pool_batch and task.pool_batch.followup)
+        self.yields = YieldState(task.schema, task.schema_mode) if task.structured and not self.pool_items else None
         self.force_yield = False
         self.yield_aborted = False
         self.yield_errors = 0
@@ -326,8 +343,8 @@ class TaskRun:
         self.suppress_delivery = False
         self.progress = progress
         self.model = None
-        self.pool_items, self.pool_followup = pool_items, pool_followup
         self.pool_results, self.pool_errors = {}, set()
+        self.pool_resume_notice = False
         self.pool_reusable = False
         self.context_tokens = self.context_window = None
 
@@ -346,6 +363,10 @@ class TaskRun:
         return self.limit > 0 and self.count >= self.budget_threshold
 
     def reminder(self):
+        if self.pool_resume_notice:
+            self.pool_resume_notice = False
+            pending = [i for i, key in enumerate(self.pool_items, 1) if key not in self.pool_results]
+            return f"<system-reminder>Restored accepted workpool yields. Continue with remaining item(s): {pending}.</system-reminder>"
         if self.budget_stopped() and not self.budget_wrap:
             self.budget_wrap = True
             instruction = ("Call yield now with your best report from completed work." if self.task.structured
@@ -421,6 +442,32 @@ class TaskRun:
         self.submitted = self.parked_yield = None
         self.yield_aborted = False
         self.schema_warning = None
+
+    def restore_pool_yields(self, session):
+        if not self.task.pool_batch:
+            return
+        with database(session.path) as db:
+            batches = session.read_batches(db, self.task.pool_batch.after + 1)
+        for _, batch in batches:
+            if not batch:
+                continue
+            calls = {call["id"] for call in batch[0].get("tool_calls", ()) if call["function"]["name"] == "yield"}
+            for result in batch[1:]:
+                if result.get("tool_call_id") not in calls or result.get("_tool_error"):
+                    continue
+                details = result.get("_tool_details") or {}
+                keys = details.get("type")
+                if details.get("status") != "success" or not isinstance(keys, list) or len(keys) != 1 or "data" not in details:
+                    continue
+                key = keys[0]
+                if key in self.pool_items and key not in self.pool_results:
+                    self.pool_results[key] = details["data"]
+                    if details.get("error"):
+                        self.pool_errors.add(key)
+        if len(self.pool_results) == len(self.pool_items):
+            self.submitted = {"data": dict(self.pool_results), "error": None}
+        else:
+            self.pool_resume_notice = bool(self.pool_results)
 
     def pool_yield_tool(self):
         keys = list(range(1, len(self.pool_items) + 1))
@@ -671,13 +718,15 @@ class Tasks:
             if staged and staged.runs:
                 staged.discard()
 
-    def reserve(self, tasks, adopted=()):
+    def reserve(self, tasks, adopted=(), *, record=None):
         with database(self.session.path) as db:
             db.executemany("INSERT INTO subagent_links(owner,name,child) VALUES (?,?,?)",
                            ((self.session.id, task.name, task.sid) for task in tasks))
             db.executemany("INSERT INTO subagent_specs(child,data) VALUES (?,?)",
                            ((task.sid, pack(task.spec())) for task in tasks))
             db.executemany("DELETE FROM speculative_task_roots WHERE session = ?", ((identifier,) for identifier in adopted))
+            if record:
+                record(db)
         if self.peer:
             self.peer.bus.mark(*(task.sid for task in tasks))
         for task in tasks:
@@ -690,6 +739,20 @@ class Tasks:
             except (OSError, SQLiteError):
                 logger.exception("Unable to update the task display for %s", task.name)
 
+    def record_pool_batch(self, task, job, keys, followup, *, first=None):
+        def record(db):
+            nonlocal task
+            head = db.execute("SELECT leaf FROM session_heads WHERE session=?", (task.sid,)).fetchone()
+            after = last_batch(db, task.sid, head[0]) if head else 0
+            task = replace(task, pool_batch=PoolBatch(job, keys, after, followup))
+            db.execute("INSERT OR REPLACE INTO subagent_workpool_batches VALUES (?,?,?)", (task.sid, job, pack(task.spec())))
+        if first is not None:
+            self.reserve([first], record=record)
+        else:
+            with database(self.session.path) as db:
+                record(db)
+        return task
+
     def restoration_plan(self):
         plan = {}
         owners = [self.session.id]
@@ -698,10 +761,11 @@ class Tasks:
         for owner in owners:
             with database(path) as db:
                 candidates = [(*row, archive_session_id(db, row[0])) for row in db.execute("""
-                    SELECT l.child,l.name,s.workspace,spec.data,
+                    SELECT l.child,l.name,s.workspace,coalesce(pool.task,spec.data),
                            dead.child IS NOT NULL OR coalesce(json_extract(l.result,'$.status'),'')='cancelled'
                            OR EXISTS(SELECT 1 FROM subagent_deliveries d WHERE d.child=l.child AND d.settled_leaf=head.leaf)
                     FROM subagent_links l LEFT JOIN subagent_specs spec ON spec.child=l.child
+                    LEFT JOIN subagent_workpool_batches pool ON pool.child=l.child
                     LEFT JOIN sessions s ON s.id=l.child
                     LEFT JOIN session_heads head ON head.session=l.child
                     LEFT JOIN subagent_tombstones dead ON dead.child=l.child
@@ -717,11 +781,18 @@ class Tasks:
                         if killed or not data or not scope or not Path(scope).is_dir():
                             continue
                         task = Task.restore(json.loads(data))
-                        if task.sid != sid or task.name != name or task.repo_root or task.workpool:
+                        if task.sid != sid or task.name != name or task.repo_root or task.workpool and not task.pool_batch:
                             continue
                         child = Session(path, sid, scope)
                         if not child.has_restorable_turn():
                             continue
+                        if task.pool_batch:
+                            with database(path) as db:
+                                current = child.read_batches(db, task.pool_batch.after + 1)
+                            if not task.pool_batch.keys or not any(message["role"] == "user"
+                                    and task.assignment in plain_text(message.get("content"))
+                                    for _, batch in current for message in batch):
+                                continue
                     plan.setdefault(owner, []).append(replace(task, workspace=scope))
                 except Timeout:
                     continue
@@ -741,11 +812,11 @@ class Tasks:
         if not tasks or not self.jobs:
             return
 
-        def reserve():
+        def reserve(batch):
             if self.peer:
-                self.peer.bus.mark(*(task.sid for task in tasks))
+                self.peer.bus.mark(*(task.sid for task in batch))
             if not delivery_owner:
-                for task in tasks:
+                for task in batch:
                     self.observe(task, "running")
 
         def release_unclaimed(owner):
@@ -754,18 +825,26 @@ class Tasks:
                     if self.peer.bus.release_restoration(child.sid):
                         release_unclaimed(child.sid)
 
-        def resume(task, cancel):
+        def resume(task, cancel, destination):
             try:
                 if task.eval_schema_source is not None and self.resume_eval:
-                    identifier = f"{owner}/{task.name}" if delivery_owner else None
-                    return self.resume_eval(task, cancel, restore_plan=plan, owner=delivery_owner, job_id=identifier)
-                return self.execute(task, cancel, restore_plan=plan, delivery_owner=delivery_owner)
+                    identifier = f"{destination}/{task.job_id}" if destination else task.job_id
+                    return self.resume_eval(task, cancel, restore_plan=plan, owner=destination, job_id=identifier)
+                return self.execute(task, cancel, restore_plan=plan, delivery_owner=destination)
             finally:
                 release_unclaimed(task.sid)
 
+        grouped = {}
+        for task in tasks:
+            destination = owner if task.pool_batch else delivery_owner
+            grouped.setdefault(destination, []).append(task)
         try:
-            self.jobs.spawn([(task.name, task.eval_label or task.assignment, task.sid, lambda cancel, task=task: resume(task, cancel))
-                             for task in tasks], reserve, resuming=True, delivery_owner=delivery_owner)
+            for destination, batch in grouped.items():
+                self.jobs.spawn([
+                    (task.job_id, task.job_id if task.pool_batch else task.eval_label or task.assignment, task.sid,
+                     lambda cancel, task=task, destination=destination: resume(task, cancel, destination))
+                    for task in batch
+                ], lambda: reserve(batch), resuming=True, delivery_owner=destination)
         except ValueError:
             release_unclaimed(owner)
             raise
@@ -863,10 +942,15 @@ class Tasks:
         completed = False
         try:
             with database(self.session.path) as db:
+                if task.pool_batch:
+                    if not db.execute("DELETE FROM subagent_workpool_batches WHERE child=? AND job=?",
+                                      (task.sid, task.job_id)).rowcount:
+                        return result
                 db.execute("UPDATE subagent_links SET result = ? WHERE child = ?", (pack({**result, "data": data}), task.sid))
                 if delivery_owner:
-                    summary = {"jobId": task.name, "type": "task", "status": result["status"],
-                               "label": task.eval_label or task.assignment, "durationMs": result["durationMs"],
+                    summary = {"jobId": task.job_id, "type": "task", "status": result["status"],
+                               "label": task.job_id if task.pool_batch else task.eval_label or task.assignment,
+                               "durationMs": result["durationMs"],
                                "result": {key: value for key, value in result.items() if key != "report"}}
                     db.execute("DELETE FROM subagent_deliveries WHERE child=? AND consumed=1", (task.sid,))
                     db.execute("""INSERT INTO subagent_deliveries(owner,child,summary,report,settled_leaf)
@@ -882,9 +966,10 @@ class Tasks:
                 self.peer.bus.finish(task.sid, retry=completed)
                 self.peer.bus.recover_deferred()
 
-    def run_task(self, task, cancel, revived, staged=None, *, progress=None, pool_items=(), pool_followup=False, restore_plan=None):
+    def run_task(self, task, cancel, revived, staged=None, *, progress=None, restore_plan=None):
         runtime = TaskRun(task, self.options, provisional=staged is not None, progress=progress,
-                          pool_items=pool_items, pool_followup=pool_followup, restore_plan=restore_plan)
+                          restore_plan=restore_plan)
+        pooled = bool(task.pool_batch)
         acquired = False
         start = monotonic()
         sandbox, isolation, opened = None, None, False
@@ -892,7 +977,7 @@ class Tasks:
         saved = bus.isolations.get(task.sid) if bus else None
         status = "failed"
         try:
-            if self.slots and not pool_items:
+            if self.slots and not pooled:
                 while not acquired:
                     cancel.check()
                     acquired = self.slots.acquire(timeout=.1)
@@ -964,8 +1049,8 @@ class Tasks:
             result["schemaWarning"] = runtime.schema_warning
         if runtime.model:
             result["model"] = runtime.model
-        if pool_items:
-            result.update(workpoolItemErrors=[key for key in pool_items if key in runtime.pool_errors],
+        if pooled:
+            result.update(workpoolItemErrors=[key for key in task.pool_batch.keys if key in runtime.pool_errors],
                           workpoolReusable=runtime.pool_reusable, contextTokens=runtime.context_tokens,
                           contextWindow=runtime.context_window)
         if isolation:

@@ -280,6 +280,8 @@ def run_agent(task, query, tools, max_steps, session, compaction, system_prompt,
             cancellation.check()
         active_tools = tools()
         run_tool_step(seq, batch, active_tools, False, turn.response(batch[0]) if turn else None)
+        if child and child.submitted is not None:
+            return batch[0]["content"]
         phase = "mid"
         if goal and (context := goal.context()):
             append_input(context)
@@ -2099,7 +2101,9 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                 handle = peer_bus.open_child(task.sid, create) if peer_bus else one_shot.enter_context(create())
                 handle.bind_child(runtime, cancel, lineage)
                 restoring = runtime.restore_plan is not None
-                if restoring and not handle.restore_pending:
+                if restoring and pooled:
+                    runtime.restore_pool_yields(handle.session)
+                if restoring and not handle.restore_pending and runtime.submitted is None:
                     raise ValueError("The saved subagent no longer has an interrupted turn.")
                 if restoring and handle.restore_children:
                     handle.restore_children(runtime.restore_plan)
@@ -2114,7 +2118,8 @@ def open_session(args, state, session_id, workspace, rpc=None, account=None, *, 
                     assignment = ("Complete assignment thoroughly:\n\n" + task.assignment
                                   if task.eval_schema_source is not None and not runtime.pool_followup else task.assignment)
                     if restoring:
-                        answer = handle.run_task(None, background=True, show=False)
+                        if runtime.submitted is None:
+                            answer = handle.run_task(None, background=True, show=False)
                     else:
                         answer = handle.run_task(incoming if revived else assignment, background=revived, show=False)
                     can_settle = (runtime.yield_errors < subagents.MAX_YIELD_ERRORS
