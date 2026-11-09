@@ -98,10 +98,14 @@ class ResponsesSocket:
         if self.connection and self.connection.state is State.OPEN and connection_key == self.connected_headers:
             return
         await self.disconnect()
+        headers = await self.upgrade_headers(headers)
         self.connection = await NoRedirectConnect(self.url, additional_headers=headers, open_timeout=10,
                                                    close_timeout=1, max_size=16 * 1024 * 1024,
                                                    ping_interval=self.ping_interval, ping_timeout=self.ping_timeout)
         self.connected_headers = connection_key
+
+    async def upgrade_headers(self, headers):
+        return headers
 
     def status_error(self, status, body=None, headers=None):
         body = body or {}

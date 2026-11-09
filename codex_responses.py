@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+import codex_attestation
 from auth_broker_cache import config_root
 from cancellable_http import active_turn
 from local_oauth import jwt_payload
@@ -287,6 +288,9 @@ class CodexSocket(ResponsesSocket):
         self.accepted_steers.clear()
         self.steer_frames.clear()
         await super().disconnect()
+
+    async def upgrade_headers(self, headers):
+        return await codex_attestation.upgrade_headers(headers, self.http_url)
 
     def append_input(self, baseline, request):
         delta = delta_input(baseline, request, codex=True)

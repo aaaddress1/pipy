@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=2,<3", "httpx>=0.28,<1", "websockets>=15,<16", "filelock>=3,<4", "prompt-toolkit>=3,<4", "regex", "pillow", "fonttools", "mcp>=2.3,<3", "pyyaml>=6,<7", "cryptography", "xxhash", "jsonschema>=4,<5", "psutil>=7,<8", "ast-grep-py", "wcmatch", "pathspec>=0.12,<2", "resvg-py>=0.5,<1", "pywinpty>=3,<4; sys_platform == 'win32'"]
+# dependencies = ["openai>=2,<3", "httpx>=0.28,<1", "websockets>=15,<16", "filelock>=3,<4", "prompt-toolkit>=3,<4", "regex", "pillow", "fonttools", "mcp>=2.3,<3", "pyyaml>=6,<7", "cryptography", "xxhash", "jsonschema>=4,<5", "psutil>=7,<8", "ast-grep-py", "wcmatch", "pathspec>=0.12,<2", "resvg-py>=0.5,<1", "pywinpty>=3,<4; sys_platform == 'win32'", "pyobjc-framework-DeviceCheck>=11; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # ///
 """A small Pi-style coding agent."""
 

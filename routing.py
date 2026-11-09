@@ -23,6 +23,7 @@ from broker_usage import quota_scope, response_limits
 from observed_usage import normalize_usage
 from cache_warmer import Prices
 from cancellable_http import CancellableTransport, active_turn
+import codex_attestation
 import codex_responses
 from mcp_oauth import oauth_url
 import model_catalog
@@ -748,6 +749,8 @@ class Router:
         http_settings = self.request_settings(route, credential)
         if route.api == "anthropic-messages":
             return httpx.Client(headers=self.native_headers(route, credential), timeout=timeout, **transport, **http_settings)
+        if route.api == codex_responses.API:
+            http_settings["event_hooks"] = {"request": [codex_attestation.authorize_request]}
         http_client = {"http_client": httpx.Client(timeout=timeout, **transport, **({"follow_redirects": True} | http_settings))
                        } if transport or http_settings else {}
         return OpenAI(**self.client_settings(route, credential), timeout=timeout, **http_client)
